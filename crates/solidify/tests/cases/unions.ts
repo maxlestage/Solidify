@@ -133,3 +133,16 @@ const found = lx.tokens.find((t) => t.type === "op");
 console.log(found, show(3), show("x"), show(false), show(null));
 const kinds = lx.tokens.map((t) => t.type);
 console.log(kinds, lx.current);
+
+// An array literal of different types is an array of their union.
+const items = [1, "two", 3.5, "four"];
+for (const m of items) {
+  if (typeof m === "string") {
+    console.log(m.toUpperCase());
+  } else {
+    console.log(m * 2);
+  }
+}
+console.log(items, items.length);
+const nested = [1, [2, 3], "x"];
+console.log(nested, JSON.stringify(nested));

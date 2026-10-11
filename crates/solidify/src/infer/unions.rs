@@ -27,17 +27,38 @@ impl<'m> Infer<'m> {
         if distinct.len() == 1 {
             return Ok(distinct.pop().expect("member"));
         }
+        // An existing union with the same members is the same union: its member types
+        // are shared, so that a number is an integer or a float in both.
+        let mut reuse: Option<(String, Vec<(Ty, Ty)>)> = None;
         for u in &self.unions {
-            if u.members.len() == distinct.len()
-                && distinct.iter().all(|t| {
-                    let zt = self.types.zonk(t);
-                    u.members
-                        .iter()
-                        .any(|m| same_shape_ty(&self.types.zonk(&m.ty), &zt))
-                })
-            {
-                return Ok(Ty::Named(u.name.clone()));
+            if u.members.len() != distinct.len() {
+                continue;
             }
+            let mut pairs = Vec::new();
+            let all = distinct.iter().all(|t| {
+                let zt = self.types.zonk(t);
+                match u
+                    .members
+                    .iter()
+                    .find(|m| same_shape_ty(&self.types.zonk(&m.ty), &zt))
+                {
+                    Some(m) => {
+                        pairs.push((m.ty.clone(), t.clone()));
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if all {
+                reuse = Some((u.name.clone(), pairs));
+                break;
+            }
+        }
+        if let Some((name, pairs)) = reuse {
+            for (a, b) in pairs {
+                let _ = self.types.unify(&a, &b);
+            }
+            return Ok(Ty::Named(name));
         }
         let mut names: Vec<String> = Vec::new();
         for t in &distinct {

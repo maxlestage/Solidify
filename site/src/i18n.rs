@@ -217,7 +217,7 @@ static EN: Dict = Dict {
                 "flattened structs, a trait per base class, Box<dyn ALike> where an A is expected",
             ),
             (
-                "A | B, discriminated unions, typeof",
+                "A | B, [1, \"two\"], discriminated unions, typeof",
                 "enum with one variant per member, match",
             ),
             ("function*, yield, yield*", "JsGenerator<T>, for x in gen"),
@@ -393,7 +393,7 @@ static FR: Dict = Dict {
                 "structs aplaties, un trait par classe de base, Box<dyn ALike> là où un A est attendu",
             ),
             (
-                "A | B, unions discriminées, typeof",
+                "A | B, [1, \"two\"], unions discriminées, typeof",
                 "enum avec une variante par membre, match",
             ),
             ("function*, yield, yield*", "JsGenerator<T>, for x in gen"),
