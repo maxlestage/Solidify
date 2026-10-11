@@ -21,10 +21,14 @@ fn var_ty(p: &solidify::infer::Program, name: &str) -> String {
 #[test]
 fn numbers_are_integers_until_proven_otherwise() {
     let p = program(
-        "function fib(n: number): number { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }\nlet total = 0; for (let i = 0; i < 10; i++) total += fib(i);\nconst avg = total / 10;\nlet f = 1; f = 2.5;",
+        "function fib(n: number): number { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }\nlet total = 0; for (let i = 0; i < 10; i++) total += fib(i);\nconst avg = total / 10;\nlet f = 1; f = 2.5;\nlet count = 0; for (const x of [1, 2]) count += x;",
     );
+    // `fib` grows exponentially: it returns a double, as in JavaScript, where it cannot
+    // overflow; its parameter stays an integer.
     assert_eq!(var_ty(&p, "n"), "number (integer)");
-    assert_eq!(var_ty(&p, "total"), "number (integer)");
+    assert_eq!(var_ty(&p, "total"), "number (float)");
+    assert_eq!(var_ty(&p, "count"), "number (integer)");
+    assert_eq!(var_ty(&p, "i"), "number (integer)");
     assert_eq!(var_ty(&p, "avg"), "number (float)");
     assert_eq!(var_ty(&p, "f"), "number (float)");
     let total = p.vars.values().find(|v| v.name == "total").unwrap();

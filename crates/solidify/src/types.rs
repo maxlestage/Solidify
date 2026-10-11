@@ -70,6 +70,10 @@ pub struct Types {
     /// Integer flavors that come from an integer-only use (an index, a length, `parseInt`…),
     /// not only from integer literals.
     hard: Vec<bool>,
+    /// `a ≤ b`: a number of flavor `a` flows into a place of flavor `b` (an argument into
+    /// a parameter, a returned value, an assigned one): when `a` is a double, so is `b`;
+    /// an integer going into a double is converted.
+    flows: Vec<(TyVar, TyVar)>,
 }
 
 impl Types {
@@ -160,6 +164,37 @@ impl Types {
         self.flavors[rb] = Slot::Value(fa.max(fb));
         if fa.max(fb) == Flavor::Unknown {
             self.flavors[rb] = Slot::Free;
+        }
+    }
+
+    /// Records that a number flows into a place (`found ≤ expected`) when both are
+    /// numbers; `false` otherwise.
+    pub fn flow(&mut self, found: &Ty, expected: &Ty) -> bool {
+        match (self.resolve(found), self.resolve(expected)) {
+            (Ty::Num(a), Ty::Num(b)) => {
+                if self.find_flavor(a) != self.find_flavor(b) {
+                    self.flows.push((a, b));
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Makes every place a double flows into a double.
+    pub fn settle_flows(&mut self) {
+        loop {
+            let mut changed = false;
+            for i in 0..self.flows.len() {
+                let (a, b) = self.flows[i];
+                if self.flavor(a) == Flavor::Float && self.flavor(b) != Flavor::Float {
+                    self.set_flavor(b, Flavor::Float);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
         }
     }
 

@@ -2,9 +2,8 @@
 
 use super::stmts::Side;
 use super::{
-    E, GResult, Gen, PREC_ADD, PREC_AND, PREC_ASSIGN, PREC_ATOM, PREC_BITAND, PREC_BITOR,
-    PREC_BITXOR, PREC_CMP, PREC_MUL, PREC_OR, PREC_POSTFIX, PREC_SHIFT, PREC_UNARY, Repr, Want,
-    format_text, pascal, string_literal,
+    E, GResult, Gen, PREC_ADD, PREC_AND, PREC_ASSIGN, PREC_ATOM, PREC_CMP, PREC_MUL, PREC_OR,
+    PREC_POSTFIX, PREC_UNARY, Repr, Want, format_text, pascal, string_literal,
 };
 use crate::ast::*;
 use crate::infer::{Callee, Role};
@@ -494,6 +493,10 @@ impl<'a> Gen<'a> {
     pub(super) fn string_of(&mut self, code: &str, ty: &Ty) -> String {
         if self.is_inspect_ty(ty) {
             self.inspect_call(code, ty, false)
+        } else if self.is_float(ty) {
+            // Called on the items of an iterator: references.
+            let h = self.helper(super::Helper::NumText);
+            format!("{h}(*{code})")
         } else {
             self.bound_needed(ty, "std::fmt::Display");
             format!("{code}.to_string()")
@@ -598,7 +601,10 @@ impl<'a> Gen<'a> {
             let missing = self.missing_word(x);
             let code = self.coerce(e, &ty, Want::Display);
             let inner_spec = self.fmt_spec(&inner);
-            let shown = if inner_spec == "{}" {
+            let shown = if self.is_float(&inner) {
+                let h = self.helper(super::Helper::NumText);
+                format!("{h}(*v)")
+            } else if inner_spec == "{}" {
                 "v.to_string()".to_string()
             } else {
                 "format!(\"{:?}\", v)".to_string()
@@ -614,6 +620,12 @@ impl<'a> Gen<'a> {
             self.bound_needed(&ty, "std::fmt::Debug");
         } else {
             self.bound_needed(&ty, "std::fmt::Display");
+        }
+        // A double as JavaScript prints it (`1e+21`, `Infinity`).
+        if self.is_float(&ty) {
+            let code = self.coerce(e, &ty, Want::Owned);
+            let h = self.helper(super::Helper::NumText);
+            return Ok(("{}".into(), Some(format!("{h}({code})"))));
         }
         let code = self.coerce(e, &ty, Want::Display);
         if is_plain_ident(&code) && !code.starts_with("r#") {
@@ -909,11 +921,11 @@ impl<'a> Gen<'a> {
                 Ok(E::owned(code, PREC_ATOM))
             }
             UnaryOp::BitNot => {
-                let x = self.expr_as(arg, Want::Owned)?;
-                Ok(E::owned(
-                    format!("!{}", paren_unless_simple(&x)),
-                    PREC_UNARY,
-                ))
+                if let Some(v) = const_number(arg) {
+                    return Ok(E::atom(int_literal((!js_to_int32(v)) as i64), Repr::Owned));
+                }
+                let x = self.int32_operand(arg)?;
+                Ok(E::owned(format!("(!{x}) as i64"), PREC_CAST_PLUS))
             }
         }
     }
@@ -1014,14 +1026,17 @@ impl<'a> Gen<'a> {
                 Ok(E::owned(format!("{lc} / {rc}"), PREC_MUL))
             }
             BinOp::Pow => {
-                let (l, r, _) = self.numeric_operands(left, right)?;
-                let lc = num_recv(&Self::paren(&l, PREC_POSTFIX), self.is_float(&lt));
-                if self.is_float(&lt) {
-                    let rc = self.as_f64(&r);
-                    return Ok(E::owned(format!("{lc}.powf({rc})"), PREC_POSTFIX));
+                // A double, as in JavaScript.
+                if let (Some(a), Some(b)) = (const_number(left), const_number(right)) {
+                    let v = a.powf(b);
+                    if v.fract() == 0.0 && v.abs() < 9007199254740992.0 {
+                        return Ok(E::atom(format!("{v:.1}"), Repr::Owned));
+                    }
                 }
+                let lc = self.float_operand(left)?;
+                let rc = self.float_operand(right)?;
                 Ok(E::owned(
-                    format!("{lc}.pow({} as u32)", Self::paren(&r, PREC_CAST_PLUS)),
+                    format!("{}.powf({rc})", num_recv(&lc, true)),
                     PREC_POSTFIX,
                 ))
             }
@@ -1031,23 +1046,13 @@ impl<'a> Gen<'a> {
             | BinOp::BitAnd
             | BinOp::BitOr
             | BinOp::BitXor => {
-                let (l, r, _) = self.numeric_operands(left, right)?;
-                let (sym, prec) = match op {
-                    BinOp::Shl => ("<<", PREC_SHIFT),
-                    BinOp::Shr | BinOp::UShr => (">>", PREC_SHIFT),
-                    BinOp::BitAnd => ("&", PREC_BITAND),
-                    BinOp::BitOr => ("|", PREC_BITOR),
-                    _ => ("^", PREC_BITXOR),
-                };
-                let lc = Self::paren(&l, prec);
-                let rc = Self::paren(&r, prec + 1);
-                if op == BinOp::UShr {
-                    return Ok(E::owned(
-                        format!("(({lc} as u32) >> {rc}) as i64"),
-                        PREC_CAST_PLUS,
-                    ));
+                // 32-bit integers, as in JavaScript (`1 << 31` is negative).
+                if let (Some(a), Some(b)) = (const_number(left), const_number(right)) {
+                    return Ok(E::atom(int_literal(js_bitwise(op, a, b)), Repr::Owned));
                 }
-                Ok(E::owned(format!("{lc} {sym} {rc}"), prec))
+                let a = self.int32_operand(left)?;
+                let b = self.int32_operand(right)?;
+                Ok(E::owned(self.bitwise_code(op, &a, &b), PREC_CAST_PLUS))
             }
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 if let Ty::Named(n, ..) = self.resolve(&lt)
@@ -1143,6 +1148,51 @@ impl<'a> Gen<'a> {
                 self.expr(left)?;
                 Ok(E::atom("false", Repr::Owned))
             }
+        }
+    }
+
+    /// A number as a double (`n as f64`), for `**` and `Math.pow`.
+    pub(super) fn float_operand(&mut self, e: &'a Expr) -> GResult<String> {
+        if let Some(v) = const_number(e) {
+            return Ok(format!("{v:?}"));
+        }
+        let t = self.ty_of(e);
+        let x = self.expr(e)?;
+        let owned = self.coerce(x, &t, Want::Owned);
+        if self.is_float(&t) {
+            return Ok(owned);
+        }
+        let x = E::owned(owned, PREC_POSTFIX);
+        Ok(self.as_f64(&x))
+    }
+
+    /// A number as JavaScript's bitwise operators see it: a 32-bit integer (`x as i32`;
+    /// a double goes through `js_to_int32`).
+    pub(super) fn int32_operand(&mut self, e: &'a Expr) -> GResult<String> {
+        if let Some(v) = const_number(e) {
+            return Ok(js_to_int32(v).to_string());
+        }
+        let t = self.ty_of(e);
+        let x = self.expr(e)?;
+        let prec = x.prec;
+        let owned = self.coerce(x, &t, Want::Owned);
+        if self.is_float(&t) {
+            let h = self.helper(super::Helper::ToInt32);
+            return Ok(format!("{h}({owned})"));
+        }
+        let x = E::owned(owned, prec);
+        Ok(format!("({} as i32)", Self::paren(&x, PREC_CAST_PLUS)))
+    }
+
+    /// `a op b` on 32-bit integers, as an `i64`.
+    pub(super) fn bitwise_code(&self, op: BinOp, a: &str, b: &str) -> String {
+        match op {
+            BinOp::Shl => format!("{a}.wrapping_shl({b} as u32) as i64"),
+            BinOp::Shr => format!("{a}.wrapping_shr({b} as u32) as i64"),
+            BinOp::UShr => format!("({a} as u32).wrapping_shr({b} as u32) as i64"),
+            BinOp::BitAnd => format!("({a} & {b}) as i64"),
+            BinOp::BitOr => format!("({a} | {b}) as i64"),
+            _ => format!("({a} ^ {b}) as i64"),
         }
     }
 
@@ -1625,6 +1675,8 @@ impl<'a> Gen<'a> {
                     "Math.LOG10E" => "std::f64::consts::LOG10_E",
                     "Math.SQRT2" => "std::f64::consts::SQRT_2",
                     "Math.SQRT1_2" => "std::f64::consts::FRAC_1_SQRT_2",
+                    "Number.MAX_SAFE_INTEGER" if self.is_float(&ty) => "9007199254740991.0",
+                    "Number.MIN_SAFE_INTEGER" if self.is_float(&ty) => "-9007199254740991.0",
                     "Number.MAX_SAFE_INTEGER" => "9007199254740991_i64",
                     "Number.MIN_SAFE_INTEGER" => "-9007199254740991_i64",
                     "Number.MAX_VALUE" => "f64::MAX",
@@ -2127,7 +2179,7 @@ impl<'a> Gen<'a> {
     }
 }
 
-const PREC_CAST_PLUS: u8 = super::PREC_CAST + 1;
+pub(super) const PREC_CAST_PLUS: u8 = super::PREC_CAST + 1;
 
 /// The expression tested by a narrowing test: `x` in `x !== null`, or `x` itself.
 pub(super) fn narrow_path_expr(e: &Expr) -> &Expr {
@@ -2300,3 +2352,45 @@ fn screaming_const(name: &str) -> String {
 }
 
 pub(super) use super::snake;
+
+/// The value of a numeric literal, possibly negated.
+pub(super) fn const_number(e: &Expr) -> Option<f64> {
+    match &e.kind {
+        ExprKind::Num { value, .. } => Some(*value),
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            arg,
+        } => const_number(arg).map(|v| -v),
+        _ => None,
+    }
+}
+
+/// JavaScript's `ToInt32`.
+pub(super) fn js_to_int32(v: f64) -> i32 {
+    if !v.is_finite() {
+        return 0;
+    }
+    (v.trunc().rem_euclid(4294967296.0) as u32) as i32
+}
+
+/// A bitwise operator on two constants, as JavaScript computes it.
+fn js_bitwise(op: BinOp, a: f64, b: f64) -> i64 {
+    let (a, b) = (js_to_int32(a), js_to_int32(b));
+    match op {
+        BinOp::Shl => a.wrapping_shl(b as u32) as i64,
+        BinOp::Shr => a.wrapping_shr(b as u32) as i64,
+        BinOp::UShr => (a as u32).wrapping_shr(b as u32) as i64,
+        BinOp::BitAnd => (a & b) as i64,
+        BinOp::BitOr => (a | b) as i64,
+        _ => (a ^ b) as i64,
+    }
+}
+
+/// An integer literal; `_i64` when it does not fit the `i32` Rust assumes.
+fn int_literal(v: i64) -> String {
+    if i32::try_from(v).is_ok() {
+        v.to_string()
+    } else {
+        format!("{v}_i64")
+    }
+}

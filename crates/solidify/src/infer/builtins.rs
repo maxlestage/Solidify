@@ -130,11 +130,14 @@ impl<'m> Infer<'m> {
                 self.done(e, full, f)
             }
             ("Math", "pow") => {
-                let n = self.types.num(Flavor::Unknown);
-                self.arg_typed(args, 0, Some(n.clone()), &full, span)?;
-                self.arg_typed(args, 1, Some(n.clone()), &full, span)?;
+                // A double, as `**`: `Math.pow(2, 64)` does not overflow.
+                for i in 0..2 {
+                    let n = self.types.num(Flavor::Unknown);
+                    self.arg_typed(args, i, Some(n), &full, span)?;
+                }
                 self.no_more_than(args, 2, &full, span)?;
-                self.done(e, full, n)
+                let f = self.types.float();
+                self.done(e, full, f)
             }
             ("Math", "max" | "min") => {
                 let n = self.types.num(Flavor::Unknown);
