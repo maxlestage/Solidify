@@ -1,6 +1,6 @@
 # Solidify
 
-**English** · [Français](README.fr.md)
+**English** · [Français](README.fr.md) · [Español](README.es.md)
 
 **Write TypeScript or JavaScript, get Rust.** Solidify is a transpiler written in Rust, with no dependency, that reads a TypeScript (or JavaScript) program, the files it imports included, and writes the Rust you would have written by hand: structs, enums, `Option`, `Result`, iterators and ownership. No virtual machine and no garbage collector in the output, a plain Rust program whose output matches what Node.js prints.
 
@@ -86,56 +86,60 @@ error: `x` may be null here (number | null): test it with `if (… !== null)`, o
 Three passes, all deterministic:
 
 1. **Parse.** A hand-written parser reads modern TypeScript: classes, interfaces, enums, arrow functions, template strings, destructuring, async/await. JavaScript is TypeScript without the annotations.
-2. **Infer.** Types come from annotations and from use, by unification. Numbers stay integers (`i64`) until a float literal, a division or JSON says otherwise (`f64`). `T | null` becomes `Option<T>`, `A | B` an enum. A function that throws, or calls one that does outside a `try`, returns `Result<T, String>`. Parameters whose type nothing constrains become type parameters; `any` is inferred from use.
+2. **Infer.** Types come from annotations and from use, by unification. Numbers stay integers (`i64`) until a float literal, a division or JSON says otherwise (`f64`). `T | null` becomes `Option<T>`, `A | B` an enum. A function that throws, or calls one that does outside a `try`, returns `Result<T, String>`. Parameters whose type nothing constrains become type parameters; `any` and `unknown` are values known at run time (`JsValue`).
 3. **Generate.** Every value gets an ownership: parameters are borrowed (`&str`, `&[T]`, `&T`) unless the function changes or keeps them; a variable is moved at its last use and cloned before that. Loops become ranges and iterators, `switch` becomes `match`, `if (x !== null)` becomes `if let Some(x)`, `if (x === null) return` becomes `let Some(x) = x else { return }`.
 
 ## What translates to what
 
 | TypeScript | Rust |
 | --- | --- |
-| `number` | `i64`, or `f64` when a float is involved |
-| `string`, template strings | `String`, `&str` for parameters, `format!` |
-| `T[]`, `[A, B]` | `Vec<T>`, `&[T]` for parameters, tuples |
-| `T \| null`, `x?: T`, `??`, `?.` | `Option<T>`, `if let`, `unwrap_or`, `map` |
-| `interface`, object literals | `struct` with `Debug`, `Clone`, `PartialEq` |
-| `class`, `get`, `set`, `static` | `struct` + `impl`, `new()`, `&self` or `&mut self`, consts |
-| `enum`, `"a" \| "b"` | `enum` with `Display`, `match` |
-| `Map`, `Set`, `Record<K, V>` | `HashMap`, `HashSet`, or `JsMap`, `JsSet` when the program observes the insertion order |
-| `throw`, `try` / `catch` / `finally` | `Result<T, String>`, `?`, a closure for the `try` block |
-| `map`, `filter`, `reduce`, `find`, `some`… | iterator chains |
-| `for … of`, `for (;;)`, `while`, labels | `for x in &v`, `for i in a..b`, `loop`, `'label` |
-| `switch` | `match`, with grouped cases |
-| `async`, `await` | `async fn`, `.await`, a small executor for `main` |
-| `function f<T>(x: T)`, `f<number>(x)` | `fn f<T: Clone + PartialEq>(x: T)`, bounds from use |
-| `class Stack<T>`, `interface Page<T>`, `type Entry<K, V>`, `extends Stack<number>`, `<T extends HasId>` | `struct Stack<T>` + `impl<T: …>`, bounds found across the program, a `HasIdLike` trait for constraints |
-| `interface Listener<T> { notify(v: T): void }`, `abstract class Shape<T>` | `trait ListenerLike<T>`, `Box<dyn ListenerLike<String>>` |
-| methods returning `this`, `a.add(1).add(2)` | `&mut Self`: the calls chain on one object |
-| `enum Level { … }`, `Level[Level.High]` | `enum` with `Display`, `Level::High.name()` |
-| `console.log`, `Math`, `parseInt`… | `println!`, `f64` methods, small helpers appended to the file |
-| recursive classes | `Option<Box<T>>` |
-| `class B extends A`, `abstract`, `super`, `protected`, `instanceof` | flattened structs, a trait per base class, `Box<dyn ALike>` where an `A` is expected |
-| `interface Shape { area(): number }`, `class C implements Shape`, `interface A extends B` | a trait per interface, `impl ShapeLike for C`, `Box<dyn ShapeLike>` / `&dyn ShapeLike` where a `Shape` is expected |
-| `A \| B`, `[1, "two"]`, discriminated unions, `typeof x === "string"`, `"kind" in x` | `enum` with one variant per member, `match` |
-| `function*`, `yield`, `yield*` | `JsGenerator<T>`, `for x in gen` |
-| `setTimeout`, `setInterval`, `clearTimeout`, `new Promise`, `Promise.all` | an event loop run by `main`, `JsPromise` |
-| `/regex/flags`, `new RegExp`, `test`, `exec`, `match`, `matchAll`, `replace`, `split`, `search`, `lastIndex`, `while ((m = re.exec(s)) !== null)` | `JsRegex`, a backtracking engine shipped in the generated file, `while let Some(m) = re.exec(&s)` |
-| `JSON.stringify(v, null, 2)`, `JSON.parse` into an annotated type | the value's `JsValue`, a generated `JsFromJson` for the parsed type |
-| `import`, `export`, `export default`, `import * as ns`, `export … from` | one `mod` per imported file, `pub` for exports |
-| `console.log` of objects, arrays, maps, sets, nested values | the exact text Node.js prints (`util.inspect` rules) |
-| `any`, `unknown` | inferred from use |
-| `...rest` parameters, `f(...xs)`, `{ ...base, z }`, `[a, ...rest] = xs`, `({ x, y }: Point) =>` | slices, `vec!`, struct literals built field by field, `let rest = xs[1..].to_vec()` |
-| `parseInt` | `Option<i64>` (`NaN` is `None`), narrowed by `isNaN` |
-| `new Date(…)`, `getTime`, `getFullYear`…, `toISOString`, `later - earlier`, `Date.now()` | `JsDate` (milliseconds, UTC), `PartialOrd`, `get_time()` differences |
-| `f?.()`, `obj?.method()`, fields of function type, `onClick?: () => void` | `if let Some(f) = …`, `.map(\|o\| o.method())`, `Rc<dyn Fn(…)>` fields |
+| `` number `` | i64, or f64 when a float is involved or the value can outgrow i64 |
+| `` bigint, 10n ** 30n `` | JsBigInt, integers of any size |
+| `` string, template strings, tag`…` `` | String, &str for parameters, format!, a call of the tag |
+| `` T[], [A, B] `` | Vec\<T>, &[T] for parameters, tuples |
+| `` T \| null, x?: T, ??, ?. `` | Option\<T>, if let, unwrap_or, map |
+| `` interface, object literal `` | struct with Debug, Clone, PartialEq |
+| `` an object stored in two places, === `` | Shared\<T> (Rc\<RefCell\<T>>): one object, compared by identity |
+| `` class, get, set, static, static { … } `` | struct, impl, new(), &self or &mut self, statics of the module |
+| `` const A = class { … }, function F() { this.x = … }, F.prototype.m `` | classes, rebuilt as structs and impl blocks |
+| `` enum, "a" \| "b" `` | enum with Display, match |
+| `` Map, Set, Record<K, V>, { [k: string]: V } `` | HashMap, HashSet, or JsMap, JsSet in insertion order |
+| `` A & B, keyof T, T["k"], typeof x, `id-${number}` `` | one struct with the fields of both, string, the field's type, the variable's type |
+| `` throw, try / catch / finally `` | Result\<T, String>, ?, a closure for the try block |
+| `` class NotFound extends Error, instanceof in catch `` | errors that keep their class, fields, message and name |
+| `` map, filter, reduce, find, some, forEach… `` | iterator chains |
+| `` for … of, for (;;), while, labels, for await `` | for x in &v, for i in a..b, loop, 'label, .await per item |
+| `` switch, case without break `` | match with grouped cases, labeled blocks for the fallthrough |
+| `` async, await, new Promise `` | fn … -> Promise\<T>: a task started at once, .await |
+| `` then, catch, finally, Promise.all, allSettled, race, any `` | methods of Promise\<T>, microtasks in Node's order |
+| `` setTimeout, setInterval `` | an event loop run by main, with Node's timings |
+| `` function f<T>(x: T), f<number>(x) `` | fn f\<T: Clone + PartialEq>(x: T), bounds from use |
+| `` class Stack<T>, interface Page<T>, <T extends HasId> `` | struct Stack\<T> + impl\<T: …>, bounds found across the program |
+| `` class B extends A, abstract, super, instanceof `` | flattened structs, a trait per base class, Box\<dyn ALike> |
+| `` interface Shape { area(): number }, implements `` | a trait per interface, impl for each class, Box\<dyn ShapeLike> |
+| `` A \| B, discriminated unions, typeof, "kind" in x `` | enum with one variant per member, match |
+| `` any, unknown `` | JsValue: a value known at run time, with JavaScript's operators |
+| `` eval, new Function `` | the code inlined when it is known, a small interpreter otherwise |
+| `` Proxy, Reflect, Symbol, arguments `` | JsProxy with its traps, JsSymbol, a rest parameter |
+| `` function*, yield, yield* `` | JsGenerator\<T>, for x in gen |
+| `` /regex/flags, lookbehind, test, exec, match, replace, split `` | JsRegex, a backtracking engine shipped in the file |
+| `` JSON.stringify, JSON.parse, replacer, reviver `` | the value's JsValue, JsFromJson for the parsed type |
+| `` import, export, import * as ns, require, module.exports `` | one mod per file, pub for exports |
+| `` import fs from "node:fs", path, os, process, node_modules `` | modules shipped with Solidify, packages translated from their sources |
+| `` console.log of objects, arrays, maps, sets `` | the exact text Node.js prints |
+| `` ...rest, f(...xs), { ...base, z }, { a, ...rest }, ({ a: { b } }) => `` | slices, vec!, struct literals field by field, nested patterns taken apart |
+| `` new Date(…), getFullYear, toISOString, later - earlier `` | JsDate in milliseconds (UTC), PartialOrd |
+| `` f?.(), obj?.method(), fields of function type `` | if let Some(f) = …, .map(\|o\| o.method()), Rc\<dyn Fn(…)> fields |
+| `` recursive classes `` | Option\<Box\<T>> |
 
-What stays different, because Rust values are not JavaScript references: an object stored in two places is copied, and changing one copy leaves the other alone (variables changed inside closures that outlive their scope are shared through `Rc<RefCell<T>>`). Numbers are `i64` until a float is involved, so an integer that overflows panics where JavaScript would lose precision. Imports go between your own files only, not to packages. `JSON` replacers and revivers, `Symbol`, `Proxy`, `eval`, prototype manipulation and `arguments` have no Rust counterpart and are refused with a message that says what to write instead.
+**What stays different.** The generated program prints what Node.js prints; a few things cannot be the same. An error printed whole shows `Error: message`, without JavaScript's stack trace. Timers use the real clock: two timers a few milliseconds apart may swap under heavy load, as they can in Node. Code built at run time for `eval` or `new Function` runs in a small interpreter shipped in the file, slower than translated code. Of Node's own modules, `fs`, `fs/promises`, `path`, `os` and `process` are there; packages from `node_modules` are translated from their sources, so native add-ons and modules such as `http` or `child_process` are refused, like async generators (`async function*`), with a message that says why.
 
 Four rules worth knowing:
 
 - **Integers first.** `let n = 0` is an `i64`. Write `2.0`, divide, or read the number from JSON, and the whole family of that number becomes `f64`. `parseFloat` and `Number()` return `f64`, because they can return `NaN`; `parseInt` returns `Option<i64>`.
 - **Null is `Option`.** Test nullable values with `!== null`, `!== undefined` or `??`; the generated Rust uses `if let`, `let … else` and `unwrap_or`. Reading a field of a value that may be null is an error, as in TypeScript's strict mode. `console.log` prints `undefined` or `null` as Node.js does, from where the missing value comes.
 - **Throw is `Result`.** `throw new Error("…")` becomes `return Err("…".to_string())`; `catch (e)` receives the message as a `String`. `JSON.parse` throws the same `SyntaxError` messages as V8.
-- **Files are modules.** Top-level statements become `main`, imported files first, as Node.js runs them; top-level `const`s holding literals become Rust `const`s; other top-level variables read inside functions become `static`s (`LazyLock`, with a `Mutex` when they change). Each imported file becomes a `mod`, its exports `pub`; the files share one namespace, so two files cannot declare the same top-level name.
+- **Files are modules.** Top-level statements become `main`, imported files first, as Node.js runs them; top-level `const`s holding literals become Rust `const`s; other top-level variables read inside functions become `static`s (`LazyLock`, read and written in place when they change). Each imported file becomes a `mod`, its exports `pub`; a name declared by two files is renamed in one of them.
 
 `console.log` prints objects, arrays, maps and sets exactly as Node.js does, `Map` and `Set` keep their insertion order when the program observes it, and `arr.sort()` without comparator sorts numbers as strings, as JavaScript does.
 
@@ -144,7 +148,7 @@ Four rules worth knowing:
 | Folder | Contents |
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | The transpiler: lexer, parser, type inference, code generation, CLI |
-| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 33 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
+| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
 | [`site`](site) | The website: a playground running Solidify as WebAssembly, written with [active](https://github.com/maxlestage/Active) |
 
 ## Development
