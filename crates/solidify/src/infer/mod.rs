@@ -383,6 +383,8 @@ pub struct Program {
     /// Classes and object types whose instances are shared between the places holding
     /// them (`Shared<T>`): changed through one, changed for all; `===` is identity.
     pub shared_types: HashSet<String>,
+    /// Classes of errors (extending `Error`, or such a class).
+    pub error_classes: HashSet<String>,
     /// Fields sharing their collection with a variable (`Rc<RefCell<T>>`).
     pub shared_fields: HashSet<(String, String)>,
     /// `eval(code)` with code known at run time: the variables it sees (a read of each).
@@ -657,6 +659,22 @@ impl Program {
                 }))
     }
 
+    /// A class of errors: thrown, caught and tested with `instanceof`.
+    pub fn is_error_class(&self, name: &str) -> bool {
+        self.error_classes.contains(name)
+    }
+
+    /// The class and its ancestors, as a thrown error lists them.
+    pub fn error_ancestry(&self, name: &str) -> Vec<String> {
+        let mut out = vec![name.to_string()];
+        let mut cur = name.to_string();
+        while let Some(p) = self.struct_info(&cur).and_then(|s| s.parent.clone()) {
+            out.push(p.clone());
+            cur = p;
+        }
+        out
+    }
+
     /// Whether the instances of a struct are shared (`Shared<T>`).
     pub fn is_shared(&self, name: &str) -> bool {
         self.shared_types.contains(name)
@@ -789,6 +807,8 @@ pub(super) struct Infer<'m> {
     pub(super) copied_types: Vec<Ty>,
     /// Struct types compared with `===`.
     pub(super) identity_types: HashSet<String>,
+    /// Classes extending `Error` (directly).
+    pub(super) error_classes: HashSet<String>,
     /// `const b = a`: (b, a).
     pub(super) var_aliases: Vec<(NodeId, NodeId)>,
     /// `{ items: list }`: (struct, field, variable).
@@ -970,6 +990,7 @@ pub fn infer<'m>(
         instance_calls: Vec::new(),
         copied_types: Vec::new(),
         identity_types: HashSet::new(),
+        error_classes: HashSet::new(),
         var_aliases: Vec::new(),
         field_sources: Vec::new(),
         changed_fields: HashSet::new(),

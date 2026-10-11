@@ -1286,7 +1286,18 @@ impl<'a> Gen<'a> {
                 let mut x = super::E::atom(self.name(binding), self.repr_of(binding));
                 x.var = Some((binding, usize::MAX));
                 let pty = self.resolve(&info.sig.params[i]);
-                let value = self.coerce(x, &pty, Want::Owned);
+                let mut value = self.coerce(x, &pty, Want::Owned);
+                // Also read by the body: the field takes a copy.
+                let mut read_again = false;
+                crate::desugar::for_each_expr(&body.stmts, &mut |e| {
+                    if matches!(&e.kind, ExprKind::Ident(n) if n == name) {
+                        read_again = true;
+                    }
+                    true
+                });
+                if read_again && !self.is_copy(&pty) && !value.ends_with(".clone()") {
+                    value = format!("{value}.clone()");
+                }
                 assigned.push((name.clone(), value));
             }
         }

@@ -850,6 +850,18 @@ impl<'m> Infer<'m> {
 
     /// `x instanceof C` where `x` is of a base class of `C`: (base, C). Marks the base
     /// as dynamically dispatched.
+    /// A class extending `Error`, or such a class.
+    pub(super) fn is_error_class_infer(&self, name: &str) -> bool {
+        let mut cur = Some(name.to_string());
+        while let Some(c) = cur {
+            if self.error_classes.contains(&c) {
+                return true;
+            }
+            cur = self.struct_by_name(&c).and_then(|s| s.parent.clone());
+        }
+        false
+    }
+
     fn instance_test(
         &mut self,
         value: &'m Expr,
@@ -879,6 +891,10 @@ impl<'m> Infer<'m> {
         let Ty::Named(base, ..) = self.types.resolve(&vt) else {
             return Ok(None);
         };
+        // A caught error tested for one of the program's error classes.
+        if base == "Error" && self.is_error_class_infer(sub) {
+            return Ok(Some((base, sub.clone())));
+        }
         if self.union_by_name(&base).is_some() || base == *sub || !self.is_subclass(sub, &base) {
             return Ok(None);
         }
