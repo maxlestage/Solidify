@@ -305,6 +305,8 @@ impl<'a> Gen<'a> {
                 let x = self.expr(inner)?;
                 // Already awaited where it is made, or a value that was never a promise.
                 if x.code.ends_with(".await")
+                    || x.code.ends_with(".await?")
+                    || x.code.ends_with(".await.unwrap()")
                     || matches!(
                         self.p.calls.get(&inner.id),
                         Some(Callee::Builtin("Promise.all" | "Promise.resolve"))
@@ -1852,6 +1854,19 @@ impl<'a> Gen<'a> {
                     "Number.NEGATIVE_INFINITY" => "f64::NEG_INFINITY",
                     "Number.NaN" => "f64::NAN",
                     "process.argv" => "std::env::args().collect::<Vec<String>>()",
+                    "process.platform" => {
+                        self.helper(super::Helper::Node);
+                        "js_node_os_info(\"platform\")"
+                    }
+                    "process.env" => {
+                        let map = self.map_name();
+                        return Ok(E::owned(
+                            format!(
+                                "{{ let mut m = {map}::new(); for (k, v) in std::env::vars() {{ m.insert(k, v); }} m }}"
+                            ),
+                            PREC_ATOM,
+                        ));
+                    }
                     _ => return self.err(format!("`{name}` is not supported"), e.span),
                 },
                 Repr::Owned,
