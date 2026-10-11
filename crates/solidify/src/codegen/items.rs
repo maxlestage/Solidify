@@ -132,7 +132,7 @@ impl<'a> Gen<'a> {
             }
         }
         for s in &self.p.structs.clone() {
-            if self.owned_by(s.span, file) {
+            if self.owned_by(s.span, file) && !self.abstract_iface(&s.name) {
                 self.struct_item(s)?;
             }
         }
@@ -1410,14 +1410,32 @@ impl<'a> Gen<'a> {
                 .filter(|f| !parent_fields.contains(&f.name))
                 .cloned()
                 .collect();
-            let methods: Vec<(String, &'a Method)> = self
-                .class_methods(&base)
-                .into_iter()
-                .filter(|(_, m)| {
-                    !parent_methods.contains(&(m.name.clone(), m.kind))
-                        && m.func.type_params.is_empty()
-                })
-                .collect();
+            // An interface has no bodies: its methods are those of the first class
+            // implementing it (the others have the same signatures).
+            let iface = info.kind == StructKind::Interface;
+            let methods: Vec<(String, &'a Method)> = if iface {
+                let first = self
+                    .p
+                    .descendants(&base)
+                    .into_iter()
+                    .find(|c| self.p.struct_info(c).is_some_and(|s| !s.is_abstract));
+                match first {
+                    Some(c) => self
+                        .class_methods(&c)
+                        .into_iter()
+                        .filter(|(_, m)| info.method(&m.name, m.kind).is_some())
+                        .collect(),
+                    None => Vec::new(),
+                }
+            } else {
+                self.class_methods(&base)
+                    .into_iter()
+                    .filter(|(_, m)| {
+                        !parent_methods.contains(&(m.name.clone(), m.kind))
+                            && m.func.type_params.is_empty()
+                    })
+                    .collect()
+            };
             let tests: Vec<(String, bool)> = self
                 .instance_tests
                 .iter()
@@ -1469,15 +1487,25 @@ impl<'a> Gen<'a> {
                 "    fn {clone_name}(&self) -> Box<dyn {trait_name}>;"
             ));
             out.push_str(&format!(
-                "\n/// `{base}` and its subclasses.\ntrait {trait_name}: {} {{\n{}\n}}\n",
+                "\n/// `{base}`{}.\ntrait {trait_name}: {} {{\n{}\n}}\n",
+                if iface {
+                    " and the classes implementing it"
+                } else {
+                    " and its subclasses"
+                },
                 supers.join(" + "),
                 lines.join("\n")
             ));
             out.push_str(&format!(
                 "\nimpl Clone for Box<dyn {trait_name}> {{\n    fn clone(&self) -> Self {{\n        self.{clone_name}()\n    }}\n}}\n"
             ));
-            // The implementations.
-            let mut classes: Vec<String> = vec![base.clone()];
+            // The implementations: the base itself (unless it is an interface with
+            // methods, which no value is of) and what descends from or implements it.
+            let mut classes: Vec<String> = if self.abstract_iface(&base) {
+                Vec::new()
+            } else {
+                vec![base.clone()]
+            };
             classes.extend(self.p.descendants(&base));
             let order: Vec<String> = self.p.structs.iter().map(|s| s.name.clone()).collect();
             classes.sort_by_key(|c| order.iter().position(|o| o == c));

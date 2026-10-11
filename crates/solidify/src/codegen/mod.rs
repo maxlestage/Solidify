@@ -978,6 +978,7 @@ impl<'a> Gen<'a> {
                 if (self.p.struct_info(&n).is_some()
                     || self.p.is_enum(&n)
                     || self.p.union_info(&n).is_some())
+                    && !self.abstract_iface(&n)
                     && self.inspected.insert(n.clone()) =>
             {
                 let mut inner: Vec<Ty> = self
@@ -1140,6 +1141,13 @@ impl<'a> Gen<'a> {
             }
             _ => format!("{recv}.js_value()"),
         }
+    }
+
+    /// An interface with methods: it exists as a trait only, never as a struct.
+    pub(super) fn abstract_iface(&self, name: &str) -> bool {
+        self.p
+            .struct_info(name)
+            .is_some_and(|s| s.kind == crate::infer::StructKind::Interface && !s.methods.is_empty())
     }
 
     /// Visibility of an item: inside a module, what is not exported stays in the crate.
@@ -1601,6 +1609,10 @@ impl<'a> Gen<'a> {
                 }
                 Repr::OptRef => e.code,
             },
+            // A boxed trait object lent as `&dyn T`: `&Box<dyn T>` does not coerce by itself.
+            Want::Ref if self.dyn_name(&ty).is_some() && e.repr != Repr::OptRef => {
+                format!("{}.as_ref()", Self::paren(&e, PREC_POSTFIX))
+            }
             Want::Ref => match e.repr {
                 Repr::Owned | Repr::Place | Repr::Usize => {
                     format!("&{}", Self::paren(&e, PREC_UNARY))

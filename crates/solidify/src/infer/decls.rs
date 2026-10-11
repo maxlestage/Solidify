@@ -113,6 +113,7 @@ impl<'m> Infer<'m> {
                         statics: Vec::new(),
                         parent: None,
                         is_abstract: false,
+                        implements: Vec::new(),
                     });
                 }
                 StmtKind::Class(c) => {
@@ -128,6 +129,7 @@ impl<'m> Infer<'m> {
                         statics: Vec::new(),
                         parent: None,
                         is_abstract: false,
+                        implements: Vec::new(),
                     });
                 }
                 StmtKind::Enum(e) => {
@@ -151,6 +153,7 @@ impl<'m> Infer<'m> {
                             statics: Vec::new(),
                             parent: None,
                             is_abstract: false,
+                            implements: Vec::new(),
                         }),
                         TypeAnn::Union(members, span)
                             if members.len() > 1
@@ -208,6 +211,7 @@ impl<'m> Infer<'m> {
                         return self.err("generic interfaces are not supported", i.span);
                     }
                     let mut fields = Vec::new();
+                    let mut methods = Vec::new();
                     for base in &i.extends {
                         let TypeAnn::Named { name, .. } = base else {
                             return self.err(
@@ -222,9 +226,14 @@ impl<'m> Infer<'m> {
                             return self.err("an interface cannot extend a class", base.span());
                         }
                         fields.extend(parent.fields.iter().cloned());
+                        methods.extend(parent.methods.iter().cloned());
                     }
-                    fields.extend(self.fields_from_members(&i.name, &i.members)?);
-                    self.struct_mut(&i.name).expect("interface").fields = fields;
+                    let (own_fields, own_methods) = self.members_of(&i.name, &i.members)?;
+                    fields.extend(own_fields);
+                    methods.extend(own_methods);
+                    let s = self.struct_mut(&i.name).expect("interface");
+                    s.fields = fields;
+                    s.methods = methods;
                 }
                 StmtKind::TypeAlias(a) => {
                     if let TypeAnn::Object(members, _) = &a.ty {
@@ -507,6 +516,68 @@ impl<'m> Infer<'m> {
         s.statics = statics;
         s.parent = parent;
         s.is_abstract = c.is_abstract;
+        // `implements I`: every field and method of `I` is here, with the same type.
+        let mut implements = Vec::new();
+        for ann in &c.implements {
+            let TypeAnn::Named { name: iname, .. } = ann else {
+                return self.err("`implements` needs the name of an interface", ann.span());
+            };
+            let Some(iface) = self.struct_by_name(iname).cloned() else {
+                return self.err(format!("unknown interface `{iname}`"), ann.span());
+            };
+            if iface.kind == StructKind::Class {
+                return self.err(
+                    format!("`{iname}` is a class: write `extends {iname}`"),
+                    ann.span(),
+                );
+            }
+            for f in &iface.fields {
+                let Some(cf) = self
+                    .struct_by_name(&c.name)
+                    .and_then(|s| s.field(&f.name).cloned())
+                else {
+                    return self.err(
+                        format!(
+                            "`{}` implements `{iname}` but has no field `{}`",
+                            c.name, f.name
+                        ),
+                        c.span,
+                    );
+                };
+                self.unify(&cf.ty, &f.ty, cf.span)?;
+            }
+            for m in &iface.methods {
+                let Some((_, cm)) = self.find_method(&c.name, &m.name, m.kind) else {
+                    return self.err(
+                        format!(
+                            "`{}` implements `{iname}` but has no method `{}`",
+                            c.name, m.name
+                        ),
+                        c.span,
+                    );
+                };
+                let (a, b) = (
+                    self.funcs[&m.fn_id].sig.clone(),
+                    self.funcs[&cm.fn_id].sig.clone(),
+                );
+                if a.params.len() != b.params.len() {
+                    return self.err(
+                        format!(
+                            "`{}` takes a different number of parameters than in `{iname}`",
+                            m.name
+                        ),
+                        c.span,
+                    );
+                }
+                for (x, y) in a.params.iter().zip(&b.params) {
+                    self.unify(x, y, c.span)?;
+                }
+                self.unify(&a.ret, &b.ret, c.span)?;
+                self.link_implementation(m.fn_id, cm.fn_id);
+            }
+            implements.push(iname.clone());
+        }
+        self.struct_mut(&c.name).expect("class").implements = implements;
         Ok(())
     }
 

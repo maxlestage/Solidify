@@ -825,11 +825,19 @@ impl<'a> Gen<'a> {
         } else {
             format!("{name} {{ {} }}", fields.join(", "))
         };
-        if prelude.is_empty() {
-            Ok(E::atom(literal, Repr::Owned))
+        let literal = if !prelude.is_empty() {
+            format!("{{ {prelude}{literal} }}")
         } else {
-            Ok(E::owned(format!("{{ {prelude}{literal} }}"), PREC_ATOM))
+            literal
+        };
+        // A shape held dynamically (classes stand in for it): boxed.
+        if self.p.is_dyn(&struct_name) {
+            return Ok(E::owned(
+                format!("Box::new({literal}) as Box<dyn {name}Like>"),
+                super::PREC_CAST,
+            ));
         }
+        Ok(E::atom(literal, Repr::Owned))
     }
 
     fn unary(&mut self, op: UnaryOp, arg: &'a Expr) -> GResult<E> {

@@ -13,6 +13,13 @@ impl<'m> Infer<'m> {
     pub(super) fn finish(mut self) -> IResult<Program> {
         self.propagate_throws();
         self.propagate_mutation();
+        // A method is mutating when any implementation or override of it is.
+        let ids: Vec<NodeId> = self.funcs.keys().copied().collect();
+        for id in ids {
+            if self.method_mutates(id) {
+                self.funcs.get_mut(&id).expect("fn").mutates_self = true;
+            }
+        }
         self.float_json_numbers();
         // A narrowed value whose alias is changed is bound mutably.
         for (binding, test) in self.alias_of_narrow.clone() {
