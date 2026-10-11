@@ -1311,9 +1311,9 @@ impl<'m> Infer<'m> {
             self.calls_in_try.insert(e.id);
         }
         match &callee.kind {
-            ExprKind::Super => return self.super_call(e, args),
+            ExprKind::Super => self.super_call(e, args),
             ExprKind::Member { obj, prop, .. } if matches!(obj.kind, ExprKind::Super) => {
-                return self.super_method_call(e, prop, args);
+                self.super_method_call(e, prop, args)
             }
             ExprKind::Ident(name) => {
                 if let Some(id) = self.lookup(name) {
