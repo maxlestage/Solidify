@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod codegen;
+pub mod desugar;
 pub mod error;
 pub mod infer;
 pub mod lexer;
