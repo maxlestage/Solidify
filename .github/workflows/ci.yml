@@ -14,8 +14,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          targets: wasm32-unknown-unknown, wasm32-wasip1
           components: clippy, rustfmt
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
       - uses: Swatinem/rust-cache@v2
       - name: Install wasm-bindgen-cli
         run: cargo install wasm-bindgen-cli --version 0.2.129 --locked
@@ -40,6 +43,14 @@ jobs:
         run: BASE_PATH=/Solidify cargo run --release -p solidify-site -- export dist
       - name: Package the crate
         run: cargo package -p solidify --allow-dirty
+      # Same commands as npm.yml: the transpiler as WebAssembly for `npx solidify-rs`,
+      # checked against every test program.
+      - name: Build the npm package
+        run: |
+          cargo build -p solidify --bin solidify --target wasm32-wasip1 --profile wasm-release
+          cp target/wasm32-wasip1/wasm-release/solidify.wasm LICENSE npm/
+          node npm/test.js
+          cd npm && npm pack --dry-run
 
   # Every branch is merged into master as soon as everything above is green (master is then
   # published on GitHub Pages by pages.yml). Branches named wip/... are never merged.
@@ -67,4 +78,6 @@ jobs:
       - name: Publish the site
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh workflow run pages.yml --ref master
+        run: |
+          gh workflow run pages.yml --ref master
+          gh workflow run npm.yml --ref master

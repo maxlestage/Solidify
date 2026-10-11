@@ -1,0 +1,32 @@
+{
+  "name": "solidify-rs",
+  "version": "0.1.0",
+  "description": "Write TypeScript or JavaScript, get Rust: a transpiler with type inference, run with npx.",
+  "keywords": [
+    "typescript",
+    "javascript",
+    "rust",
+    "transpiler",
+    "compiler"
+  ],
+  "homepage": "https://maxlestage.github.io/Solidify/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/maxlestage/Solidify.git"
+  },
+  "author": "Maxime Nathan Lestage",
+  "license": "SEE LICENSE IN LICENSE",
+  "bin": {
+    "solidify-rs": "bin/solidify.js",
+    "solidify": "bin/solidify.js"
+  },
+  "files": [
+    "bin",
+    "solidify.wasm",
+    "LICENSE",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  }
+}
