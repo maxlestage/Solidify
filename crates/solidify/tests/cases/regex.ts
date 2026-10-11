@@ -32,3 +32,19 @@ console.log("cat cot cut".replace(re, "-"), re.test("dog"), new RegExp("^a+$").t
 console.log("tabs\tand\nnewlines".split(/\s/).length, "mississippi".replace(/s+/g, "S"), /(?<word>\w+)/.exec("hi there")?.[1]);
 console.log("price: 42 EUR".replace("42", (n) => (parseInt(n)! * 2).toString()), "aaa".replaceAll("a", (x) => x.toUpperCase()));
 console.log(/^\p{L}+$/u.test("été"), "é".length, /colou?r/.test("the colour"), re);
+
+// `exec` with the g flag walks the text through `lastIndex`.
+const pairs = /(\w)(\d)/g;
+const sample = "a1 b2 c3";
+let m;
+while ((m = pairs.exec(sample)) !== null) {
+  console.log(m[0], m[1], m[2], m.index, pairs.lastIndex);
+}
+console.log(pairs.lastIndex);
+const sticky = /\d+/y;
+sticky.lastIndex = 3;
+console.log(sticky.test("ab 123"), sticky.lastIndex, sticky.test("ab 123"), sticky.lastIndex);
+let hit: RegExpExecArray | null = null;
+if ((hit = /b(\d)/.exec(sample)) !== null) {
+  console.log("found", hit[1], "at", hit.index);
+}

@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 /// Regular expressions: a small engine written into the program, with JavaScript's syntax.
 static EMAIL: LazyLock<JsRegex> = LazyLock::new(|| JsRegex::new("^([\\w.+-]+)@([\\w-]+)\\.([a-z]{2,})$", "i"));
 const TEXT: &str = "Dates: 2024-01-15, 1999-12-31 and 2000-02-29.";
+const SAMPLE: &str = "a1 b2 c3";
 
 fn check(address: &str) -> String {
     let m = (*EMAIL).exec(address);
@@ -36,6 +37,18 @@ fn main() {
     println!("{} {} {}", JsRegex::new("\\s", "").split("tabs\tand\nnewlines").len(), JsRegex::new("s+", "g").replace("mississippi", "S"), JsRegex::new("(?<word>\\w+)", "").exec("hi there").as_ref().map(|v| v.get(1)).as_ref().map_or("null".to_string(), |v| v.to_string()));
     println!("{} {}", JsRegex::new("42", "").replace_with("price: 42 EUR", |m_| (|n: String| (js_parse_int(&n).unwrap() * 2).to_string())(m_.get(0))), JsRegex::new("a", "g").replace_with("aaa", |m_| (|x: String| x.to_uppercase())(m_.get(0))));
     println!("{} {} {} {re}", JsRegex::new("^\\p{L}+$", "u").test("été"), "é".chars().count(), JsRegex::new("colou?r", "").test("the colour"));
+    // `exec` with the g flag walks the text through `lastIndex`.
+    let pairs = JsRegex::new("(\\w)(\\d)", "g");
+    while let Some(m) = &pairs.exec(SAMPLE) {
+        println!("{} {} {} {} {}", m.get(0), m.get(1), m.get(2), m.index, pairs.last_index());
+    }
+    println!("{}", pairs.last_index());
+    let mut sticky = JsRegex::new("\\d+", "y");
+    sticky.set_last_index(3);
+    println!("{} {} {} {}", sticky.test("ab 123"), sticky.last_index(), sticky.test("ab 123"), sticky.last_index());
+    if let Some(hit) = &JsRegex::new("b(\\d)", "").exec(SAMPLE) {
+        println!("found {} at {}", hit.get(1), hit.index);
+    }
 }
 
 /// `parseInt(s)`: the leading integer, or `None` for `NaN`.
@@ -519,7 +532,7 @@ fn js_group_array(ctx: &JsInspectCtx, output: Vec<String>, items: &[JsValue]) ->
 
 /// A regular expression (`/pattern/flags`): parsed once, matched by backtracking on the
 /// characters of the text, with JavaScript's syntax and semantics.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct JsRegex {
     root: Vec<Vec<RxNode>>,
@@ -529,8 +542,29 @@ pub struct JsRegex {
     multiline: bool,
     dot_all: bool,
     global: bool,
+    sticky: bool,
     source: String,
     flags: String,
+    /// `re.lastIndex`: where the next `exec` or `test` starts, with the `g` or `y` flag.
+    last_index: std::sync::atomic::AtomicUsize,
+}
+
+impl Clone for JsRegex {
+    fn clone(&self) -> JsRegex {
+        JsRegex {
+            root: self.root.clone(),
+            groups: self.groups,
+            names: self.names.clone(),
+            ignore_case: self.ignore_case,
+            multiline: self.multiline,
+            dot_all: self.dot_all,
+            global: self.global,
+            sticky: self.sticky,
+            source: self.source.clone(),
+            flags: self.flags.clone(),
+            last_index: std::sync::atomic::AtomicUsize::new(self.last_index() as usize),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -562,6 +596,13 @@ pub struct JsMatch {
     pub index: i64,
     pub input: String,
     pub groups: Vec<Option<String>>,
+}
+
+impl JsMatch {
+    /// The character position just after the match.
+    pub fn end(&self) -> usize {
+        self.index as usize + self.groups[0].as_ref().map_or(0, |g| g.chars().count())
+    }
 }
 
 #[allow(dead_code)]
@@ -621,8 +662,10 @@ impl JsRegex {
             multiline: flags.contains('m'),
             dot_all: flags.contains('s'),
             global: flags.contains('g'),
+            sticky: flags.contains('y'),
             source: source.to_string(),
             flags: flags.to_string(),
+            last_index: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -814,47 +857,77 @@ impl JsRegex {
 
     /// The first match at or after character `from`.
     fn find_from(&self, text: &[char], input: &str, from: usize) -> Option<JsMatch> {
-        for start in from..=text.len() {
-            let mut caps: RxCaps = vec![None; self.groups + 1];
-            let mut found: Option<usize> = None;
-            let matched = self.seq(
-                text,
-                &[RxNode::Group(self.root.clone(), Some(0))],
-                start,
-                &mut caps,
-                &mut |end, _| {
-                    found = Some(end);
-                    true
-                },
-            );
-            if matched {
-                let groups = caps
-                    .iter()
-                    .map(|c| c.map(|(a, b)| text[a..b].iter().collect::<String>()))
-                    .collect();
-                let _ = found;
-                return Some(JsMatch {
-                    index: start as i64,
-                    input: input.to_string(),
-                    groups,
-                });
-            }
+        (from..=text.len()).find_map(|start| self.try_at(text, input, start))
+    }
+
+    /// The match starting exactly at `start`.
+    fn try_at(&self, text: &[char], input: &str, start: usize) -> Option<JsMatch> {
+        let mut caps: RxCaps = vec![None; self.groups + 1];
+        let mut found: Option<usize> = None;
+        let matched = self.seq(
+            text,
+            &[RxNode::Group(self.root.clone(), Some(0))],
+            start,
+            &mut caps,
+            &mut |end, _| {
+                found = Some(end);
+                true
+            },
+        );
+        if !matched {
+            return None;
         }
-        None
+        let groups = caps
+            .iter()
+            .map(|c| c.map(|(a, b)| text[a..b].iter().collect::<String>()))
+            .collect();
+        let _ = found;
+        Some(JsMatch {
+            index: start as i64,
+            input: input.to_string(),
+            groups,
+        })
     }
 
     fn chars(input: &str) -> Vec<char> {
         input.chars().collect()
     }
 
-    /// `re.test(s)`.
+    /// `re.test(s)`: like `exec`, `lastIndex` included.
     pub fn test(&self, input: &str) -> bool {
-        self.find_from(&Self::chars(input), input, 0).is_some()
+        self.exec(input).is_some()
     }
 
-    /// `re.exec(s)` / `s.match(re)` without the `g` flag.
+    /// `re.exec(s)`: the first match, or with the `g` or `y` flag the next one from
+    /// `lastIndex`, which then moves past it (back to 0 when nothing matches).
     pub fn exec(&self, input: &str) -> Option<JsMatch> {
-        self.find_from(&Self::chars(input), input, 0)
+        use std::sync::atomic::Ordering;
+        let text = Self::chars(input);
+        if !(self.global || self.sticky) {
+            return self.find_from(&text, input, 0);
+        }
+        let from = self.last_index.load(Ordering::Relaxed);
+        let found = if from > text.len() {
+            None
+        } else if self.sticky {
+            self.try_at(&text, input, from)
+        } else {
+            self.find_from(&text, input, from)
+        };
+        let next = found.as_ref().map_or(0, JsMatch::end);
+        self.last_index.store(next, Ordering::Relaxed);
+        found
+    }
+
+    /// `re.lastIndex`.
+    pub fn last_index(&self) -> i64 {
+        self.last_index.load(std::sync::atomic::Ordering::Relaxed) as i64
+    }
+
+    /// `re.lastIndex = i`.
+    pub fn set_last_index(&self, i: i64) {
+        self.last_index
+            .store(i.max(0) as usize, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Every match, as `s.matchAll(re)` gives them.
