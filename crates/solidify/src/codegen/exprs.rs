@@ -2398,7 +2398,9 @@ impl<'a> Gen<'a> {
             params.push(text);
             if !matches!(p.pat, Pattern::Ident { .. }) {
                 let lines = self.capture(|g| match &p.pat {
-                    Pattern::Object { props, .. } => g.destructure_object(props, &name, &pty),
+                    Pattern::Object { props, rest, .. } => {
+                        g.destructure_object_rest(props, rest, &name, &pty)
+                    }
                     Pattern::Array { elems, rest, .. } => {
                         g.destructure_array(elems, rest, &name, &pty)
                     }
