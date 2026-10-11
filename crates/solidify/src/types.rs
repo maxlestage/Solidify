@@ -50,9 +50,15 @@ impl Ty {
     pub fn named(name: impl Into<String>) -> Ty {
         Ty::Named(name.into(), Vec::new())
     }
+
+    /// `Promise<T>`: a task started at once, whose value `await` gets.
+    pub fn promise(t: Ty) -> Ty {
+        Ty::Named(PROMISE.into(), vec![t])
+    }
 }
 
 /// The name of the dynamic type ([`Ty::dynamic`]).
+pub const PROMISE: &str = "Promise";
 pub const DYNAMIC: &str = "JsValue";
 
 #[derive(Clone, Debug, PartialEq)]

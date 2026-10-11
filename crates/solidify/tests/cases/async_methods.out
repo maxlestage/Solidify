@@ -1,0 +1,15 @@
+sync first
+after main call
+micro 1
+ann 12 12
+caught: too big: 5
+started
+10 10
+done 2
+done 3
+done 1
+[ 2, 4, 6 ]
+fulfilled 10 undefined
+rejected undefined too big: 9
+chain: too big: 10
+finally

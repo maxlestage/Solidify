@@ -513,7 +513,11 @@ impl<'m> Infer<'m> {
                 if id == self.main_id {
                     self.funcs.get_mut(&id).expect("main").is_async = true;
                 }
-                self.expr(inner, expected)
+                if self.ctx().try_depth > 0 {
+                    self.calls_in_try.insert(e.id);
+                }
+                let t = self.expr(inner, None)?;
+                self.awaited(inner, e.id, &t)
             }
             ExprKind::Yield { value, delegate } => {
                 let Some(t) = self.ctx().yield_ty.clone() else {
@@ -1355,6 +1359,58 @@ impl<'m> Infer<'m> {
         None
     }
 
+    /// The value of `await x` (`at` is the await): a promise's value, or `x` itself.
+    pub(super) fn awaited(&mut self, x: &'m Expr, at: NodeId, t: &Ty) -> IResult<Ty> {
+        let t = match self.types.resolve(t) {
+            Ty::Var(_) => {
+                let inner = self.types.fresh();
+                self.types.unify(t, &Ty::promise(inner.clone())).ok();
+                return self.awaited(x, at, &Ty::promise(inner));
+            }
+            t => t,
+        };
+        self.uses_timers = true;
+        let Ty::Named(n, args) = &t else {
+            return Ok(t);
+        };
+        if n != crate::types::PROMISE {
+            return Ok(t);
+        }
+        match &x.kind {
+            ExprKind::Call { .. }
+                if matches!(
+                    self.calls.get(&x.id),
+                    Some(Callee::Fn(_) | Callee::Method { .. } | Callee::SuperMethod { .. })
+                ) =>
+            {
+                self.awaited_calls.insert(x.id);
+            }
+            _ => {
+                let id = self.ctx().id;
+                self.promise_awaits.push((id, at));
+            }
+        }
+        Ok(args[0].clone())
+    }
+
+    /// A value returned from an async body: a promise given back is waited for.
+    pub(super) fn returned(&mut self, x: &'m Expr, t: &Ty, ret: &Ty) -> IResult<Ty> {
+        let id = self.ctx().id;
+        let is_async = self.funcs.get(&id).is_some_and(|f| f.is_async);
+        if is_async
+            && let Ty::Named(n, _) = self.types.resolve(t)
+            && n == crate::types::PROMISE
+            && !matches!(self.types.resolve(ret), Ty::Named(m, _) if m == crate::types::PROMISE)
+        {
+            if self.ctx().try_depth > 0 {
+                self.calls_in_try.insert(x.id);
+            }
+            self.auto_awaits.insert(x.id);
+            return self.awaited(x, x.id, t);
+        }
+        Ok(t.clone())
+    }
+
     pub(super) fn closure(&mut self, f: &'m Function, expected: Option<&Ty>) -> IResult<Ty> {
         let mut info = self.signature(f, None, None, false)?;
         if let Some(Ty::Func(ex)) = expected {
@@ -1857,19 +1913,15 @@ impl<'m> Infer<'m> {
                 };
                 let t = self.expr(&a.expr, Some(&executor))?;
                 self.expect(&t, &executor, a.expr.span)?;
-                let id = self.ctx().id;
-                let is_async = self.funcs.get(&id).is_some_and(|f| f.is_async);
-                if !is_async && id != self.main_id {
-                    return self.err(
-                        "`new Promise` must be made in an async function (it is awaited there)",
-                        e.span,
-                    );
+                self.mark_stored(&a.expr);
+                if let ExprKind::Arrow(f) | ExprKind::Func(f) = &a.expr.kind
+                    && f.params.len() > 1
+                {
+                    self.rejects = true;
                 }
-                if id == self.main_id {
-                    self.funcs.get_mut(&id).expect("main").is_async = true;
-                }
+                self.uses_timers = true;
                 self.calls.insert(e.id, Callee::Builtin("new Promise"));
-                Ok(value)
+                Ok(Ty::promise(value))
             }
             "RegExp" => {
                 self.arg_typed(args, 0, Some(Ty::Str), "RegExp", e.span)?;
@@ -2591,6 +2643,7 @@ impl<'m> Infer<'m> {
                     && n != "Date"
                     && n != "Symbol"
                     && n != "bigint"
+                    && n != crate::types::PROMISE
                     && !self.is_type_param(n) =>
             {
                 let Some(s) = self.struct_by_name(n) else {
