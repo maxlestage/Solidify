@@ -367,6 +367,9 @@ pub struct Program {
     pub overrides: HashMap<NodeId, Vec<NodeId>>,
     /// The program sets timers: they run once `main` is done.
     pub uses_timers: bool,
+    /// Declarations not written: variables only assigned inside a null test, whose
+    /// value the test binds.
+    pub drop_decl: HashSet<NodeId>,
 }
 
 impl Program {
@@ -523,6 +526,11 @@ pub(super) struct Infer<'m> {
     pub(super) namespaces: HashMap<NodeId, usize>,
     /// For each file, its exported names and the global name each one stands for.
     pub(super) exports: Vec<HashMap<String, String>>,
+    /// Variables assigned inside a null test (`(m = re.exec(s)) !== null`), with the ids
+    /// of the assignment targets: the test binds the value itself.
+    pub(super) assign_narrowed: HashMap<NodeId, Vec<NodeId>>,
+    /// The null tests made on an assignment: `while let` binds a fresh value each time.
+    pub(super) assign_tests: HashSet<NodeId>,
     pub(super) types: Types,
     pub(super) node_count: usize,
     pub(super) next_synth: usize,
@@ -637,6 +645,8 @@ pub fn infer<'m>(
         files,
         namespaces: HashMap::new(),
         exports: Vec::new(),
+        assign_narrowed: HashMap::new(),
+        assign_tests: HashSet::new(),
         types: Types::default(),
         node_count: module.node_count,
         next_synth: module.node_count + 1,
@@ -801,6 +811,25 @@ impl<'m> Infer<'m> {
     }
 
     /// Binds the names of a pattern to the parts of `ty`.
+    /// `let` and `const` cannot declare a name twice in one scope (JavaScript refuses it).
+    pub(super) fn check_redeclaration(&self, kind: VarKind, pat: &Pattern) -> IResult<()> {
+        if kind == VarKind::Var {
+            return Ok(());
+        }
+        let Some(scope) = self.scopes.last() else {
+            return Ok(());
+        };
+        for (name, _) in pat.names() {
+            if scope.vars.contains_key(name) {
+                return self.err(
+                    format!("`{name}` is already declared in this scope"),
+                    pat.span(),
+                );
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn bind_pattern(&mut self, pat: &'m Pattern, ty: &Ty, role: Role) -> IResult<()> {
         match pat {
             Pattern::Ident { name, span, id } => {

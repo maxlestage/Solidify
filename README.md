@@ -113,7 +113,7 @@ Three passes, all deterministic:
 | `A \| B`, `[1, "two"]`, discriminated unions, `typeof x === "string"`, `"kind" in x` | `enum` with one variant per member, `match` |
 | `function*`, `yield`, `yield*` | `JsGenerator<T>`, `for x in gen` |
 | `setTimeout`, `setInterval`, `clearTimeout`, `new Promise`, `Promise.all` | an event loop run by `main`, `JsPromise` |
-| `/regex/flags`, `new RegExp`, `test`, `exec`, `match`, `matchAll`, `replace`, `split`, `search` | `JsRegex`, a backtracking engine shipped in the generated file |
+| `/regex/flags`, `new RegExp`, `test`, `exec`, `match`, `matchAll`, `replace`, `split`, `search`, `lastIndex`, `while ((m = re.exec(s)) !== null)` | `JsRegex`, a backtracking engine shipped in the generated file, `while let Some(m) = re.exec(&s)` |
 | `JSON.stringify(v, null, 2)`, `JSON.parse` into an annotated type | the value's `JsValue`, a generated `JsFromJson` for the parsed type |
 | `import`, `export`, `export default`, `import * as ns`, `export … from` | one `mod` per imported file, `pub` for exports |
 | `console.log` of objects, arrays, maps, sets, nested values | the exact text Node.js prints (`util.inspect` rules) |
