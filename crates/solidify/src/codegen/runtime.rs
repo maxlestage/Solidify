@@ -421,23 +421,23 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::BigInt => include_str!("runtime/bigint.rs"),
             Helper::Error => include_str!("runtime/error.rs"),
             Helper::BlockOn => {
-                r#"/// Runs a future to completion, running the timers it waits on.
+                r#"/// Runs the top level, with the tasks and timers it waits for.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    fn noop(_: *const ()) {}
-    fn clone(p: *const ()) -> RawWaker {
-        RawWaker::new(p, &VTABLE)
-    }
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
     let mut future = std::pin::pin!(future);
     loop {
-        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+        if let std::task::Poll::Ready(v) = future.as_mut().poll(&mut cx) {
             return v;
         }
+        let before = JS_TICK.with(|t| t.get());
+        js_run_tasks();
+        if JS_TICK.with(|t| t.get()) != before {
+            continue;
+        }
+        js_report_unhandled();
         if !js_run_next_timer() {
-            panic!("a promise never settled");
+            // Node leaves a top-level await nothing will settle.
+            std::process::exit(13);
         }
     }
 }"#

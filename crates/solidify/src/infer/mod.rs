@@ -8,6 +8,7 @@
 
 mod annotations;
 mod builtins;
+pub use builtins::SETTLED;
 mod decls;
 mod dynamic;
 mod exprs;
@@ -411,6 +412,10 @@ pub struct Program {
     pub overrides: HashMap<NodeId, Vec<NodeId>>,
     /// The program sets timers: they run once `main` is done.
     pub uses_timers: bool,
+    /// Promises returned from an async body, which it waits for.
+    pub auto_awaits: HashSet<NodeId>,
+    /// Some promise of the program may be rejected: awaiting one may throw.
+    pub promise_rejects: bool,
     /// Declarations not written: variables only assigned inside a null test, whose
     /// value the test binds.
     pub drop_decl: HashSet<NodeId>,
@@ -887,6 +892,13 @@ pub(super) struct Infer<'m> {
     pub(super) class_asts: HashMap<String, &'m Class>,
     pub(super) collected_classes: HashSet<String>,
     pub(super) uses_timers: bool,
+    /// `await p` of a promise value: (function, await).
+    pub(super) promise_awaits: Vec<(NodeId, NodeId)>,
+    /// Calls awaited where they are made: the caller throws when the callee does.
+    pub(super) awaited_calls: HashSet<NodeId>,
+    pub(super) auto_awaits: HashSet<NodeId>,
+    /// A promise may be rejected other than by a throwing async function.
+    pub(super) rejects: bool,
 }
 
 /// A use of a variable: the expression, the loop depth, the function and the branch path.
@@ -1040,6 +1052,10 @@ pub fn infer<'m>(
         class_asts: HashMap::new(),
         collected_classes: HashSet::new(),
         uses_timers: false,
+        promise_awaits: Vec::new(),
+        awaited_calls: HashSet::new(),
+        auto_awaits: HashSet::new(),
+        rejects: false,
     };
     inf.run(module)?;
     inf.finish()

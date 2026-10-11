@@ -2782,9 +2782,21 @@ impl<'a> Gen<'a> {
             .map(|t| t.jumps)
             .unwrap_or_default();
         let body = body?;
-        self.line(&format!("let result_: {result_ty} = (|| {{"));
-        self.out.push_str(&body);
-        self.line("})();");
+        // In an async body the block may wait: an async block, waited for at once.
+        let in_async = self
+            .p
+            .funcs
+            .get(&self.fn_ctx().id)
+            .is_some_and(|f| f.is_async);
+        if in_async {
+            self.line(&format!("let result_: {result_ty} = async {{"));
+            self.out.push_str(&body);
+            self.line("}.await;");
+        } else {
+            self.line(&format!("let result_: {result_ty} = (|| {{"));
+            self.out.push_str(&body);
+            self.line("})();");
+        }
         if let Some(f) = finally {
             self.block_body(&f.stmts, false)?;
         }

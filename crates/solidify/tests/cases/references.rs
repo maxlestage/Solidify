@@ -822,6 +822,7 @@ impl<T: JsInspect + ?Sized> JsInspect for Shared<T> {
 struct JsStatic<T>(std::cell::RefCell<T>);
 
 unsafe impl<T> Sync for JsStatic<T> {}
+unsafe impl<T> Send for JsStatic<T> {}
 
 #[allow(dead_code)]
 impl<T> JsStatic<T> {
