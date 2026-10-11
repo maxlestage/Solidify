@@ -314,6 +314,14 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     let ty = self.resolve(&var.ty);
+                    // Only assigned inside null tests, which bind the value themselves.
+                    if self.p.drop_decl.contains(id)
+                        && d.init
+                            .as_ref()
+                            .is_none_or(|i| matches!(i.kind, ExprKind::Null | ExprKind::Undefined))
+                    {
+                        continue;
+                    }
                     let Some(init) = &d.init else {
                         let t = self.rust_ty(&ty, *span)?;
                         let name = self.bind(*id, Repr::Owned);
@@ -784,6 +792,18 @@ impl<'a> Gen<'a> {
         };
         let tt = self.ty_of(t);
         let vt = self.ty_of(value);
+        // `re.lastIndex = i`
+        if let ExprKind::Member { obj, prop, .. } = &t.kind
+            && prop == "lastIndex"
+            && matches!(self.ty_of(obj), Ty::Named(ref n) if n == "RegExp")
+            && op == AssignOp::Assign
+        {
+            let r = self.expr(obj)?;
+            let r = Self::paren(&r, PREC_POSTFIX);
+            let i = self.expr_as(value, Want::Owned)?;
+            self.line(&format!("{r}.set_last_index({i});"));
+            return Ok(());
+        }
         // `map[key] = value`
         if let ExprKind::Index { obj, index, .. } = &t.kind
             && let Ty::Map(k, v, _) = self.ty_of(obj)
