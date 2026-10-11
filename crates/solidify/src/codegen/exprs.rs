@@ -1290,6 +1290,15 @@ impl<'a> Gen<'a> {
                     self.expr(left)?;
                     return Ok(E::atom("false", Repr::Owned));
                 };
+                if class == "Error" && self.p.is_error_class(sub) {
+                    self.helper(super::Helper::Error);
+                    let x = self.expr(left)?;
+                    let x = self.coerce(x, &lt, Want::Ref);
+                    return Ok(E::owned(
+                        format!("js_error_is({x}, \"{sub}\")"),
+                        PREC_POSTFIX,
+                    ));
+                }
                 if self.p.is_subclass(&class, sub) {
                     self.expr(left)?;
                     return Ok(E::atom("true", Repr::Owned));
@@ -1742,7 +1751,19 @@ impl<'a> Gen<'a> {
             self.instance_tests
                 .insert((base.clone(), sub.clone(), mutated));
             let recv = Self::paren(&x, PREC_POSTFIX);
-            if self.p.is_shared(&base) {
+            if base == "Error" {
+                // A caught error of the program's own class: read back.
+                self.helper(super::Helper::Error);
+                let sub_ty = Ty::named(sub.clone());
+                let _ = self.mark_json(&sub_ty, Default::default());
+                let rt = self
+                    .rust_ty(&sub_ty, Default::default())
+                    .unwrap_or_default();
+                (
+                    format!("js_error_as::<{rt}>(&{recv}, \"{sub}\")"),
+                    Repr::Owned,
+                )
+            } else if self.p.is_shared(&base) {
                 // The subclass's handle: the guard is dropped before the block.
                 (
                     format!(
@@ -2008,6 +2029,15 @@ impl<'a> Gen<'a> {
                 "input" => E::new(format!("{base}.input"), PREC_POSTFIX, Repr::Place),
                 _ => E::new(format!("{base}.len()"), PREC_POSTFIX, Repr::Usize),
             }),
+            Ty::Named(n, ..) if n == "Error" && !self.p.error_classes.is_empty() => {
+                self.helper(super::Helper::Error);
+                let code = match prop {
+                    "message" => format!("js_error_message(&{base})"),
+                    "name" => format!("js_error_name(&{base})"),
+                    _ => "String::new()".to_string(),
+                };
+                Ok(E::owned(code, PREC_POSTFIX))
+            }
             Ty::Named(n, ..) if n == "Error" => Ok(match prop {
                 "message" => {
                     let mut x = E::atom(

@@ -185,6 +185,21 @@ impl<'m> Infer<'m> {
                 ret: zonk(&f.sig.ret),
             };
         }
+        let error_classes = {
+            let mut set = self.error_classes.clone();
+            loop {
+                let before = set.len();
+                for s in &self.structs {
+                    if s.parent.as_ref().is_some_and(|p| set.contains(p)) {
+                        set.insert(s.name.clone());
+                    }
+                }
+                if set.len() == before {
+                    break;
+                }
+            }
+            set
+        };
         let mut structs = self.structs;
         for s in &mut structs {
             for f in &mut s.fields {
@@ -226,6 +241,7 @@ impl<'m> Infer<'m> {
             dyn_casts,
             dyn_literals: self.dyn_literals,
             shared_types,
+            error_classes,
             shared_fields,
             eval_scopes: self.eval_scopes,
             narrow_tests,
