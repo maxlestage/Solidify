@@ -53,7 +53,8 @@ pub fn home(lang: Lang, origin: &str) -> String {
     seo = seo.alternate("x-default", Lang::En.path());
     let body = fragment([
         skip_link(lang),
-        // Decorations driven by app.js: reading progress and the light under the pointer.
+        // Decorations driven by the WebAssembly client (client.rs): reading progress and
+        // the light under the pointer.
         div().class("progress").attr("aria-hidden", "true"),
         div().class("glow").attr("aria-hidden", "true"),
         header(lang),
@@ -76,7 +77,7 @@ pub fn home(lang: Lang, origin: &str) -> String {
 fn head_extra() -> String {
     format!(
         "<link rel=\"icon\" href=\"{}\" type=\"image/svg+xml\"/>\
-         <meta name=\"theme-color\" content=\"#0b0b0c\"/>\
+         <meta name=\"theme-color\" content=\"{}\"/>\
          <link rel=\"manifest\" href=\"{}\"/>\
          <link rel=\"apple-touch-icon\" href=\"{}\"/>\
          <meta name=\"apple-mobile-web-app-capable\" content=\"yes\"/>\
@@ -84,33 +85,13 @@ fn head_extra() -> String {
          <link rel=\"preload\" href=\"{}\" as=\"font\" type=\"font/woff2\" crossorigin=\"\"/>\
          <link rel=\"preload\" href=\"{}\" as=\"font\" type=\"font/woff2\" crossorigin=\"\"/>",
         link("/static/favicon.svg"),
+        crate::pwa::THEME,
         link("/manifest.webmanifest"),
         link("/static/apple-touch-icon.png"),
         link("/static/fonts/geist-latin-wght-normal.woff2"),
         link("/static/fonts/geist-mono-latin-wght-normal.woff2"),
-    ) + LANGUAGE_SCRIPT
-        + &format!(
-            "<script src=\"{}\" defer=\"\"></script>",
-            link("/static/app.js")
-        )
-        + &crate::pwa::register_script(&link("/sw.js"))
+    )
 }
-
-/// Runs before the page is drawn: marks that scripts run (the hero's entrance waits for
-/// app.js, or 2.5 s at most), and opens the page in the visitor's language. A language picked in the menu is kept
-/// (`localStorage`); without one, the browser's languages decide, on the English home
-/// page only, so that a link to `/fr/` or `/es/` stays where it leads.
-const LANGUAGE_SCRIPT: &str = "<script>(function(){\
-var d=document.documentElement;d.classList.add(\"js\");\
-setTimeout(function(){d.classList.add(\"ready\")},2500);\
-var base=d.getAttribute(\"data-base\")||\"\",here=d.lang,pick=null;\
-try{pick=localStorage.getItem(\"solidify-lang\")}catch(e){}\
-if(!pick){if(here!==\"en\")return;var ls=navigator.languages||[navigator.language||\"en\"];\
-for(var i=0;i<ls.length;i++){var c=String(ls[i]).slice(0,2).toLowerCase();\
-if(c===\"en\"||c===\"fr\"||c===\"es\"){pick=c;break}}}\
-if(pick&&pick!==here&&(pick===\"en\"||pick===\"fr\"||pick===\"es\")){\
-location.replace(base+(pick===\"en\"?\"/\":\"/\"+pick+\"/\")+location.hash)}\
-})()</script>";
 
 fn json_ld(lang: Lang) -> String {
     let d = t(lang);
@@ -221,7 +202,7 @@ fn header(lang: Lang) -> Element {
         )
 }
 
-/// The language picker: works without scripts (`<details>`); app.js remembers the
+/// The language picker: works without WebAssembly (`<details>`); client.rs remembers the
 /// choice, and "Automatic" hands it back to the browser.
 fn lang_picker(lang: Lang) -> Element {
     let d = t(lang);
@@ -338,8 +319,17 @@ fn hero(lang: Lang) -> Element {
             ul().class("facts intro")
                 .attr("style", "--d:10")
                 .children(d.hero.facts.iter().map(|(value, label)| {
-                    li().child(strong().attr("data-count", *value).text(*value))
-                        .child(span().text(*label))
+                    // A whole number counts up as the page opens (CSS only, see
+                    // `.facts strong[data-count]`); the figure stays in the text.
+                    let figure = if value.parse::<u32>().is_ok() {
+                        strong()
+                            .attr("data-count", *value)
+                            .attr("style", format!("--to:{value}"))
+                            .child(span().class("value").text(*value))
+                    } else {
+                        strong().text(*value)
+                    };
+                    li().child(figure).child(span().text(*label))
                 })),
         )
         .child(

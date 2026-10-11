@@ -40,7 +40,7 @@ jobs:
         run: |
           cargo build -p solidify --bin solidify --target wasm32-wasip1 --profile wasm-release
           cp target/wasm32-wasip1/wasm-release/solidify.wasm LICENSE npm/
-          node npm/test.js
+          cargo test -p solidify --test npm
       - name: Publish
         working-directory: npm
         env:
