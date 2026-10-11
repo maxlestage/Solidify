@@ -47,7 +47,7 @@ impl<'m> Infer<'m> {
                 for p in params {
                     let mut t = match &p.ty {
                         Some(t) => self.ann(t, hint)?,
-                        None => Ty::Any,
+                        None => self.types.fresh(),
                     };
                     if p.optional {
                         t = Ty::Option(Box::new(t));
@@ -91,12 +91,16 @@ impl<'m> Infer<'m> {
             "boolean" => Ty::Bool,
             "void" | "undefined" => Ty::Void,
             "null" => Ty::Null,
-            "any" | "unknown" | "object" | "const" => Ty::Any,
+            // `any` and `unknown` are inferred from their uses, like a missing annotation.
+            "any" | "unknown" | "object" => self.types.fresh(),
+            "const" => Ty::Any,
             "never" => Ty::Never,
             "bigint" => return self.err("bigint is not supported", span),
             "symbol" => return self.err("symbols are not supported", span),
             "Array" | "ReadonlyArray" => Ty::Array(Box::new(arg(self, 0)?)),
-            "Map" | "ReadonlyMap" => Ty::Map(Box::new(arg(self, 0)?), Box::new(arg(self, 1)?)),
+            "Map" | "ReadonlyMap" => {
+                Ty::Map(Box::new(arg(self, 0)?), Box::new(arg(self, 1)?), false)
+            }
             "Set" | "ReadonlySet" => Ty::Set(Box::new(arg(self, 0)?)),
             "Record" => {
                 let k = arg(self, 0)?;
@@ -106,7 +110,7 @@ impl<'m> Infer<'m> {
                 {
                     return self.err("Record keys must be strings, numbers or an enum", span);
                 }
-                Ty::Map(Box::new(k), Box::new(v))
+                Ty::Map(Box::new(k), Box::new(v), true)
             }
             "Promise" => arg(self, 0)?,
             "Partial" | "Required" | "Readonly" | "NonNullable" | "Awaited" => arg(self, 0)?,

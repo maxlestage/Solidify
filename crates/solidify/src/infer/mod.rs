@@ -652,7 +652,7 @@ impl<'m> Infer<'m> {
                             .collect(),
                         None => return self.err(format!("cannot destructure {n}"), *span),
                     },
-                    Ty::Map(_, v) => props
+                    Ty::Map(_, v, _) => props
                         .iter()
                         .map(|p| (p.key.clone(), (**v).clone()))
                         .collect(),

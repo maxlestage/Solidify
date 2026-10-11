@@ -118,7 +118,15 @@ impl<'m> Infer<'m> {
                         ArrayElem::Spread(x) => {
                             let arr = Ty::Array(Box::new(item.clone()));
                             let xt = self.expr(x, Some(&arr))?;
-                            self.expect(&xt, &arr, x.span)?;
+                            // Arrays, sets, maps (pairs) and strings (characters) spread.
+                            match self.types.resolve(&xt) {
+                                Ty::Set(t) => self.expect(&t, &item, x.span)?,
+                                Ty::Map(k, v, _) => {
+                                    self.expect(&Ty::Tuple(vec![*k, *v]), &item, x.span)?
+                                }
+                                Ty::Str => self.expect(&Ty::Str, &item, x.span)?,
+                                _ => self.expect(&xt, &arr, x.span)?,
+                            }
                         }
                         ArrayElem::Hole => {
                             return self.err("holes in arrays are not supported", e.span);
@@ -482,7 +490,7 @@ impl<'m> Infer<'m> {
             BinOp::In => {
                 let rt = self.expr(right, None)?;
                 match self.types.resolve(&rt) {
-                    Ty::Map(k, _) => {
+                    Ty::Map(k, _, _) => {
                         let lt = self.expr(left, Some(&k))?;
                         self.expect(&lt, &k, left.span)?;
                         Ok(Ty::Bool)
@@ -647,8 +655,8 @@ impl<'m> Infer<'m> {
     ) -> IResult<Ty> {
         let expected = expected.filter(|t| !matches!(t, Ty::Var(_)));
         // A map literal.
-        if let Some(Ty::Map(k, v)) = expected {
-            let (k, v) = ((**k).clone(), (**v).clone());
+        if let Some(Ty::Map(k, v, record)) = expected {
+            let (k, v, record) = ((**k).clone(), (**v).clone(), *record);
             for p in props {
                 let PropValue::Expr(value) = &p.value else {
                     return self.err(
@@ -671,7 +679,7 @@ impl<'m> Infer<'m> {
                 self.mark_stored(value);
                 self.expect(&vt, &v, value.span)?;
             }
-            return Ok(Ty::Map(Box::new(k), Box::new(v)));
+            return Ok(Ty::Map(Box::new(k), Box::new(v), record));
         }
         let spread_struct = match props.iter().find_map(|p| match &p.value {
             PropValue::Spread(s) => Some(s),
@@ -1049,7 +1057,7 @@ impl<'m> Infer<'m> {
                 self.expect(&it, &n, index.span)?;
                 Ok(Ty::Str)
             }
-            Ty::Map(k, v) => {
+            Ty::Map(k, v, _) => {
                 let it = self.expr(index, Some(k))?;
                 self.expect(&it, k, index.span)?;
                 Ok((**v).clone())
@@ -1132,7 +1140,7 @@ impl<'m> Infer<'m> {
                     self.expect(&t, &entries, a.expr.span)?;
                 }
                 self.calls.insert(e.id, Callee::Builtin("new Map"));
-                Ok(Ty::Map(Box::new(k), Box::new(v)))
+                Ok(Ty::Map(Box::new(k), Box::new(v), false))
             }
             "Set" => {
                 let t = self.types.fresh();
@@ -1348,14 +1356,7 @@ impl<'m> Infer<'m> {
     /// `parseInt(…)`, `String(…)`…
     fn global_call(&mut self, e: &'m Expr, name: &str, args: &'m [Arg], span: Span) -> IResult<Ty> {
         let ty = match name {
-            "parseInt" => {
-                self.arg_typed(args, 0, Some(Ty::Str), name, span)?;
-                if args.len() > 1 {
-                    let i = self.types.int();
-                    self.arg_typed(args, 1, Some(i), name, span)?;
-                }
-                self.types.int()
-            }
+            "parseInt" => self.parse_int_call(args, name, span)?,
             "parseFloat" => {
                 self.arg_typed(args, 0, Some(Ty::Str), name, span)?;
                 self.types.float()
@@ -1383,8 +1384,7 @@ impl<'m> Infer<'m> {
                 Ty::Bool
             }
             "isNaN" | "isFinite" => {
-                let f = self.types.num(Flavor::Unknown);
-                self.arg_typed(args, 0, Some(f), name, span)?;
+                self.nan_test_arg(args, name, span)?;
                 Ty::Bool
             }
             "structuredClone" => self.arg_typed(args, 0, None, name, span)?,
@@ -1403,6 +1403,43 @@ impl<'m> Infer<'m> {
         self.calls
             .insert(e.id, Callee::Builtin(leak(format!("global.{name}"))));
         Ok(ty)
+    }
+
+    /// `parseInt(s)` is `Option<i64>` (`NaN` is `None`); `parseInt(n)` truncates a number.
+    pub(super) fn parse_int_call(
+        &mut self,
+        args: &'m [Arg],
+        name: &str,
+        span: Span,
+    ) -> IResult<Ty> {
+        let t = self.arg_typed(args, 0, None, name, span)?;
+        if args.len() > 1 {
+            let i = self.types.int();
+            self.arg_typed(args, 1, Some(i), name, span)?;
+        }
+        Ok(match self.types.resolve(&t) {
+            Ty::Num(_) => self.types.int(),
+            other => {
+                self.expect(&other, &Ty::Str, args[0].expr.span)?;
+                Ty::Option(Box::new(self.types.int()))
+            }
+        })
+    }
+
+    /// The argument of `isNaN` / `isFinite`: a number, or the `Option` of `parseInt`.
+    pub(super) fn nan_test_arg(&mut self, args: &'m [Arg], name: &str, span: Span) -> IResult<Ty> {
+        let t = self.arg_typed(args, 0, None, name, span)?;
+        match self.types.resolve(&t) {
+            Ty::Option(inner) => {
+                let n = self.types.num(Flavor::Unknown);
+                self.expect(&inner, &n, args[0].expr.span)?;
+            }
+            other => {
+                let n = self.types.num(Flavor::Unknown);
+                self.expect(&other, &n, args[0].expr.span)?;
+            }
+        }
+        Ok(t)
     }
 
     /// Argument `i` of a builtin call, typed.
@@ -1537,17 +1574,86 @@ impl<'m> Infer<'m> {
                 ),
                 obj.span,
             ),
-            Ty::Var(_) => self.err(
-                format!(
-                    "the type of `{}` is not known yet: add an annotation",
-                    self.text(obj)
-                ),
-                obj.span,
-            ),
+            Ty::Var(_) => {
+                // A method that only strings or only arrays have decides the type.
+                let guessed = if STRING_METHODS.contains(&prop) {
+                    Some(Ty::Str)
+                } else if ARRAY_METHODS.contains(&prop) {
+                    Some(Ty::Array(Box::new(self.types.fresh())))
+                } else {
+                    None
+                };
+                let Some(guess) = guessed else {
+                    return self.err(
+                        format!(
+                            "the type of `{}` is not known yet: add an annotation",
+                            self.text(obj)
+                        ),
+                        obj.span,
+                    );
+                };
+                self.unify(&ot, &guess, obj.span)?;
+                let ot = self.types.resolve(&guess);
+                self.builtin_method(e, obj, &ot, prop, args)
+            }
             _ => self.builtin_method(e, obj, &ot, prop, args),
         }
     }
 }
+
+/// Methods only strings have: calling one on a value of unknown type makes it a string.
+const STRING_METHODS: &[&str] = &[
+    "toUpperCase",
+    "toLowerCase",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "charAt",
+    "charCodeAt",
+    "codePointAt",
+    "startsWith",
+    "endsWith",
+    "substring",
+    "substr",
+    "padStart",
+    "padEnd",
+    "repeat",
+    "split",
+    "replace",
+    "replaceAll",
+    "localeCompare",
+    "match",
+    "matchAll",
+    "search",
+];
+
+/// Methods only arrays have.
+const ARRAY_METHODS: &[&str] = &[
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "map",
+    "filter",
+    "forEach",
+    "reduce",
+    "reduceRight",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "some",
+    "every",
+    "join",
+    "splice",
+    "reverse",
+    "sort",
+    "fill",
+    "flat",
+    "flatMap",
+    "toSorted",
+    "toReversed",
+];
 
 /// `users` → `user`, `entries` → `entry`.
 fn singular(hint: &str) -> String {

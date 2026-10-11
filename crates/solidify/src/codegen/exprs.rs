@@ -308,12 +308,89 @@ impl<'a> Gen<'a> {
         Ok(E::owned(format_call("format!", &fmt, &args), PREC_ATOM))
     }
 
+    /// `x` (a Rust expression of type `ty`) as JavaScript's `String(x)`.
+    pub(super) fn string_of(&mut self, code: &str, ty: &Ty) -> String {
+        if self.is_inspect_ty(ty) {
+            self.inspect_call(code, ty, false)
+        } else {
+            format!("{code}.to_string()")
+        }
+    }
+
+    /// A value shown by `console.log`: objects, arrays, maps and sets are inspected like
+    /// Node does; the rest prints as in a template string.
+    pub(super) fn log_arg(&mut self, x: &'a Expr) -> GResult<(String, Option<String>)> {
+        let ty = self.ty_of(x);
+        if !self.is_inspect_ty(&ty) {
+            return self.format_arg(x);
+        }
+        if let Some((shown, _)) = empty_literal(x) {
+            return Ok((format_text(shown), None));
+        }
+        let e = self.expr(x)?;
+        if let Ty::Option(inner) = self.resolve(&ty) {
+            let missing = self.missing_word(x);
+            let code = self.coerce(e, &ty, Want::Display);
+            let shown = self.inspect_call("v", &inner, true);
+            return Ok((
+                "{}".into(),
+                Some(format!(
+                    "{code}.as_ref().map_or(\"{missing}\".to_string(), |v| {shown})"
+                )),
+            ));
+        }
+        let code = self.coerce(e, &ty, Want::Display);
+        Ok(("{}".into(), Some(self.inspect_call(&code, &ty, true))))
+    }
+
+    /// `undefined` for the methods that give it, `null` otherwise.
+    fn missing_word(&self, x: &Expr) -> &'static str {
+        match self.p.calls.get(&x.id) {
+            Some(Callee::Builtin(n))
+                if matches!(
+                    *n,
+                    "map.get"
+                        | "array.find"
+                        | "array.findLast"
+                        | "array.pop"
+                        | "array.shift"
+                        | "array.at"
+                ) =>
+            {
+                "undefined"
+            }
+            Some(Callee::Builtin("global.parseInt")) => "NaN",
+            _ => "null",
+        }
+    }
+
     /// A value in a format string: `{name}` inline when it is a plain variable, else a
     /// `{}` and the argument.
     pub(super) fn format_arg(&mut self, x: &'a Expr) -> GResult<(String, Option<String>)> {
         let ty = self.ty_of(x);
         let spec = self.fmt_spec(&ty);
         let e = self.expr(x)?;
+        // Objects, arrays, maps and sets become strings the way JavaScript does it.
+        if self.is_inspect_ty(&ty)
+            && !matches!(self.resolve(&ty), Ty::Named(ref n) if self.p.struct_info(n).is_some_and(|s| s.method("toString", MethodKind::Method).is_some()))
+        {
+            if let Some((_, text)) = empty_literal(x) {
+                return Ok((format_text(text), None));
+            }
+            if let Ty::Option(inner) = self.resolve(&ty) {
+                let missing = self.missing_word(x);
+                let code = self.coerce(e, &ty, Want::Display);
+                let shown = self.inspect_call("v", &inner, false);
+                return Ok((
+                    "{}".into(),
+                    Some(format!(
+                        "{code}.as_ref().map_or(\"{missing}\".to_string(), |v| {shown})"
+                    )),
+                ));
+            }
+            let code = self.coerce(e, &ty, Want::Display);
+            return Ok(("{}".into(), Some(self.inspect_call(&code, &ty, false))));
+        }
         // A struct with `toString()` prints through it.
         if let Ty::Named(n) = self.resolve(&ty)
             && n != "Error"
@@ -327,22 +404,7 @@ impl<'a> Gen<'a> {
             return Ok(("{}".into(), Some(format!("{code}.to_string()"))));
         }
         if let Ty::Option(inner) = self.resolve(&ty) {
-            let missing = match self.p.calls.get(&x.id) {
-                Some(Callee::Builtin(n))
-                    if matches!(
-                        *n,
-                        "map.get"
-                            | "array.find"
-                            | "array.findLast"
-                            | "array.pop"
-                            | "array.shift"
-                            | "array.at"
-                    ) =>
-                {
-                    "undefined"
-                }
-                _ => "null",
-            };
+            let missing = self.missing_word(x);
             let code = self.coerce(e, &ty, Want::Display);
             let inner_spec = self.fmt_spec(&inner);
             let shown = if inner_spec == "{}" {
@@ -408,7 +470,17 @@ impl<'a> Gen<'a> {
                         }
                         let xt = self.ty_of(x);
                         let s = self.expr(x)?;
-                        parts.push(self.owned(s, &xt));
+                        let recv = Self::paren(&s, PREC_POSTFIX);
+                        parts.push(match self.resolve(&xt) {
+                            Ty::Set(_) => format!("{recv}.iter().cloned().collect::<Vec<_>>()"),
+                            Ty::Map(..) => format!(
+                                "{recv}.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>()"
+                            ),
+                            Ty::Str => {
+                                format!("{recv}.chars().map(String::from).collect::<Vec<_>>()")
+                            }
+                            _ => self.owned(s, &xt),
+                        });
                     }
                     ArrayElem::Hole => {}
                 }
@@ -435,8 +507,8 @@ impl<'a> Gen<'a> {
     }
 
     fn object(&mut self, e: &'a Expr, props: &'a [Prop], ty: &Ty) -> GResult<E> {
-        if let Ty::Map(k, v) = self.resolve(ty) {
-            self.uses_hashmap = true;
+        if let Ty::Map(k, v, _) = self.resolve(ty) {
+            let map_name = self.map_name();
             let mut entries = Vec::new();
             for p in props {
                 let PropValue::Expr(value) = &p.value else {
@@ -464,10 +536,10 @@ impl<'a> Gen<'a> {
                 entries.push(format!("({key}, {val})"));
             }
             if entries.is_empty() {
-                return Ok(E::atom("HashMap::new()", Repr::Owned));
+                return Ok(E::atom(format!("{map_name}::new()"), Repr::Owned));
             }
             return Ok(E::atom(
-                format!("HashMap::from([{}])", entries.join(", ")),
+                format!("{map_name}::from([{}])", entries.join(", ")),
                 Repr::Owned,
             ));
         }
@@ -761,7 +833,7 @@ impl<'a> Gen<'a> {
             BinOp::In => {
                 let r = self.expr(right)?;
                 let rc = Self::paren(&r, PREC_POSTFIX);
-                let Ty::Map(k, _) = self.resolve(&rt) else {
+                let Ty::Map(k, _, _) = self.resolve(&rt) else {
                     return self.err("`in` needs a map", e.span);
                 };
                 let key = self.expr_as(
@@ -927,6 +999,19 @@ impl<'a> Gen<'a> {
                 op: UnaryOp::Not,
                 arg,
             } => {
+                // `!isNaN(n)`: the content exists; bind it.
+                if let Some(n) = self.p.narrow_tests.get(&arg.id).cloned()
+                    && !n.positive
+                    && !n.let_else
+                    && !n.unwrap
+                {
+                    let path_expr = narrow_path_expr(arg);
+                    let pt = self.ty_of(path_expr);
+                    let x = self.expr(path_expr)?;
+                    let (pattern, source) =
+                        self.narrow_binding(&n.name, n.mutated, &n.inner, x, &pt);
+                    return Ok(format!("let {pattern} = {source}"));
+                }
                 let inner = self.cond(arg)?;
                 if let Some(rest) = inner.strip_suffix(".is_none()") {
                     return Ok(format!("{rest}.is_some()"));
@@ -1352,7 +1437,7 @@ impl<'a> Gen<'a> {
                 let h = self.helper(super::Helper::StrCharAt);
                 Ok(E::owned(format!("{h}({s}, {i})"), PREC_POSTFIX))
             }
-            Ty::Map(k, _) => {
+            Ty::Map(k, _, _) => {
                 let key = self.expr_as(
                     index,
                     if self.is_str(&k) {
@@ -1481,7 +1566,23 @@ pub(super) fn narrow_path_expr(e: &Expr) -> &Expr {
                 right
             }
         }
+        // `isNaN(n)`
+        ExprKind::Call { args, .. } if args.len() == 1 => &args[0].expr,
         _ => e,
+    }
+}
+
+/// `[]`, `new Map()`, `new Set()`: what `console.log` and `String(…)` show for them (their
+/// element type may be unknown).
+fn empty_literal(x: &Expr) -> Option<(&'static str, &'static str)> {
+    match &x.kind {
+        ExprKind::Array(elems) if elems.is_empty() => Some(("[]", "")),
+        ExprKind::New { callee, args, .. } if args.is_empty() => match &callee.kind {
+            ExprKind::Ident(n) if n == "Map" => Some(("Map(0) {}", "[object Map]")),
+            ExprKind::Ident(n) if n == "Set" => Some(("Set(0) {}", "[object Set]")),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
