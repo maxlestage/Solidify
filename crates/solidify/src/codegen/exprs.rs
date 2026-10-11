@@ -683,6 +683,10 @@ impl<'a> Gen<'a> {
                             Ty::Str => {
                                 format!("{recv}.chars().map(String::from).collect::<Vec<_>>()")
                             }
+                            // A borrowed array (a slice parameter): a copy.
+                            Ty::Array(_) if matches!(s.repr, Repr::Ref | Repr::RefMut) => {
+                                format!("{recv}.to_vec()")
+                            }
                             _ => self.owned(s, &xt),
                         });
                     }
