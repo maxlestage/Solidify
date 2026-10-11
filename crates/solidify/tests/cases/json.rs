@@ -195,6 +195,8 @@ enum JsValue {
     Func(&'static str),
     /// Text shown as it is (a regular expression).
     Raw(String),
+    /// A date: its ISO text, and its `toString()` text.
+    Date(String, String),
 }
 
 /// Implemented by every type that `console.log` can show.
@@ -374,6 +376,7 @@ fn js_to_string(v: &JsValue) -> String {
         JsValue::Set(_) => "[object Set]".into(),
         JsValue::Func(name) => format!("function {name}() {{ [native code] }}"),
         JsValue::Raw(text) => text.clone(),
+        JsValue::Date(_, text) => text.clone(),
     }
 }
 
@@ -461,6 +464,7 @@ fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> Strin
             };
         }
         JsValue::Raw(text) => return text.clone(),
+        JsValue::Date(iso, _) => return iso.clone(),
         JsValue::Array(items) => {
             if items.is_empty() {
                 return "[]".into();
@@ -877,6 +881,7 @@ fn js_json_write(v: &JsValue, indent: &str, depth: usize, out: &mut String) -> b
             out.push('}');
         }
         JsValue::Map(_) | JsValue::Set(_) | JsValue::Raw(_) => out.push_str("{}"),
+        JsValue::Date(iso, _) => js_json_quote(iso, out),
     }
     true
 }
