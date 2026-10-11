@@ -130,6 +130,11 @@ impl<'m> Infer<'m> {
                 m.ty = zonk(&m.ty);
             }
         }
+        let dyn_casts = self
+            .dyn_casts
+            .into_iter()
+            .map(|(id, (a, b))| (id, (zonk(&a), zonk(&b))))
+            .collect();
         let mut program = Program {
             types,
             node_count: self.node_count,
@@ -144,6 +149,8 @@ impl<'m> Infer<'m> {
             calls: self.calls,
             literal_struct: self.literal_struct,
             enum_literal: self.enum_literal,
+            dyn_casts,
+            dyn_literals: self.dyn_literals,
             narrow_tests,
             narrowed_uses: self.narrowed_uses,
             drop_decl,

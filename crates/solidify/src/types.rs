@@ -36,11 +36,24 @@ pub enum Ty {
 }
 
 impl Ty {
+    /// A value known only at run time (`JSON.parse` without a type, what a reviver gets):
+    /// `JsValue` in the output, with JavaScript's operators.
+    pub fn dynamic() -> Ty {
+        Ty::named(DYNAMIC)
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, Ty::Named(n, args) if n == DYNAMIC && args.is_empty())
+    }
+
     /// A struct, an enum or a type parameter without type arguments.
     pub fn named(name: impl Into<String>) -> Ty {
         Ty::Named(name.into(), Vec::new())
     }
 }
+
+/// The name of the dynamic type ([`Ty::dynamic`]).
+pub const DYNAMIC: &str = "JsValue";
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FuncTy {
@@ -279,6 +292,8 @@ impl Types {
             | (Ty::Null, Ty::Null) => Ok(()),
             (Ty::Option(x), Ty::Option(y)) => self.unify(x, y),
             (Ty::Option(_), Ty::Null) | (Ty::Null, Ty::Option(_)) => Ok(()),
+            // `null` and `undefined` are values like any other at run time.
+            (Ty::Null, d) | (d, Ty::Null) if d.is_dynamic() => Ok(()),
             (Ty::Option(x), _) => self.unify(x, &b),
             (_, Ty::Option(y)) => self.unify(&a, y),
             (Ty::Null, _) | (_, Ty::Null) => Err(format!(
@@ -357,6 +372,9 @@ impl Types {
             ),
             Ty::Set(t) => format!("Set<{}>", self.describe(&t)),
             Ty::Gen(t) => format!("Generator<{}>", self.describe(&t)),
+            Ty::Named(n, args) if n == DYNAMIC && args.is_empty() => {
+                "a value known at run time".into()
+            }
             Ty::Named(n, args) if args.is_empty() => n,
             Ty::Named(n, args) => format!(
                 "{n}<{}>",

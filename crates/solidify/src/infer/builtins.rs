@@ -11,7 +11,7 @@ use crate::types::{Flavor, FuncTy, Ty};
 
 impl<'m> Infer<'m> {
     /// Types a callback argument against the signature it must have.
-    fn callback(
+    pub(super) fn callback(
         &mut self,
         args: &'m [Arg],
         i: usize,
@@ -43,7 +43,7 @@ impl<'m> Infer<'m> {
         }
     }
 
-    fn done(&mut self, e: &Expr, name: String, ty: Ty) -> IResult<Ty> {
+    pub(super) fn done(&mut self, e: &Expr, name: String, ty: Ty) -> IResult<Ty> {
         self.calls.insert(e.id, Callee::Builtin(leak(name)));
         Ok(ty)
     }
@@ -197,7 +197,21 @@ impl<'m> Infer<'m> {
             }
             ("Object", "keys" | "values" | "entries") => {
                 let t = self.arg_typed(args, 0, None, &full, span)?;
-                let Ty::Map(k, v, _) = self.types.resolve(&t) else {
+                // An object known at run time, or an instance: its properties as values
+                // known at run time.
+                let resolved = self.types.resolve(&t);
+                let object = resolved.is_dynamic()
+                    || matches!(&resolved, Ty::Named(n, _) if self.struct_by_name(n).is_some());
+                if object {
+                    let d = Ty::dynamic();
+                    let out = match prop {
+                        "keys" => Ty::Str,
+                        "values" => d,
+                        _ => Ty::Tuple(vec![Ty::Str, d]),
+                    };
+                    return self.done(e, format!("Object.{prop}.dyn"), Ty::Array(Box::new(out)));
+                }
+                let Ty::Map(k, v, _) = resolved else {
                     return self.err(
                         format!("`{full}` works on a `Record` or `Map`; struct fields are known at compile time"),
                         span,
@@ -257,10 +271,10 @@ impl<'m> Infer<'m> {
                 }
                 self.done(e, full, Ty::Array(Box::new(item)))
             }
-            ("Array", "isArray") => self.err(
-                "`Array.isArray` is not needed: types are known at compile time",
-                span,
-            ),
+            ("Array", "isArray") => {
+                self.arg_typed(args, 0, None, &full, span)?;
+                self.done(e, full, Ty::Bool)
+            }
             ("Array", _) => self.err(format!("`Array.{prop}` is not supported"), span),
             ("Promise", "all") => {
                 // Each value is already awaited where it is made: the array itself.
@@ -287,13 +301,25 @@ impl<'m> Infer<'m> {
                         args[0].expr.span,
                     );
                 }
+                // A replacer: a function given each key and value, or the keys to keep.
                 if let Some(a) = args.get(1)
                     && !matches!(a.expr.kind, ExprKind::Null | ExprKind::Undefined)
                 {
-                    return self.err(
-                        "replacer functions are not supported in `JSON.stringify`: pass `null`",
-                        a.expr.span,
-                    );
+                    let keys = Ty::Array(Box::new(Ty::Str));
+                    if matches!(a.expr.kind, ExprKind::Array(_)) {
+                        self.arg_typed(args, 1, Some(keys), &full, span)?;
+                    } else {
+                        let d = Ty::dynamic();
+                        let f = Ty::Func(Rc::new(FuncTy {
+                            params: vec![Ty::Str, d.clone()],
+                            ret: d,
+                        }));
+                        let literal = matches!(a.expr.kind, ExprKind::Arrow(_) | ExprKind::Func(_));
+                        let at = self.expr(&a.expr, literal.then_some(&f))?;
+                        if self.types.unify(&at, &keys).is_err() {
+                            self.expect(&at, &f, a.expr.span)?;
+                        }
+                    }
                 }
                 if args.len() == 3 {
                     let it = self.arg_typed(args, 2, None, &full, span)?;
@@ -305,19 +331,24 @@ impl<'m> Infer<'m> {
                 self.done(e, full, Ty::Str)
             }
             ("JSON", "parse") => {
-                if args.len() > 1 {
-                    return self.err(
-                        "reviver functions are not supported in `JSON.parse`",
-                        args[1].expr.span,
-                    );
-                }
+                let expected = self.call_expected.take();
+                self.no_more_than(args, 2, &full, span)?;
                 self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                // A reviver: each key and value, innermost first.
+                if args.len() > 1 {
+                    let d = Ty::dynamic();
+                    self.callback(args, 1, vec![Ty::Str, d.clone()], d, &full, span)?;
+                }
                 // It throws on bad text: the function fails like one with a `throw`.
                 if self.ctx().try_depth == 0 {
                     let id = self.ctx().id;
                     self.funcs.get_mut(&id).expect("fn").throw_direct = true;
                 }
-                let t = self.types.fresh();
+                // Without a type: a value known at run time; a reviver gives one too.
+                let t = match expected {
+                    Some(t) if !matches!(t, Ty::Var(_)) && args.len() == 1 => t,
+                    _ => Ty::dynamic(),
+                };
                 self.json_targets.push(t.clone());
                 self.done(e, full, t)
             }
