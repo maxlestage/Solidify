@@ -1147,11 +1147,18 @@ impl<'a> Gen<'a> {
                 ""
             };
             params.push(format!("{m}{name}: {t}"));
+            // `{ x, y }: Point`: the parameter is taken whole, then taken apart.
             if !matches!(p.pat, Pattern::Ident { .. }) {
-                return self.err(
-                    "destructured parameters are not supported yet: destructure in the body",
-                    p.span,
-                );
+                let lines = self.capture(|g| match &p.pat {
+                    Pattern::Object { props, .. } => g.destructure_object(props, &name, &pty),
+                    Pattern::Array { elems, rest, .. } => {
+                        g.destructure_array(elems, rest, &name, &pty)
+                    }
+                    Pattern::Ident { .. } => Ok(()),
+                })?;
+                for l in lines.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                    self.param_rebinds.push(l.to_string());
+                }
             }
         }
         Ok(params.join(", "))
