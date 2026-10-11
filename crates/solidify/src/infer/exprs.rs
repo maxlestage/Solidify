@@ -36,7 +36,7 @@ impl<'m> Infer<'m> {
                 self.types.float()
             }),
             ExprKind::Str(s) => {
-                if let Some(Ty::Named(n)) = &expected_res
+                if let Some(Ty::Named(n, ..)) = &expected_res
                     && let Some(en) = self.enum_by_name(n)
                     && en.kind == EnumKind::Literals
                 {
@@ -45,7 +45,7 @@ impl<'m> Infer<'m> {
                     };
                     let variant = v.name.clone();
                     self.enum_literal.insert(e.id, (n.clone(), variant));
-                    return Ok(Ty::Named(n.clone()));
+                    return Ok(Ty::named(n.clone()));
                 }
                 Ok(Ty::Str)
             }
@@ -62,7 +62,7 @@ impl<'m> Infer<'m> {
                 if let Err(msg) = crate::codegen::regex_rt::JsRegex::parse(pattern, flags) {
                     return self.err(format!("invalid regular expression: {msg}"), e.span);
                 }
-                Ok(Ty::Named("RegExp".into()))
+                Ok(Ty::named("RegExp"))
             }
             ExprKind::This => {
                 let Some(class) = self.ctx().this.clone() else {
@@ -84,7 +84,7 @@ impl<'m> Infer<'m> {
                     self.narrowed_uses.insert(e.id, (n.name.clone(), n.test_id));
                     return Ok(n.inner.clone());
                 }
-                Ok(Ty::Named(class))
+                Ok(self.self_type(&class))
             }
             ExprKind::Super => {
                 self.err("`super` is used as `super(…)` or `super.method(…)`", e.span)
@@ -303,6 +303,15 @@ impl<'m> Infer<'m> {
                     self.expect(&at, &u, alt.span)?;
                     return Ok(u);
                 }
+                // `c ? x : undefined`: a value or nothing.
+                match (self.types.resolve(&ct), self.types.resolve(&at)) {
+                    (Ty::Null, Ty::Null) => return Ok(Ty::Null),
+                    (Ty::Null, Ty::Option(_)) | (Ty::Option(_), Ty::Null) => {}
+                    (Ty::Null, Ty::Var(_)) | (Ty::Var(_), Ty::Null) => {}
+                    (Ty::Null, other) => return Ok(Ty::Option(Box::new(other))),
+                    (other, Ty::Null) => return Ok(Ty::Option(Box::new(other))),
+                    _ => {}
+                }
                 if self.types.unify(&ct, &at).is_err() {
                     return self.err(
                         format!(
@@ -324,10 +333,15 @@ impl<'m> Infer<'m> {
                 optional,
                 type_args,
             } => {
-                if !type_args.is_empty() {
-                    return self.err("explicit type arguments are not supported", e.span);
+                let mut given = Vec::new();
+                for a in type_args {
+                    given.push(self.ann(a, "")?);
                 }
-                self.call(e, callee, args, *optional)
+                let before = self.type_args.take();
+                self.type_args = (!given.is_empty()).then_some((e.span, given));
+                let r = self.call(e, callee, args, *optional);
+                self.type_args = before;
+                r
             }
             ExprKind::New { callee, args, .. } => self.new_expr(e, callee, args),
             ExprKind::Member {
@@ -533,9 +547,9 @@ impl<'m> Infer<'m> {
                 };
                 // `later - earlier` on dates: the milliseconds between them.
                 if matches!(op, BinOp::Sub)
-                    && matches!(self.types.resolve(&lt), Ty::Named(ref d) if d == "Date")
+                    && matches!(self.types.resolve(&lt), Ty::Named(ref d, ..) if d == "Date")
                 {
-                    let date = Ty::Named("Date".into());
+                    let date = Ty::named("Date");
                     let rt = self.expr(right, Some(&date))?;
                     self.expect(&rt, &date, right.span)?;
                     return Ok(self.types.int());
@@ -562,7 +576,7 @@ impl<'m> Infer<'m> {
                 }
                 match self.types.resolve(&lt) {
                     Ty::Num(_) | Ty::Str | Ty::Var(_) => Ok(Ty::Bool),
-                    Ty::Named(n) if self.is_type_param(&n) || n == "Date" => Ok(Ty::Bool),
+                    Ty::Named(n, ..) if self.is_type_param(&n) || n == "Date" => Ok(Ty::Bool),
                     other => {
                         let d = self.describe(&other);
                         self.err(format!("cannot order {d}"), span)
@@ -823,7 +837,7 @@ impl<'m> Infer<'m> {
                 };
                 let st = self.expr(s, None)?;
                 let name = match self.types.resolve(&st) {
-                    Ty::Named(n) if self.struct_by_name(&n).is_some() => n,
+                    Ty::Named(n, ..) if self.struct_by_name(&n).is_some() => n,
                     _ => {
                         spread_struct = None;
                         break;
@@ -839,8 +853,8 @@ impl<'m> Infer<'m> {
             }
         }
         let struct_name = match (expected, spread_struct) {
-            (Some(Ty::Named(n)), _) if self.struct_by_name(n).is_some() => n.clone(),
-            (Some(Ty::Named(n)), _) if self.union_by_name(n).is_some() => {
+            (Some(Ty::Named(n, ..)), _) if self.struct_by_name(n).is_some() => n.clone(),
+            (Some(Ty::Named(n, ..)), _) if self.union_by_name(n).is_some() => {
                 let u = self.union_by_name(n).expect("union").clone();
                 match self.union_literal_member(&u, props) {
                     Some(member) => member,
@@ -853,11 +867,23 @@ impl<'m> Infer<'m> {
             _ => return self.anonymous_object(e, props),
         };
         self.literal_struct.insert(e.id, struct_name.clone());
-        let fields = self
+        // A generic interface: `Box<number>` from the annotation, or inferred.
+        let (inst, subst) = match expected {
+            Some(t @ Ty::Named(n, args)) if *n == struct_name && !args.is_empty() => {
+                (t.clone(), self.instance_subst(t))
+            }
+            _ => self.fresh_instance(&struct_name),
+        };
+        let fields: Vec<FieldInfo> = self
             .struct_by_name(&struct_name)
             .expect("struct")
             .fields
-            .clone();
+            .iter()
+            .map(|f| FieldInfo {
+                ty: substitute(&f.ty, &subst, &self.types),
+                ..f.clone()
+            })
+            .collect();
         let mut seen = HashSet::new();
         // A spread of this very shape gives every field; one of another shape gives the
         // fields the shapes share.
@@ -867,8 +893,8 @@ impl<'m> Infer<'m> {
             if let PropValue::Spread(s) = &p.value {
                 let st = self.expr(s, None)?;
                 match self.types.resolve(&st) {
-                    Ty::Named(n) if n == struct_name => same_spread = true,
-                    Ty::Named(n) if self.struct_by_name(&n).is_some() => {
+                    Ty::Named(n, ..) if n == struct_name => same_spread = true,
+                    Ty::Named(n, ..) if self.struct_by_name(&n).is_some() => {
                         let src = self.struct_by_name(&n).expect("struct").fields.clone();
                         for sf in &src {
                             if let Some(tf) = fields.iter().find(|f| f.name == sf.name) {
@@ -922,7 +948,7 @@ impl<'m> Infer<'m> {
                 }
             }
         }
-        Ok(Ty::Named(struct_name))
+        Ok(inst)
     }
 
     /// Whether every key of a literal is a field of `struct_name` (spreads aside).
@@ -963,7 +989,7 @@ impl<'m> Infer<'m> {
             if let PropValue::Spread(s) = &p.value {
                 let st = self.expr(s, None)?;
                 let src = match self.types.resolve(&st) {
-                    Ty::Named(n) => self.struct_by_name(&n).map(|s| s.fields.clone()),
+                    Ty::Named(n, ..) => self.struct_by_name(&n).map(|s| s.fields.clone()),
                     _ => None,
                 };
                 let Some(src) = src else {
@@ -1032,7 +1058,7 @@ impl<'m> Infer<'m> {
                 self.unify(&f.ty, &g.ty, f.span)?;
             }
             self.literal_struct.insert(e.id, existing.clone());
-            return Ok(Ty::Named(existing));
+            return Ok(Ty::named(existing));
         }
         let name = self.synth_name(&hint);
         self.structs.push(StructInfo {
@@ -1047,9 +1073,12 @@ impl<'m> Infer<'m> {
             parent: None,
             is_abstract: false,
             implements: Vec::new(),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            parent_args: Vec::new(),
         });
         self.literal_struct.insert(e.id, name.clone());
-        Ok(Ty::Named(name))
+        Ok(Ty::named(name))
     }
 
     fn same_shape(&self, fields: &[FieldInfo]) -> Option<String> {
@@ -1143,12 +1172,12 @@ impl<'m> Infer<'m> {
                     if !en.variants.iter().any(|v| v.source == prop) {
                         return self.err(format!("{name} has no member `{prop}`"), e.span);
                     }
-                    self.set_ty(obj.id, Ty::Named(name.clone()));
-                    return Ok(Ty::Named(name.clone()));
+                    self.set_ty(obj.id, Ty::named(name.clone()));
+                    return Ok(Ty::named(name.clone()));
                 }
                 Role::Class => {
                     self.refs.insert(obj.id, id);
-                    self.set_ty(obj.id, Ty::Named(name.clone()));
+                    self.set_ty(obj.id, Ty::named(name.clone()));
                     if let Some((_, t)) = self.find_static(name, prop) {
                         return Ok(t);
                     }
@@ -1202,7 +1231,7 @@ impl<'m> Infer<'m> {
 
     pub(super) fn member_of(&mut self, ot: &Ty, prop: &str, span: Span, obj: &Expr) -> IResult<Ty> {
         match ot {
-            Ty::Named(n) => {
+            Ty::Named(n, ..) => {
                 if n == "Error" {
                     return match prop {
                         "message" | "name" | "stack" => Ok(Ty::Str),
@@ -1230,8 +1259,14 @@ impl<'m> Infer<'m> {
                     };
                 }
                 if self.is_type_param(n) {
+                    // `T extends HasId`: the fields of the constraint.
+                    if let Some(c) = self.constraint_of(n) {
+                        return self.member_of(&Ty::named(c), prop, span, obj);
+                    }
                     return self.err(
-                        format!("`{prop}` is not known on the type parameter {n}"),
+                        format!(
+                            "`{prop}` is not known on the type parameter {n}: constrain it, `<{n} extends {{ {prop}: … }}>`"
+                        ),
                         span,
                     );
                 }
@@ -1253,15 +1288,18 @@ impl<'m> Infer<'m> {
                     }
                     return self.err(format!("{n} has no property `{prop}`"), span);
                 };
+                let subst = self.instance_subst(ot);
                 if let Some(f) = s.field(prop) {
-                    return Ok(if f.optional {
+                    let t = if f.optional {
                         Ty::Option(Box::new(f.ty.clone()))
                     } else {
                         f.ty.clone()
-                    });
+                    };
+                    return Ok(substitute(&t, &subst, &self.types));
                 }
                 if let Some((_, m)) = self.find_method(n, prop, MethodKind::Get) {
-                    return Ok(self.funcs[&m.fn_id].sig.ret.clone());
+                    let t = self.funcs[&m.fn_id].sig.ret.clone();
+                    return Ok(substitute(&t, &subst, &self.types));
                 }
                 if self.find_method(n, prop, MethodKind::Method).is_some() {
                     return self.err(
@@ -1334,13 +1372,13 @@ impl<'m> Infer<'m> {
                 self.expect(&it, k, index.span)?;
                 Ok((**v).clone())
             }
-            Ty::Named(n) if n == "RegExpMatch" => {
+            Ty::Named(n, ..) if n == "RegExpMatch" => {
                 let it = self.expr(index, None)?;
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&it, &n, index.span)?;
                 Ok(Ty::Str)
             }
-            Ty::Named(n) if self.struct_by_name(n).is_some() => {
+            Ty::Named(n, ..) if self.struct_by_name(n).is_some() => {
                 let ExprKind::Str(key) = &index.kind else {
                     return self.err(format!("{n} is indexed with a property name"), index.span);
                 };
@@ -1375,7 +1413,7 @@ impl<'m> Infer<'m> {
             }
             let name = &canonical;
             self.refs.insert(callee.id, id);
-            self.set_ty(callee.id, Ty::Named(name.clone()));
+            self.set_ty(callee.id, Ty::named(name.clone()));
             let s = self.struct_by_name(name).expect("class");
             if s.is_abstract {
                 return self.err(
@@ -1383,10 +1421,35 @@ impl<'m> Infer<'m> {
                     e.span,
                 );
             }
+            // `new Stack<number>()`, or `new Pair("x", 3)` with the arguments inferred.
+            let (inst, subst) = self.fresh_instance(name);
+            if let ExprKind::New { type_args, .. } = &e.kind
+                && !type_args.is_empty()
+            {
+                let params = self
+                    .struct_by_name(name)
+                    .expect("class")
+                    .type_params
+                    .clone();
+                if params.len() != type_args.len() {
+                    return self.err(
+                        format!(
+                            "{name} takes {} type argument{}",
+                            params.len(),
+                            if params.len() == 1 { "" } else { "s" }
+                        ),
+                        e.span,
+                    );
+                }
+                for (p, a) in params.iter().zip(type_args) {
+                    let t = self.ann(a, name)?;
+                    self.unify(&subst[p], &t, a.span())?;
+                }
+            }
             match self.nearest_ctor(name) {
                 Some((_, ctor)) => {
                     let info = self.funcs[&ctor].clone();
-                    self.args(args, &info, ctor, e.span)?;
+                    self.args_in(args, &info, ctor, e.span, &subst)?;
                     let caller = self.ctx().id;
                     self.funcs
                         .get_mut(&caller)
@@ -1404,7 +1467,7 @@ impl<'m> Infer<'m> {
                 }
             }
             self.calls.insert(e.id, Callee::Ctor(name.clone()));
-            return Ok(Ty::Named(name.clone()));
+            return Ok(inst);
         }
         let ExprKind::Ident(name) = &callee.kind else {
             return self.err("`new` needs a class name", callee.span);
@@ -1412,6 +1475,15 @@ impl<'m> Infer<'m> {
         if self.lookup(name).is_some() {
             return self.err(format!("`{name}` is not a class"), callee.span);
         }
+        // `new Map<string, number>()`: the type arguments, when given.
+        let mut given = Vec::new();
+        if let ExprKind::New { type_args, .. } = &e.kind {
+            for a in type_args {
+                given.push(self.ann(a, name)?);
+            }
+        }
+        let targ =
+            |this: &mut Self, i: usize| given.get(i).cloned().unwrap_or_else(|| this.types.fresh());
         match name.as_str() {
             "Error" | "TypeError" | "RangeError" => {
                 if let Some(a) = args.first() {
@@ -1419,10 +1491,10 @@ impl<'m> Infer<'m> {
                     self.expect(&t, &Ty::Str, a.expr.span)?;
                 }
                 self.calls.insert(e.id, Callee::Builtin("new Error"));
-                Ok(Ty::Named("Error".into()))
+                Ok(Ty::named("Error"))
             }
             "Map" => {
-                let (k, v) = (self.types.fresh(), self.types.fresh());
+                let (k, v) = (targ(self, 0), targ(self, 1));
                 if let Some(a) = args.first() {
                     let entries = Ty::Array(Box::new(Ty::Tuple(vec![k.clone(), v.clone()])));
                     let t = self.expr(&a.expr, Some(&entries))?;
@@ -1432,7 +1504,7 @@ impl<'m> Infer<'m> {
                 Ok(Ty::Map(Box::new(k), Box::new(v), false))
             }
             "Set" => {
-                let t = self.types.fresh();
+                let t = targ(self, 0);
                 if let Some(a) = args.first() {
                     let arr = Ty::Array(Box::new(t.clone()));
                     let at = self.expr(&a.expr, Some(&arr))?;
@@ -1442,7 +1514,7 @@ impl<'m> Infer<'m> {
                 Ok(Ty::Set(Box::new(t)))
             }
             "Array" => {
-                let t = self.types.fresh();
+                let t = targ(self, 0);
                 if let Some(a) = args.first() {
                     let n = self.types.int();
                     let at = self.expr(&a.expr, Some(&n))?;
@@ -1461,7 +1533,7 @@ impl<'m> Infer<'m> {
                             let i = self.types.int();
                             self.expect(&t, &i, args[0].expr.span)?;
                         }
-                        Ty::Named(ref d) if d == "Date" => {}
+                        Ty::Named(ref d, ..) if d == "Date" => {}
                         other => {
                             let d = self.describe(&other);
                             return self.err(
@@ -1481,7 +1553,7 @@ impl<'m> Infer<'m> {
                     }
                 }
                 self.calls.insert(e.id, Callee::Builtin("new Date"));
-                Ok(Ty::Named("Date".into()))
+                Ok(Ty::named("Date"))
             }
             "Promise" => {
                 // `new Promise((resolve, reject) => …)`, awaited where it is made.
@@ -1497,7 +1569,7 @@ impl<'m> Infer<'m> {
                     ret: Ty::Void,
                 }));
                 let reject = Ty::Func(Rc::new(FuncTy {
-                    params: vec![Ty::Named("Error".into())],
+                    params: vec![Ty::named("Error")],
                     ret: Ty::Void,
                 }));
                 let executor = Ty::Func(Rc::new(FuncTy {
@@ -1542,7 +1614,7 @@ impl<'m> Infer<'m> {
                     }
                 }
                 self.calls.insert(e.id, Callee::Builtin("new RegExp"));
-                Ok(Ty::Named("RegExp".into()))
+                Ok(Ty::named("RegExp"))
             }
             _ => self.err(format!("unknown class `{name}`"), callee.span),
         }
@@ -1556,6 +1628,21 @@ impl<'m> Infer<'m> {
         fn_id: NodeId,
         span: Span,
     ) -> IResult<()> {
+        self.args_in(args, info, fn_id, span, &HashMap::new())
+            .map(|_| ())
+    }
+
+    /// Checks the arguments of a call; `outer` gives the type arguments of the receiver
+    /// (a method of `Stack<number>` sees `T` as `number`). Returns every type parameter's
+    /// type for this call.
+    pub(super) fn args_in(
+        &mut self,
+        args: &'m [Arg],
+        info: &FnInfo,
+        fn_id: NodeId,
+        span: Span,
+        outer: &HashMap<String, Ty>,
+    ) -> IResult<HashMap<String, Ty>> {
         // `...rest`: the last parameter takes every extra argument.
         let rest_at = if info.rest {
             Some(info.sig.params.len() - 1)
@@ -1589,10 +1676,34 @@ impl<'m> Infer<'m> {
                 span,
             );
         }
-        // Type parameters are instantiated afresh for each call.
-        let mut subst: HashMap<String, Ty> = HashMap::new();
-        for tp in &info.type_params {
-            subst.insert(tp.clone(), self.types.fresh());
+        // Type parameters are instantiated afresh for each call, or given (`f<number>(…)`).
+        let mut subst: HashMap<String, Ty> = outer.clone();
+        // Only for the call they were written on (not a call among its arguments).
+        let given = match self.type_args.take() {
+            Some((at, tys)) if at == span => tys,
+            other => {
+                self.type_args = other;
+                Vec::new()
+            }
+        };
+        if !given.is_empty() && given.len() != info.type_params.len() {
+            let name = info.name.clone().unwrap_or_else(|| "the function".into());
+            return self.err(
+                format!(
+                    "`{name}` takes {} type argument{}",
+                    info.type_params.len(),
+                    if info.type_params.len() == 1 { "" } else { "s" }
+                ),
+                span,
+            );
+        }
+        for (i, tp) in info.type_params.iter().enumerate() {
+            let t = given.get(i).cloned().unwrap_or_else(|| self.types.fresh());
+            subst.insert(tp.clone(), t);
+        }
+        if !info.type_bounds.is_empty() {
+            let bounds = info.type_bounds.clone();
+            self.record_bound_uses(&bounds, &subst, span);
         }
         for (i, a) in args.iter().enumerate() {
             if let Some(r) = rest_at
@@ -1640,7 +1751,7 @@ impl<'m> Infer<'m> {
                 self.arg_bindings.push((fn_id, i, b));
             }
         }
-        Ok(())
+        Ok(subst)
     }
 
     fn call(
@@ -1714,7 +1825,7 @@ impl<'m> Infer<'m> {
         let Ty::Option(inner) = self.types.resolve(&ot) else {
             return self.err("`?.` on a value that is never null", obj.span);
         };
-        let Ty::Named(n) = self.types.resolve(&inner) else {
+        let Ty::Named(n, ..) = self.types.resolve(&inner) else {
             return self.err(
                 "`?.` before a method call works on objects: test the value first",
                 e.span,
@@ -1766,7 +1877,8 @@ impl<'m> Infer<'m> {
         match self.nearest_ctor(&parent) {
             Some((owner, ctor)) => {
                 let info = self.funcs[&ctor].clone();
-                self.args(args, &info, ctor, e.span)?;
+                let given = self.ancestor_subst(&class, HashMap::new());
+                self.args_in(args, &info, ctor, e.span, &given)?;
                 let caller = self.ctx().id;
                 self.funcs
                     .get_mut(&caller)
@@ -1809,7 +1921,8 @@ impl<'m> Infer<'m> {
             );
         }
         let info = self.funcs[&m.fn_id].clone();
-        self.args(args, &info, m.fn_id, e.span)?;
+        let given = self.ancestor_subst(&class, HashMap::new());
+        let used = self.args_in(args, &info, m.fn_id, e.span, &given)?;
         let caller = self.ctx().this_fn;
         if !self.ctx().in_ctor {
             self.this_calls.push((m.fn_id, caller));
@@ -1828,20 +1941,7 @@ impl<'m> Infer<'m> {
                 fn_id: m.fn_id,
             },
         );
-        Ok(info.sig.ret.clone())
-    }
-
-    fn instantiate_ret(&mut self, info: &FnInfo, args: &'m [Arg]) -> IResult<Ty> {
-        let mut subst: HashMap<String, Ty> = HashMap::new();
-        for tp in &info.type_params {
-            subst.insert(tp.clone(), self.types.fresh());
-        }
-        for (i, a) in args.iter().enumerate() {
-            let pt = substitute(&info.sig.params[i], &subst, &self.types);
-            let at = self.expr_ty[&a.expr.id].clone();
-            self.expect(&at, &pt, a.expr.span)?;
-        }
-        Ok(substitute(&info.sig.ret, &subst, &self.types))
+        Ok(substitute(&info.sig.ret, &used, &self.types))
     }
 
     pub(super) fn dynamic_args(&mut self, args: &'m [Arg], f: &FuncTy, span: Span) -> IResult<()> {
@@ -2042,7 +2142,7 @@ impl<'m> Infer<'m> {
                     let fn_id = self.fn_bindings[&id];
                     let info = self.funcs[&fn_id].clone();
                     self.set_ty(callee.id, Ty::Func(Rc::new(info.sig.clone())));
-                    self.args(args, &info, fn_id, e.span)?;
+                    let used = self.args_in(args, &info, fn_id, e.span, &HashMap::new())?;
                     self.calls.insert(e.id, Callee::Fn(id));
                     let caller = self.ctx().id;
                     self.funcs
@@ -2050,10 +2150,7 @@ impl<'m> Infer<'m> {
                         .expect("fn")
                         .calls
                         .push((fn_id, e.id));
-                    if !info.type_params.is_empty() {
-                        return self.instantiate_ret(&info, args);
-                    }
-                    return Ok(info.sig.ret.clone());
+                    return Ok(substitute(&info.sig.ret, &used, &self.types));
                 }
                 Role::Class => {
                     return self.err(
@@ -2109,7 +2206,7 @@ impl<'m> Infer<'m> {
             }
             let name = &canonical;
             self.refs.insert(obj.id, id);
-            self.set_ty(obj.id, Ty::Named(name.clone()));
+            self.set_ty(obj.id, Ty::named(name.clone()));
             let Some((owner, m)) = self
                 .find_method(name, prop, MethodKind::Method)
                 .filter(|(_, m)| m.is_static)
@@ -2118,7 +2215,7 @@ impl<'m> Infer<'m> {
             };
             let (fn_id, class) = (m.fn_id, owner);
             let info = self.funcs[&fn_id].clone();
-            self.args(args, &info, fn_id, e.span)?;
+            let used = self.args_in(args, &info, fn_id, e.span, &HashMap::new())?;
             self.calls.insert(
                 e.id,
                 Callee::Method {
@@ -2134,12 +2231,29 @@ impl<'m> Infer<'m> {
                 .expect("fn")
                 .calls
                 .push((fn_id, e.id));
-            return Ok(info.sig.ret.clone());
+            return Ok(substitute(&info.sig.ret, &used, &self.types));
         }
         let ot = self.expr(obj, None)?;
         let ot = self.types.resolve(&ot);
+        // `T extends Shape`: the methods of the constraint.
+        let ot = match &ot {
+            Ty::Named(n, args) if args.is_empty() && self.is_type_param(n) => {
+                match self.constraint_of(n) {
+                    Some(c) => Ty::named(c),
+                    None => {
+                        return self.err(
+                            format!(
+                                "`{prop}` is not known on the type parameter {n}: constrain it, `<{n} extends {{ {prop}(): … }}>`"
+                            ),
+                            e.span,
+                        );
+                    }
+                }
+            }
+            _ => ot,
+        };
         match &ot {
-            Ty::Named(n)
+            Ty::Named(n, ..)
                 if n != "Error"
                     && n != "RegExp"
                     && n != "RegExpMatch"
@@ -2158,9 +2272,11 @@ impl<'m> Infer<'m> {
                     }
                     return self.err(format!("{n} has no method `{prop}`"), e.span);
                 };
+                let subst = self.instance_subst(&ot);
                 if let Some(f) = s.field(prop) {
                     // A field holding a function.
-                    let ft = self.types.resolve(&f.ty);
+                    let ft = substitute(&f.ty, &subst, &self.types);
+                    let ft = self.types.resolve(&ft);
                     let Ty::Func(fun) = ft else {
                         return self.err(format!("`{prop}` is a field, not a method"), e.span);
                     };
@@ -2177,7 +2293,7 @@ impl<'m> Infer<'m> {
                 }
                 let (fn_id, class) = (m.fn_id, n.clone());
                 let info = self.funcs[&fn_id].clone();
-                self.args(args, &info, fn_id, e.span)?;
+                let used = self.args_in(args, &info, fn_id, e.span, &subst)?;
                 // Whether the method mutates `self` is settled at the end: remember the
                 // receiver.
                 if super::stmts::uses_this(obj) {
@@ -2206,7 +2322,7 @@ impl<'m> Infer<'m> {
                     .expect("fn")
                     .calls
                     .push((fn_id, e.id));
-                Ok(info.sig.ret.clone())
+                Ok(substitute(&info.sig.ret, &used, &self.types))
             }
             Ty::Option(_) => self.err(
                 format!(

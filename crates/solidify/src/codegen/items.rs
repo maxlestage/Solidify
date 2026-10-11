@@ -1,7 +1,7 @@
 //! Module-level items: constants, enums, structs, implementations, functions, `main`.
 
 use super::{
-    FnGen, GResult, Gen, Helper, Mode, Repr, Want, pascal, screaming, snake, string_literal,
+    Bounds, FnGen, GResult, Gen, Helper, Mode, Repr, Want, pascal, screaming, snake, string_literal,
 };
 use crate::ast::*;
 use crate::infer::{Callee, EnumKind, EnumValue, Role, StructKind};
@@ -186,6 +186,20 @@ impl<'a> Gen<'a> {
         if !self.helpers.contains(&Helper::Inspect) {
             return Ok(items);
         }
+        // A type parameter shown: any type of the program may be shown through it.
+        if self.generic_inspect {
+            let names: Vec<String> = self
+                .p
+                .structs
+                .iter()
+                .map(|s| s.name.clone())
+                .chain(self.p.enums.iter().map(|e| e.name.clone()))
+                .chain(self.p.unions.iter().map(|u| u.name.clone()))
+                .collect();
+            for n in names {
+                self.mark_inspected(&Ty::named(n));
+            }
+        }
         if self.helpers.contains(&Helper::JsMap) {
             out.push_str(
                 "\nimpl<K: JsInspect + std::hash::Hash + Eq + Clone, V: JsInspect> JsInspect for JsMap<K, V> {\n    fn js_value(&self) -> JsValue {\n        JsValue::Map(self.iter().map(|(k, v)| (k.js_value(), v.js_value())).collect())\n    }\n}\n",
@@ -221,9 +235,21 @@ impl<'a> Gen<'a> {
             }
             for name in pending {
                 done.insert(name.clone());
+                let params = self
+                    .p
+                    .struct_info(&name)
+                    .map(|s| s.type_params.clone())
+                    .unwrap_or_default();
+                let prev = std::mem::replace(&mut self.class_params, params.clone());
+                let header = self.generic_header(&params, &["JsInspect"]);
                 let rust_name = pascal(&name);
+                let args = if params.is_empty() {
+                    String::new()
+                } else {
+                    format!("<{}>", params.join(", "))
+                };
                 out.push_str(&format!(
-                    "\nimpl JsInspect for {rust_name} {{\n    fn js_value(&self) -> JsValue {{\n"
+                    "\nimpl{header} JsInspect for {rust_name}{args} {{\n    fn js_value(&self) -> JsValue {{\n"
                 ));
                 if let Some(u) = self.p.union_info(&name).cloned() {
                     out.push_str("        match self {\n");
@@ -261,11 +287,16 @@ impl<'a> Gen<'a> {
                     } else {
                         "None".to_string()
                     };
-                    let mut entries = Vec::new();
-                    let mut optional = Vec::new();
+                    // Each field in its place; an optional field of an object literal
+                    // is there only when given.
+                    let mut parts: Vec<(String, Option<(String, String)>)> = Vec::new();
                     for f in &info.fields {
                         let key = string_literal(&f.name);
                         let field = snake(&f.name);
+                        let undefined = self
+                            .p
+                            .undef_fields
+                            .contains(&(name.clone(), f.name.clone()));
                         let value = match self.resolve(&f.ty) {
                             Ty::Func(_) => format!("JsValue::Func({key})"),
                             _ if f.optional && info.kind == StructKind::Class => {
@@ -277,32 +308,42 @@ impl<'a> Gen<'a> {
                             }
                             _ if f.optional => {
                                 let inner = self.js_value_of("v", &f.ty);
-                                optional.push((key, field, inner));
+                                parts.push((key, Some((field, inner))));
                                 continue;
+                            }
+                            Ty::Option(inner_ty) if undefined => {
+                                let inner = self.js_value_of("v", &inner_ty);
+                                format!(
+                                    "self.{field}.as_ref().map_or(JsValue::Undefined, |v| {inner})"
+                                )
                             }
                             _ => self.js_value_of(&format!("self.{field}"), &f.ty),
                         };
-                        entries.push(format!("({key}.to_string(), {value})"));
+                        parts.push((format!("({key}.to_string(), {value})"), None));
                     }
-                    if optional.is_empty() {
+                    if parts.iter().all(|(_, o)| o.is_none()) {
+                        let entries: Vec<String> = parts.into_iter().map(|(e, _)| e).collect();
                         out.push_str(&format!(
                             "        JsValue::Object({class}, vec![{}])\n",
                             entries.join(", ")
                         ));
                     } else {
-                        out.push_str(&format!(
-                            "        let mut props: Vec<(String, JsValue)> = vec![{}];\n",
-                            entries.join(", ")
-                        ));
-                        for (key, field, inner) in optional {
-                            out.push_str(&format!(
-                                "        if let Some(v) = &self.{field} {{\n            props.push(({key}.to_string(), {inner}));\n        }}\n"
-                            ));
+                        out.push_str(
+                            "        let mut props: Vec<(String, JsValue)> = Vec::new();\n",
+                        );
+                        for (entry, optional) in parts {
+                            match optional {
+                                None => out.push_str(&format!("        props.push({entry});\n")),
+                                Some((field, inner)) => out.push_str(&format!(
+                                    "        if let Some(v) = &self.{field} {{\n            props.push(({entry}.to_string(), {inner}));\n        }}\n"
+                                )),
+                            }
                         }
                         out.push_str(&format!("        JsValue::Object({class}, props)\n"));
                     }
                 }
                 out.push_str("    }\n}\n");
+                self.class_params = prev;
                 items.push((Some(name.clone()), std::mem::take(&mut out)));
             }
         }
@@ -325,8 +366,19 @@ impl<'a> Gen<'a> {
         for name in self.json_types.clone() {
             let rust_name = pascal(&name);
             let name_lit = string_literal(&name);
+            let params = self
+                .p
+                .struct_info(&name)
+                .map(|s| s.type_params.clone())
+                .unwrap_or_default();
+            let header = self.generic_header(&params, &["JsFromJson"]);
+            let args = if params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", params.join(", "))
+            };
             out.push_str(&format!(
-                "\nimpl JsFromJson for {rust_name} {{\n    fn from_json(v: &JsonValue) -> Result<Self, String> {{\n"
+                "\nimpl{header} JsFromJson for {rust_name}{args} {{\n    fn from_json(v: &JsonValue) -> Result<Self, String> {{\n"
             ));
             if let Some(u) = self.p.union_info(&name).cloned() {
                 if let Some(d) = &u.discriminant {
@@ -617,7 +669,7 @@ impl<'a> Gen<'a> {
                         .members
                         .first()
                         .and_then(|member| match self.resolve(&member.ty) {
-                            Ty::Named(n) => self.p.struct_info(&n).and_then(|s| {
+                            Ty::Named(n, ..) => self.p.struct_info(&n).and_then(|s| {
                                 s.field(&field).map(|f| {
                                     if f.optional {
                                         Ty::Option(Box::new(f.ty.clone()))
@@ -689,7 +741,39 @@ impl<'a> Gen<'a> {
         } else {
             self.line("#[derive(Debug, Clone, PartialEq)]");
         }
-        self.line(&format!("{vis}struct {name} {{"));
+        let params = s.type_params.clone();
+        let generics = if params.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", params.join(", "))
+        };
+        let prev_params = std::mem::replace(&mut self.class_params, params.clone());
+        let given = self.ancestor_subst(&s.name);
+        let prev_subst = std::mem::replace(&mut self.class_subst, given);
+        let mut bounds = Bounds::new();
+        for (p, c) in &s.type_bounds {
+            bounds
+                .entry(p.clone())
+                .or_default()
+                .insert(Self::bound_trait(c));
+        }
+        let prev_bounds = std::mem::replace(&mut self.class_bounds, bounds);
+        let r = self.struct_body(s, &name, vis, has_fn, &generics);
+        self.class_subst = prev_subst;
+        self.class_params = prev_params;
+        self.class_bounds = prev_bounds;
+        r
+    }
+
+    fn struct_body(
+        &mut self,
+        s: &crate::infer::StructInfo,
+        name: &str,
+        vis: &str,
+        has_fn: bool,
+        generics: &str,
+    ) -> GResult<()> {
+        self.line(&format!("{vis}struct {name}{generics} {{"));
         self.indent += 1;
         for f in &s.fields {
             let ty = if f.optional {
@@ -709,11 +793,14 @@ impl<'a> Gen<'a> {
         if has_fn {
             // `Debug` by hand: the functions are shown as such.
             self.blank();
-            self.line(&format!("impl std::fmt::Debug for {name} {{"));
+            let header = self.generic_header(&s.type_params, &["std::fmt::Debug"]);
+            self.line(&format!(
+                "impl{header} std::fmt::Debug for {name}{generics} {{"
+            ));
             self.indent += 1;
             self.line("fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {");
             self.indent += 1;
-            self.line(&format!("f.debug_struct({})", string_literal(&name)));
+            self.line(&format!("f.debug_struct({})", string_literal(name)));
             self.indent += 1;
             for f in &s.fields {
                 let fname = snake(&f.name);
@@ -774,40 +861,19 @@ impl<'a> Gen<'a> {
         };
         self.current_class = Some(s.name.clone());
         self.blank();
-        self.line(&format!("impl {name} {{"));
+        // The bounds of a generic struct's `impl` are known once its methods are written:
+        // the header is completed then.
+        let header_at = self.out.len();
+        self.line(&format!("impl {name}{generics} {{"));
         self.indent += 1;
-        let mut first = true;
-        for (sname, sty, init) in &s.statics {
-            let Some(init_id) = init else {
-                return self.err(
-                    format!("static field `{sname}` needs a literal value"),
-                    s.span,
-                );
-            };
-            let init_expr = find_expr(class, *init_id).expect("static init");
-            if !matches!(
-                init_expr.kind,
-                ExprKind::Num { .. } | ExprKind::Str(_) | ExprKind::Bool(_)
-            ) && !matches!(&init_expr.kind, ExprKind::Unary { op: UnaryOp::Neg, arg } if matches!(arg.kind, ExprKind::Num { .. }))
-            {
-                return self.err(format!("static field `{sname}` needs a literal value (static state is not supported)"), init_expr.span);
-            }
-            let (t, value) = if self.is_str(sty) {
-                let ExprKind::Str(v) = &init_expr.kind else {
-                    unreachable!()
-                };
-                ("&str".to_string(), string_literal(v))
-            } else {
-                let x = self.expr(init_expr)?;
-                (self.rust_ty(sty, init_expr.span)?, x.code)
-            };
-            self.line(&format!("pub const {}: {t} = {value};", screaming(sname)));
-            first = false;
-        }
-        if !first {
+        // A generic class keeps its statics in an `impl` of its own (`Name<()>`): a call
+        // like `Name::of(…)` could not tell the type arguments of the generic one.
+        let generic = !s.type_params.is_empty();
+        let statics_text = self.capture(|g| g.static_consts(class, s))?;
+        if !generic && !statics_text.is_empty() {
+            self.out.push_str(&statics_text);
             self.blank();
         }
-        first = false;
         if let Some(m) = class.members.iter().find_map(|m| match m {
             ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
             _ => None,
@@ -821,7 +887,7 @@ impl<'a> Gen<'a> {
             self.indent += 1;
             self.fns.push(self.plain_ctx(
                 class.id,
-                Ty::Named(s.name.clone()),
+                Ty::named(s.name.clone()),
                 Some(s.name.clone()),
                 true,
             ));
@@ -831,11 +897,13 @@ impl<'a> Gen<'a> {
             self.indent -= 1;
             self.line("}");
         }
+        let mut statics = Vec::new();
         for (_, m) in methods {
-            if !first {
-                self.blank();
+            if generic && m.is_static {
+                statics.push(m);
+                continue;
             }
-            first = false;
+            self.blank();
             self.function_item(&m.func, Some(m), None)?;
         }
         // `super.m()`: the base class's version, as `base_m`, possibly needing more.
@@ -875,6 +943,57 @@ impl<'a> Gen<'a> {
         self.indent -= 1;
         self.line("}");
         self.current_class = None;
+        if !s.type_params.is_empty() {
+            self.found_bounds
+                .insert(format!("struct:{}", s.name), self.class_bounds.clone());
+            let header = self.generic_header(&s.type_params, &["Clone"]);
+            let at = header_at + self.out[header_at..].find("impl ").expect("impl header");
+            self.out.replace_range(at..at + 4, &format!("impl{header}"));
+            if !statics_text.is_empty() || !statics.is_empty() {
+                let unit = vec!["()"; s.type_params.len()].join(", ");
+                self.blank();
+                self.line(&format!("impl {name}<{unit}> {{"));
+                self.indent += 1;
+                self.out.push_str(&statics_text);
+                for m in statics {
+                    self.blank();
+                    self.function_item(&m.func, Some(m), None)?;
+                }
+                self.indent -= 1;
+                self.line("}");
+            }
+        }
+        Ok(())
+    }
+
+    /// The `const`s of a class's static fields.
+    fn static_consts(&mut self, class: &'a Class, s: &crate::infer::StructInfo) -> GResult<()> {
+        for (sname, sty, init) in &s.statics {
+            let Some(init_id) = init else {
+                return self.err(
+                    format!("static field `{sname}` needs a literal value"),
+                    s.span,
+                );
+            };
+            let init_expr = find_expr(class, *init_id).expect("static init");
+            if !matches!(
+                init_expr.kind,
+                ExprKind::Num { .. } | ExprKind::Str(_) | ExprKind::Bool(_)
+            ) && !matches!(&init_expr.kind, ExprKind::Unary { op: UnaryOp::Neg, arg } if matches!(arg.kind, ExprKind::Num { .. }))
+            {
+                return self.err(format!("static field `{sname}` needs a literal value (static state is not supported)"), init_expr.span);
+            }
+            let (t, value) = if self.is_str(sty) {
+                let ExprKind::Str(v) = &init_expr.kind else {
+                    unreachable!()
+                };
+                ("&str".to_string(), string_literal(v))
+            } else {
+                let x = self.expr(init_expr)?;
+                (self.rust_ty(sty, init_expr.span)?, x.code)
+            };
+            self.line(&format!("pub const {}: {t} = {value};", screaming(sname)));
+        }
         Ok(())
     }
 
@@ -891,7 +1010,7 @@ impl<'a> Gen<'a> {
         let info = self.p.funcs[&ctor].clone();
         self.push_scope();
         self.fns
-            .push(self.plain_ctx(f.id, Ty::Named(s.name.clone()), Some(s.name.clone()), true));
+            .push(self.plain_ctx(f.id, Ty::named(s.name.clone()), Some(s.name.clone()), true));
         self.fn_ctx_mut().returns_result = info.throws;
         let params = self.param_list(f, &info)?;
         let names: Vec<String> = info.params.iter().map(|b| self.name(*b)).collect();
@@ -1016,7 +1135,7 @@ impl<'a> Gen<'a> {
         let info = self.p.funcs[&f.id].clone();
         self.push_scope();
         self.fns
-            .push(self.plain_ctx(f.id, Ty::Named(s.name.clone()), Some(s.name.clone()), true));
+            .push(self.plain_ctx(f.id, Ty::named(s.name.clone()), Some(s.name.clone()), true));
         self.fn_ctx_mut().returns_result = info.throws;
         let params = self.param_list(f, &info)?;
         let ret = if info.throws {
@@ -1162,12 +1281,13 @@ impl<'a> Gen<'a> {
             let binding = info.params[i];
             let var = self.p.var(binding).clone();
             let pty = self.resolve(&info.sig.params[i]);
+            let all_params = self.all_type_params(info);
             let mode = self.param_mode(
-                &pty,
+                &info.sig.params[i],
                 var.stored || var.shared,
                 var.reassigned,
                 var.mutated,
-                &info.type_params,
+                &all_params,
             );
             let t = self.mode_ty(&pty, mode, p.span)?;
             let repr = Self::mode_repr(mode);
@@ -1280,7 +1400,30 @@ impl<'a> Gen<'a> {
         self.pop_scope();
         let params = params?;
         let body = body?;
+        if !info.type_params.is_empty() {
+            let own: Bounds = ctx
+                .bounds
+                .iter()
+                .filter(|(k, _)| info.type_params.contains(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            self.found_bounds
+                .entry(format!("fn:{}", info.id))
+                .or_default()
+                .extend(own);
+        }
         let mut generics = Vec::new();
+        let mut ctx = ctx;
+        // Every value of the program can be copied (`Clone`): the parameters too.
+        for tp in &info.type_params {
+            ctx.bounds.entry(tp.clone()).or_default().insert("Clone");
+        }
+        for (p, c) in &info.type_bounds {
+            ctx.bounds
+                .entry(p.clone())
+                .or_default()
+                .insert(Self::bound_trait(c));
+        }
         for tp in &info.type_params {
             match ctx.bounds.get(tp) {
                 Some(b) if !b.is_empty() => generics.push(format!(
@@ -1295,7 +1438,14 @@ impl<'a> Gen<'a> {
         } else {
             format!("<{}>", generics.join(", "))
         };
-        let ret = self.fn_return_ty(&ret_ty, f.span)?;
+        let mut ret = self.fn_return_ty(&ret_ty, f.span)?;
+        if method.is_some() && self.fluent(&info) {
+            ret = if self.p.method_mutates(info.id) {
+                "&mut Self".into()
+            } else {
+                "&Self".into()
+            };
+        }
         let ret = if info.throws && !f.is_generator {
             format!(" -> Result<{ret}, String>")
         } else if ret == "()" {
@@ -1614,8 +1764,131 @@ impl<'a> Gen<'a> {
                     body.join("\n\n")
                 ));
                 if inspect {
-                    self.mark_inspected(&Ty::Named(c.clone()));
+                    self.mark_inspected(&Ty::named(c.clone()));
                 }
+            }
+        }
+        out.push_str(&self.bound_trait_items(file)?);
+        Ok(out)
+    }
+
+    /// The traits of the constraints (`T extends HasId` → `trait HasIdLike`): an accessor
+    /// per field and the methods, implemented by every type given for such a parameter.
+    fn bound_trait_items(&mut self, file: Option<usize>) -> GResult<String> {
+        let constraints: std::collections::BTreeSet<String> = self
+            .p
+            .funcs
+            .values()
+            .flat_map(|f| f.type_bounds.iter().map(|(_, c)| c.clone()))
+            .chain(
+                self.p
+                    .structs
+                    .iter()
+                    .flat_map(|s| s.type_bounds.iter().map(|(_, c)| c.clone())),
+            )
+            .collect();
+        let mut out = String::new();
+        for c in constraints {
+            // A class held as `dyn` already has its trait, implemented by its subclasses.
+            if self.p.is_dyn(&c) {
+                continue;
+            }
+            let Some(info) = self.p.struct_info(&c).cloned() else {
+                continue;
+            };
+            if !self.owned_by(info.span, file) {
+                continue;
+            }
+            let trait_name = Self::bound_trait(&c);
+            let impls: Vec<String> = self
+                .p
+                .bound_impls
+                .iter()
+                .filter(|(k, _)| *k == c)
+                .map(|(_, n)| n.clone())
+                .collect();
+            let mut lines = Vec::new();
+            let mut getters = Vec::new();
+            for f in &info.fields {
+                let ty = if f.optional {
+                    Ty::Option(Box::new(f.ty.clone()))
+                } else {
+                    f.ty.clone()
+                };
+                let t = self.rust_ty(&ty, f.span)?;
+                let fname = snake(&f.name);
+                let setter = self.bound_setters.contains(&(c.clone(), f.name.clone()));
+                lines.push(format!("    fn {fname}(&self) -> &{t};"));
+                if setter {
+                    lines.push(format!("    fn {fname}_mut(&mut self) -> &mut {t};"));
+                }
+                getters.push((fname, t, setter));
+            }
+            // The methods, with the signatures of a class that has them.
+            let mut sigs: Vec<(String, Vec<String>)> = Vec::new();
+            for mi in &info.methods {
+                let candidates: Vec<String> = std::iter::once(c.clone())
+                    .chain(impls.iter().cloned())
+                    .collect();
+                let found = candidates.iter().find_map(|k| {
+                    self.class_methods(k)
+                        .into_iter()
+                        .find(|(_, m)| m.name == mi.name && m.kind == mi.kind && !m.is_abstract)
+                });
+                let Some((_, m)) = found else {
+                    continue;
+                };
+                let mutable = self.p.method_mutates(m.func.id);
+                let (sig, names) = self.method_sig(m, mutable)?;
+                lines.push(format!("    {sig};"));
+                sigs.push((sig, names));
+            }
+            out.push_str(&format!(
+                "\n/// What `T extends {c}` needs of `T`.\ntrait {trait_name} {{\n{}\n}}\n",
+                lines.join("\n")
+            ));
+            for n in impls {
+                let nname = pascal(&n);
+                let params = self
+                    .p
+                    .struct_info(&n)
+                    .map(|s| s.type_params.clone())
+                    .unwrap_or_default();
+                let (header, args) = if params.is_empty() {
+                    (String::new(), String::new())
+                } else {
+                    let list = params.join(", ");
+                    (format!("<{list}>"), format!("<{list}>"))
+                };
+                let mut body = Vec::new();
+                for (fname, t, setter) in &getters {
+                    body.push(format!(
+                        "    fn {fname}(&self) -> &{t} {{\n        &self.{fname}\n    }}"
+                    ));
+                    if *setter {
+                        body.push(format!(
+                            "    fn {fname}_mut(&mut self) -> &mut {t} {{\n        &mut self.{fname}\n    }}"
+                        ));
+                    }
+                }
+                for (sig, names) in &sigs {
+                    let method = sig
+                        .trim_start_matches("fn ")
+                        .split('(')
+                        .next()
+                        .unwrap_or_default();
+                    let call_args = std::iter::once("self".to_string())
+                        .chain(names.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    body.push(format!(
+                        "    {sig} {{\n        {nname}::{method}({call_args})\n    }}"
+                    ));
+                }
+                out.push_str(&format!(
+                    "\nimpl{header} {trait_name} for {nname}{args} {{\n{}\n}}\n",
+                    body.join("\n\n")
+                ));
             }
         }
         Ok(out)

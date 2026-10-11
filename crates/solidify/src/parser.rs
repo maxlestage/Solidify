@@ -1055,10 +1055,11 @@ impl<'a> Parser<'a> {
         };
         let id = self.id();
         let type_params = self.type_params()?;
+        let mut extends_args = Vec::new();
         let extends = if self.eat_word("extends") {
             let e = self.call_member(false)?;
             if self.at_punct("<") {
-                self.type_args()?;
+                extends_args = self.type_args()?;
             }
             Some(e)
         } else {
@@ -1091,6 +1092,7 @@ impl<'a> Parser<'a> {
             name,
             type_params,
             extends,
+            extends_args,
             implements,
             members,
             exported,

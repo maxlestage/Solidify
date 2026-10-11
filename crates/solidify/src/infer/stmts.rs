@@ -44,6 +44,25 @@ impl<'m> Infer<'m> {
             | StmtKind::Import(_) => Ok(()),
             StmtKind::Return(value) => {
                 let ret = self.ctx().ret.clone();
+                let id = self.ctx().id;
+                let counts = self.this_returns.entry(id).or_default();
+                if matches!(
+                    value,
+                    Some(Expr {
+                        kind: ExprKind::This,
+                        ..
+                    })
+                ) {
+                    counts.0 += 1;
+                } else {
+                    counts.1 += 1;
+                }
+                match value {
+                    Some(e) => self.fn_returns.push((id, e)),
+                    None => {
+                        self.undef_fns.insert(id);
+                    }
+                }
                 match value {
                     Some(e) => {
                         let t = self.expr(e, Some(&ret))?;
@@ -249,7 +268,7 @@ impl<'m> Infer<'m> {
             StmtKind::Throw(e) => {
                 let t = self.expr(e, None)?;
                 match self.types.resolve(&t) {
-                    Ty::Str | Ty::Named(_) => {}
+                    Ty::Str | Ty::Named(..) => {}
                     other => {
                         let d = self.describe(&other);
                         return self
@@ -278,7 +297,7 @@ impl<'m> Infer<'m> {
                 if let Some(c) = catch {
                     self.push_scope();
                     if let Some(p) = &c.param {
-                        self.bind_pattern(p, &Ty::Named("Error".into()), Role::Catch)?;
+                        self.bind_pattern(p, &Ty::named("Error"), Role::Catch)?;
                     }
                     self.block(&c.body)?;
                     self.pop_scope();
@@ -351,6 +370,19 @@ impl<'m> Infer<'m> {
                 }
             } else {
                 self.bind_pattern(&d.pat, &ty, Role::Local)?;
+            }
+            // `let x: T | undefined`, `let x;`: missing means `undefined`; otherwise the
+            // initializer decides.
+            if let Pattern::Ident { id, .. } = &d.pat {
+                match (&d.ty, &d.init) {
+                    (Some(t), _) if super::says_undefined(t) => {
+                        self.undef_vars.insert(*id);
+                    }
+                    (_, None) => {
+                        self.undef_vars.insert(*id);
+                    }
+                    (_, Some(init)) => self.var_inits.push((*id, init)),
+                }
             }
             if let (Pattern::Ident { id, .. }, Some(init)) = (&d.pat, &d.init) {
                 let alias = is_place(init);
@@ -492,6 +524,7 @@ impl<'m> Infer<'m> {
                 }
             }
             FnBody::Expr(e) => {
+                self.fn_returns.push((f.id, e));
                 let ret = self.ctx().ret.clone();
                 if matches!(self.types.resolve(&ret), Ty::Void) {
                     // A callback whose result nobody wants: the value is dropped.
@@ -519,7 +552,7 @@ impl<'m> Infer<'m> {
             }
             for v in vars {
                 let name = super::finish::fresh_type_param(&type_params);
-                self.types.bind(v, Ty::Named(name.clone()));
+                self.types.bind(v, Ty::named(name.clone()));
                 type_params.push(name);
             }
             self.funcs.get_mut(&f.id).expect("fn").type_params = type_params;
@@ -528,6 +561,14 @@ impl<'m> Infer<'m> {
     }
 
     fn class_bodies(&mut self, c: &'m Class) -> IResult<()> {
+        self.param_scope
+            .push(c.type_params.iter().map(|t| t.name.clone()).collect());
+        let r = self.class_bodies_inner(c);
+        self.param_scope.pop();
+        r
+    }
+
+    fn class_bodies_inner(&mut self, c: &'m Class) -> IResult<()> {
         self.this_class_stack.push(c.name.clone());
         for m in &c.members {
             match m {
@@ -670,7 +711,7 @@ impl<'m> Infer<'m> {
                         complement: None,
                         instance_of: Some(sub.clone()),
                         mutated: false,
-                        inner: Ty::Named(sub.clone()),
+                        inner: Ty::named(sub.clone()),
                         let_else: false,
                         unwrap: false,
                     },
@@ -679,7 +720,7 @@ impl<'m> Infer<'m> {
                     root: path.root,
                     path: path.fields,
                     name,
-                    inner: Ty::Named(sub),
+                    inner: Ty::named(sub),
                     test_id: e.id,
                 };
                 Ok((vec![n], Vec::new()))
@@ -805,7 +846,7 @@ impl<'m> Infer<'m> {
             return Ok(None);
         }
         let vt = self.expr(value, None)?;
-        let Ty::Named(base) = self.types.resolve(&vt) else {
+        let Ty::Named(base, ..) = self.types.resolve(&vt) else {
             return Ok(None);
         };
         if self.union_by_name(&base).is_some() || base == *sub || !self.is_subclass(sub, &base) {
@@ -866,13 +907,13 @@ impl<'m> Infer<'m> {
         let ty = match &path.root {
             Root::Var(id) => self.vars[id].ty.clone(),
             Root::This => match self.ctx().this.clone() {
-                Some(c) => Ty::Named(c),
+                Some(c) => Ty::named(c),
                 None => return false,
             },
         };
         let mut ty = self.types.resolve(&ty);
         for f in &path.fields {
-            let Ty::Named(n) = &ty else { return false };
+            let Ty::Named(n, ..) = &ty else { return false };
             let Some(s) = self.struct_by_name(n) else {
                 return false;
             };

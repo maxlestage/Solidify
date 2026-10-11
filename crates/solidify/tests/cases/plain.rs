@@ -1,5 +1,5 @@
 /// Plain JavaScript: no annotations at all.
-fn greet<T: std::fmt::Display>(name: T) -> String {
+fn greet<T: Clone + std::fmt::Display>(name: T) -> String {
     format!("Hello, {name}!")
 }
 

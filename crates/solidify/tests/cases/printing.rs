@@ -93,7 +93,7 @@ fn main() {
     let record = JsMap::from([("b".to_string(), vec![2]), ("a".to_string(), vec![1, 1])]);
     println!("{} {} {}", js_inspect(&JsValue::Object(None, record.iter().map(|(k, v)| (k.to_string(), v.js_value())).collect())), js_inspect(&record.keys().cloned().collect::<Vec<_>>().js_value()), js_inspect(&(record.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>()).js_value()));
     let found = points.iter().find(|p| p.x > 2).cloned();
-    println!("{} {} {} {}", found.as_ref().map_or("null".to_string(), |v| js_inspect(&v.js_value())), points.iter().find(|p| p.x > 10).cloned().as_ref().map_or("undefined".to_string(), |v| js_inspect(&v.js_value())), scores.get("zoe").copied().as_ref().map_or("undefined".to_string(), |v| v.to_string()), scores.get("nobody").copied().as_ref().map_or("undefined".to_string(), |v| v.to_string()));
+    println!("{} {} {} {}", found.as_ref().map_or("undefined".to_string(), |v| js_inspect(&v.js_value())), points.iter().find(|p| p.x > 10).cloned().as_ref().map_or("undefined".to_string(), |v| js_inspect(&v.js_value())), scores.get("zoe").copied().as_ref().map_or("undefined".to_string(), |v| v.to_string()), scores.get("nobody").copied().as_ref().map_or("undefined".to_string(), |v| v.to_string()));
     let mut line = "items: ".to_string();
     line.push_str(&format!("{}", js_to_string(&(points.iter().map(|p| p.x).collect::<Vec<_>>()).js_value())));
     println!("{line} {} {} {}", vec![1, 2].iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", "), vec![vec![1, 2], vec![3]].iter().map(|x| js_to_string(&x.js_value())).collect::<Vec<_>>().join(";"), vec![1, 2, 3].iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","));

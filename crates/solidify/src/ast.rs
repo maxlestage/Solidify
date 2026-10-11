@@ -257,6 +257,8 @@ pub struct Class {
     pub name: String,
     pub type_params: Vec<TypeParam>,
     pub extends: Option<Expr>,
+    /// `extends Base<number>`: the base class's type arguments.
+    pub extends_args: Vec<TypeAnn>,
     pub implements: Vec<TypeAnn>,
     pub members: Vec<ClassMember>,
     pub exported: bool,

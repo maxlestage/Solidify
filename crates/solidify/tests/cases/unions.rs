@@ -273,7 +273,7 @@ fn main() {
     lx.push(Token::End(End { r#type: "end".to_string() }));
     println!("{} {} {} {}", lx.describe(), lx.tokens.len(), number_of(&lx.tokens[0]), number_of(&lx.tokens[1]));
     let found = lx.tokens.iter().find(|t| t.r#type().as_str() == "op").cloned();
-    println!("{} {} {} {} {}", found.as_ref().map_or("null".to_string(), |v| js_inspect(&v.js_value())), show(Some(&NumberOrStringOrBoolean::Number(3.0))), show(Some(&NumberOrStringOrBoolean::String("x".to_string()))), show(Some(&NumberOrStringOrBoolean::Boolean(false))), show(None));
+    println!("{} {} {} {} {}", found.as_ref().map_or("undefined".to_string(), |v| js_inspect(&v.js_value())), show(Some(&NumberOrStringOrBoolean::Number(3.0))), show(Some(&NumberOrStringOrBoolean::String("x".to_string()))), show(Some(&NumberOrStringOrBoolean::Boolean(false))), show(None));
     let kinds = lx.tokens.iter().map(|t| t.r#type().clone()).collect::<Vec<_>>();
     println!("{} {}", js_inspect(&kinds.js_value()), lx.current.as_ref().map_or("null".to_string(), |v| js_inspect(&v.js_value())));
     // An array literal of different types is an array of their union.

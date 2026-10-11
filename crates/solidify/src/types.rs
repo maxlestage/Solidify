@@ -26,12 +26,20 @@ pub enum Ty {
     Set(Box<Ty>),
     /// A generator (`function*`): a lazy sequence of values.
     Gen(Box<Ty>),
-    /// A struct, an enum or a type parameter, by name.
-    Named(String),
+    /// A struct, an enum or a type parameter, by name, with the type arguments of a
+    /// generic class or interface (`Stack<number>`).
+    Named(String, Vec<Ty>),
     Func(Rc<FuncTy>),
     /// `any` / `unknown`: accepted everywhere, never named in the output.
     Any,
     Never,
+}
+
+impl Ty {
+    /// A struct, an enum or a type parameter without type arguments.
+    pub fn named(name: impl Into<String>) -> Ty {
+        Ty::Named(name.into(), Vec::new())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -179,6 +187,7 @@ impl Types {
             Ty::Gen(t) => Ty::Gen(Box::new(self.zonk(&t))),
             Ty::Map(k, v, r) => Ty::Map(Box::new(self.zonk(&k)), Box::new(self.zonk(&v)), r),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.zonk(t)).collect()),
+            Ty::Named(n, args) => Ty::Named(n, args.iter().map(|t| self.zonk(t)).collect()),
             Ty::Func(f) => Ty::Func(Rc::new(FuncTy {
                 params: f.params.iter().map(|t| self.zonk(t)).collect(),
                 ret: self.zonk(&f.ret),
@@ -197,7 +206,7 @@ impl Types {
             Ty::Var(w) => w == v,
             Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => self.occurs(v, &t),
             Ty::Map(k, val, _) => self.occurs(v, &k) || self.occurs(v, &val),
-            Ty::Tuple(ts) => ts.iter().any(|t| self.occurs(v, t)),
+            Ty::Tuple(ts) | Ty::Named(_, ts) => ts.iter().any(|t| self.occurs(v, t)),
             Ty::Func(f) => f.params.iter().any(|t| self.occurs(v, t)) || self.occurs(v, &f.ret),
             _ => false,
         }
@@ -261,7 +270,14 @@ impl Types {
                 }
                 Ok(())
             }
-            (Ty::Named(x), Ty::Named(y)) if x == y => Ok(()),
+            (Ty::Named(x, xs), Ty::Named(y, ys)) if x == y => {
+                // A generic type seen without its arguments (inside its own class) takes
+                // the other side's.
+                for (x, y) in xs.iter().zip(ys) {
+                    self.unify(x, y)?;
+                }
+                Ok(())
+            }
             (Ty::Func(f), Ty::Func(g)) => {
                 for (x, y) in f.params.iter().zip(&g.params) {
                     self.unify(x, y)?;
@@ -306,7 +322,14 @@ impl Types {
             ),
             Ty::Set(t) => format!("Set<{}>", self.describe(&t)),
             Ty::Gen(t) => format!("Generator<{}>", self.describe(&t)),
-            Ty::Named(n) => n,
+            Ty::Named(n, args) if args.is_empty() => n,
+            Ty::Named(n, args) => format!(
+                "{n}<{}>",
+                args.iter()
+                    .map(|t| self.describe(t))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Ty::Func(f) => format!(
                 "({}) => {}",
                 f.params
@@ -327,7 +350,7 @@ impl Types {
             Ty::Num(_) | Ty::Bool | Ty::Void | Ty::Null | Ty::Never => true,
             Ty::Option(t) => self.is_copy(&t, copy_named),
             Ty::Tuple(ts) => ts.iter().all(|t| self.is_copy(t, copy_named)),
-            Ty::Named(n) => copy_named(&n),
+            Ty::Named(n, ..) => copy_named(&n),
             _ => false,
         }
     }
