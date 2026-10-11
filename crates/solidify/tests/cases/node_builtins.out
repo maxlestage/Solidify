@@ -1,0 +1,13 @@
+true 3 12 true
+[ 'b.txt', 'notes.txt' ]
+notes.txt .txt /a/b c
+a/c/d /a/c/ true ../c/d
+{
+  root: '/',
+  dir: '/home/u',
+  base: 'file.tar.gz',
+  ext: '.gz',
+  name: 'file.tar'
+} / true
+caught true
+false string true

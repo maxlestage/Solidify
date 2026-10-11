@@ -8,6 +8,7 @@ pub mod infer;
 pub mod lexer;
 pub mod parser;
 pub mod project;
+pub mod rename;
 pub mod types;
 
 pub use error::Error;

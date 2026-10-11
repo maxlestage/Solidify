@@ -364,6 +364,10 @@ impl<'m> Infer<'m> {
                 let f = self.types.float();
                 self.done(e, full, f)
             }
+            ("process", "cwd") => {
+                self.no_more_than(args, 0, &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
             ("process", "exit") => {
                 let i = self.types.int();
                 if !args.is_empty() {
@@ -600,12 +604,21 @@ impl<'m> Infer<'m> {
             }
             "includes" | "startsWith" | "endsWith" => {
                 self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
-                self.no_more_than(args, 1, &full, span)?;
+                // A position: where to look from (to, for `endsWith`).
+                if args.len() > 1 {
+                    let n = int(self);
+                    self.arg_typed(args, 1, Some(n), &full, span)?;
+                }
+                self.no_more_than(args, 2, &full, span)?;
                 self.done(e, full, Ty::Bool)
             }
             "indexOf" | "lastIndexOf" => {
                 self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
-                self.no_more_than(args, 1, &full, span)?;
+                if args.len() > 1 {
+                    let n = int(self);
+                    self.arg_typed(args, 1, Some(n), &full, span)?;
+                }
+                self.no_more_than(args, 2, &full, span)?;
                 let i = int(self);
                 self.done(e, full, i)
             }

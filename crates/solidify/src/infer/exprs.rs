@@ -1335,6 +1335,8 @@ impl<'m> Infer<'m> {
                     | "NEGATIVE_INFINITY" | "NaN",
                 ) => self.types.float(),
                 ("process", "argv") => Ty::Array(Box::new(Ty::Str)),
+                ("process", "env") => Ty::Map(Box::new(Ty::Str), Box::new(Ty::Str), true),
+                ("process", "platform") => Ty::Str,
                 _ if GLOBALS.contains(&name.as_str()) => {
                     return self.err(format!("`{name}.{prop}` is not supported"), e.span);
                 }
@@ -2188,6 +2190,23 @@ impl<'m> Infer<'m> {
             self.calls.insert(e.id, Callee::Builtin("new Array"));
             return Ok(Ty::Array(Box::new(t)));
         }
+        if let Some((_, params, ret)) = super::INTRINSICS.iter().find(|(n, ..)| *n == name) {
+            for (i, p) in params.chars().enumerate() {
+                let t = if p == 's' { Ty::Str } else { Ty::Bool };
+                self.arg_typed(args, i, Some(t), name, span)?;
+            }
+            self.no_more_than(args, params.len(), name, span)?;
+            let ty = match ret {
+                's' => Ty::Str,
+                'b' => Ty::Bool,
+                'i' => self.types.int(),
+                'a' => Ty::Array(Box::new(Ty::Str)),
+                _ => Ty::Void,
+            };
+            self.calls
+                .insert(e.id, Callee::Builtin(leak(format!("global.{name}"))));
+            return Ok(ty);
+        }
         let ty = match name {
             "parseInt" => self.parse_int_call(args, name, span)?,
             "parseFloat" => {
@@ -2238,7 +2257,7 @@ impl<'m> Infer<'m> {
             "Function" => return self.function_call(e, args),
             "require" => {
                 return self.err(
-                    "`require` is not supported: Solidify translates one file",
+                    "`require` takes a module name written in the program: `require(\"./file\")`",
                     span,
                 );
             }
@@ -2397,6 +2416,8 @@ impl<'m> Infer<'m> {
                         let d = self.describe(&ft);
                         return self.err(format!("`{name}` is {d}, not a function"), callee.span);
                     };
+                    // A read of the variable: a closure calling it captures it.
+                    self.expr(callee, None)?;
                     self.set_ty(callee.id, Ty::Func(f.clone()));
                     self.dynamic_args(args, &f, e.span)?;
                     self.calls.insert(e.id, Callee::Closure(id));

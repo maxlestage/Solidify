@@ -60,6 +60,8 @@ pub enum Helper {
     Eval,
     /// `Shared<T>`: objects held in several places.
     Shared,
+    /// The native side of the Node modules (`fs`, `os`).
+    Node,
 }
 
 /// The regular expression engine, compiled into Solidify too: patterns are checked when
@@ -110,6 +112,19 @@ fn js_index_of(s: &str, needle: &str) -> i64 {
         Some(byte) => s[..byte].chars().count() as i64,
         None => -1,
     }
+}
+
+/// `s.indexOf(needle, from)`.
+#[allow(dead_code)]
+fn js_index_of_from(s: &str, needle: &str, from: i64) -> i64 {
+    let from = from.max(0) as usize;
+    let Some((start, _)) = s.char_indices().nth(from).or((from == s.chars().count()).then_some((s.len(), ' '))) else {
+        return if needle.is_empty() { s.chars().count() as i64 } else { -1 };
+    };
+    match s[start..].find(needle) {
+        Some(byte) => s[..start + byte].chars().count() as i64,
+        None => -1,
+    }
 }"#
             }
             Helper::StrLastIndexOf => {
@@ -119,6 +134,25 @@ fn js_last_index_of(s: &str, needle: &str) -> i64 {
         Some(byte) => s[..byte].chars().count() as i64,
         None => -1,
     }
+}
+
+/// `s.lastIndexOf(needle, from)`: the last match starting at `from` or before.
+#[allow(dead_code)]
+fn js_last_index_of_from(s: &str, needle: &str, from: i64) -> i64 {
+    let chars: Vec<char> = s.chars().collect();
+    let n: Vec<char> = needle.chars().collect();
+    if n.len() > chars.len() {
+        return -1;
+    }
+    let last = (chars.len() - n.len()) as i64;
+    let mut i = from.clamp(0, last.max(0)).min(last);
+    while i >= 0 {
+        if chars[i as usize..].starts_with(&n) {
+            return i;
+        }
+        i -= 1;
+    }
+    -1
 }"#
             }
             Helper::StrCharCodeAt => {
@@ -379,6 +413,7 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Dynamic => include_str!("runtime/dynamic.rs"),
             Helper::Eval => include_str!("runtime/eval.rs"),
             Helper::Shared => include_str!("runtime/shared.rs"),
+            Helper::Node => include_str!("runtime/node.rs"),
             Helper::BlockOn => {
                 r#"/// Runs a future to completion, running the timers it waits on.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
