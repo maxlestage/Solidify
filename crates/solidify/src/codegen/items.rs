@@ -970,7 +970,7 @@ impl<'a> Gen<'a> {
                 statics.push(m);
                 continue;
             }
-            if self.p.is_shared(&s.name) && !m.is_static {
+            if self.p.is_shared(&s.name) && !self.p.is_shared_hierarchy(&s.name) && !m.is_static {
                 on_handle.push(m);
                 continue;
             }
@@ -1333,7 +1333,7 @@ impl<'a> Gen<'a> {
             }
         }
         let fields = self.initial_fields(class, s, &assigned);
-        let shared = self.p.is_shared(&s.name);
+        let shared = self.p.is_shared(&s.name) && !self.p.is_shared_hierarchy(&s.name);
         let text = self.capture(|g| {
             g.indent += 1;
             for st in lead {
@@ -1582,7 +1582,9 @@ impl<'a> Gen<'a> {
                     (None, MethodKind::Set) => format!("set_{base}"),
                     _ => base,
                 };
-                let on_handle = class.as_ref().is_some_and(|c| self.p.is_shared(c));
+                let on_handle = class
+                    .as_ref()
+                    .is_some_and(|c| self.p.is_shared(c) && !self.p.is_shared_hierarchy(c));
                 let self_param = if m.is_static {
                     String::new()
                 } else if on_handle {
@@ -1810,6 +1812,13 @@ impl<'a> Gen<'a> {
                 if *mutable {
                     lines.push(format!(
                         "    fn as_{}_mut(&mut self) -> Option<&mut {target}>;",
+                        snake(sub)
+                    ));
+                }
+                // Shared objects: the handle of the subclass, the same object.
+                if self.p.is_shared(&base) {
+                    lines.push(format!(
+                        "    fn as_{}_shared(&self, me: &Shared<dyn {trait_name}{generics}>) -> Option<Shared<{target}>>;",
                         snake(sub)
                     ));
                 }
@@ -2100,6 +2109,25 @@ impl<'a> Gen<'a> {
                     "    fn as_{}_mut(&mut self) -> Option<&mut {target}> {{\n        {}\n    }}",
                     snake(sub),
                     if is { "Some(self)" } else { "None" }
+                ));
+            }
+            if self.p.is_shared(c) {
+                // `me` holds a `{cname}`: its allocation is one of `RefCell<{cname}>`.
+                let value = if is {
+                    let cast = format!(
+                        "unsafe {{ std::rc::Rc::from_raw(std::rc::Rc::into_raw(me.0.clone()) as *const std::cell::RefCell<{cname}>) }}"
+                    );
+                    if self.p.is_dyn(sub) {
+                        format!("Some(Shared({cast} as std::rc::Rc<std::cell::RefCell<{target}>>))")
+                    } else {
+                        format!("Some(Shared({cast}))")
+                    }
+                } else {
+                    "None".to_string()
+                };
+                body.push(format!(
+                    "    fn as_{}_shared(&self, me: &Shared<dyn {trait_name}{trait_args}>) -> Option<Shared<{target}>> {{\n        {value}\n    }}",
+                    snake(sub)
                 ));
             }
         }
