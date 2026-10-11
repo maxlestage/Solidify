@@ -1403,6 +1403,10 @@ impl<'a> Gen<'a> {
                 if falls_through && !body.is_empty() {
                     return g.err("a `case` must end with `break` or `return`: falling through is not supported", c.span);
                 }
+                // `case 1: { … break; }`: the block is the body.
+                if let [Stmt { kind: StmtKind::Block(b), .. }] = body {
+                    body = &b.stmts;
+                }
                 if let Some(Stmt { kind: StmtKind::Break(None), .. }) = body.last() {
                     body = &body[..body.len() - 1];
                 }
@@ -1436,7 +1440,8 @@ impl<'a> Gen<'a> {
             self.indent += 1;
         }
         self.line(&format!("match {head} {{"));
-        self.out.push_str(&text);
+        self.out
+            .push_str(&if used { indent_text(&text, 1) } else { text });
         if !has_default && !covered {
             self.indent += 1;
             self.line("_ => {}");

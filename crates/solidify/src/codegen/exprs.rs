@@ -782,6 +782,9 @@ impl<'a> Gen<'a> {
         if is_int_literal_e(x) {
             return format!("{}.0", x.code);
         }
+        if let Some(base) = x.code.strip_suffix(" as i64") {
+            return format!("{base} as f64");
+        }
         format!("{} as f64", Self::paren(x, PREC_CAST_PLUS))
     }
 

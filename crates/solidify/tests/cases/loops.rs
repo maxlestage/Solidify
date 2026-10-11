@@ -16,20 +16,15 @@ fn search(grid: &[Vec<i64>], target: i64) -> Option<(i64, i64)> {
 
 fn describe(n: i64) -> String {
     let mut kind = "".to_string();
-    'switch: {
-        match n % 3 {
+    match n % 3 {
         0 => {
             kind = "fizz".to_string();
         }
         1 => {
-            {
-                kind = "one".to_string();
-                break 'switch;
-            }
+            kind = "one".to_string();
         }
         _ => {
             kind = "other".to_string();
-        }
         }
     }
     kind
@@ -57,7 +52,7 @@ fn main() {
         println!("found at {r},{c}");
     }
     println!("{} {} {} {}", search(&grid, 7).is_none(), describe(9), describe(10), describe(11));
-    println!("{} {}", first_negative(&vec![3, 1, -2, 5]), first_negative(&vec![1, 2]));
+    println!("{} {}", first_negative(&[3, 1, -2, 5]), first_negative(&[1, 2]));
     let mut evens = 0;
     let mut i = 10;
     while i >= 0 {

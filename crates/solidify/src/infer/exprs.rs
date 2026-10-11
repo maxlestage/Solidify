@@ -512,7 +512,17 @@ impl<'m> Infer<'m> {
             }
             AssignTarget::Expr(t) => {
                 self.check_assignable(t)?;
-                let tt = self.expr(t, None)?;
+                // A plain `x = …` writes `x` without reading it: not a use that keeps the
+                // previous value alive.
+                let tt = match (&t.kind, op) {
+                    (ExprKind::Ident(name), AssignOp::Assign) if self.lookup(name).is_some() => {
+                        let id = self.lookup(name).expect("binding");
+                        self.refs.insert(t.id, id);
+                        let ty = self.vars[&id].ty.clone();
+                        self.set_ty(t.id, ty)
+                    }
+                    _ => self.expr(t, None)?,
+                };
                 match op {
                     AssignOp::Assign => {
                         let vt = self.expr(value, Some(&tt))?;

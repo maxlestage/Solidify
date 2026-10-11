@@ -8,7 +8,7 @@ fn average(values: &[i64]) -> f64 {
     for &v in values {
         total += v;
     }
-    total as f64 / values.len() as i64 as f64
+    total as f64 / values.len() as f64
 }
 
 fn largest<T: Clone + PartialOrd>(items: &[T]) -> T {
@@ -23,7 +23,7 @@ fn largest<T: Clone + PartialOrd>(items: &[T]) -> T {
 
 fn main() {
     let scores = vec![12, 7, 19, 3];
-    println!("{} {} {} {}", greet("Ada".to_string()), average(&scores), largest(&scores), largest(&vec!["pear".to_string(), "zebra".to_string(), "apple".to_string()]));
+    println!("{} {} {} {}", greet("Ada"), average(&scores), largest(&scores), largest(&["pear".to_string(), "zebra".to_string(), "apple".to_string()]));
     let mut count = 0;
     while count < 3 {
         count += 1;

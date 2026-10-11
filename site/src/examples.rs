@@ -46,6 +46,12 @@ pub const EXAMPLES: &[Example] = &[
     case!("closures", "Closures & generics", "Closures et génériques"),
     case!("enums", "Enums & switch", "Enums et switch"),
     case!("strings", "Strings", "Chaînes"),
+    case!(
+        "narrowing",
+        "Trees & null checks",
+        "Arbres et tests de null"
+    ),
+    case!("plain", "Plain JavaScript", "JavaScript sans types"),
 ];
 
 pub fn example(id: &str) -> Option<&'static Example> {

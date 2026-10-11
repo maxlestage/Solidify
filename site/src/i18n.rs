@@ -110,7 +110,7 @@ static EN: Dict = Dict {
         cta2: "Install the CLI",
         facts: [
             ("0", "dependencies"),
-            ("12", "programs checked against Node.js"),
+            ("17", "programs checked against Node.js"),
             ("1", "file in, 1 file out"),
         ],
     },
@@ -253,7 +253,7 @@ static FR: Dict = Dict {
         cta2: "Installer la ligne de commande",
         facts: [
             ("0", "dépendance"),
-            ("12", "programmes vérifiés contre Node.js"),
+            ("17", "programmes vérifiés contre Node.js"),
             ("1", "fichier en entrée, 1 fichier en sortie"),
         ],
     },
