@@ -709,15 +709,57 @@ impl<'a> Gen<'a> {
             return self.err("this object has no known type", e.span);
         };
         let info = self.p.struct_info(&struct_name).expect("struct").clone();
-        let mut fields = Vec::new();
-        let mut base = None;
-        let mut seen = Vec::new();
+        // Each field: given in the literal, copied from a spread of another shape, or
+        // taken from a spread of this very shape (`..base`).
+        let mut given: Vec<(String, String)> = Vec::new();
+        let mut copied: Vec<(String, String)> = Vec::new();
+        let mut base: Option<String> = None;
+        let mut prelude = String::new();
+        let mut temps = 0;
         for p in props {
             match &p.value {
                 PropValue::Spread(s) => {
                     let st = self.ty_of(s);
                     let x = self.expr(s)?;
-                    base = Some(self.owned(x, &st));
+                    match self.resolve(&st) {
+                        Ty::Named(n) if n == struct_name => {
+                            base = Some(self.owned(x, &st));
+                            copied.clear();
+                        }
+                        Ty::Named(n) => {
+                            let Some(src) = self.p.struct_info(&n).cloned() else {
+                                return self.err("cannot spread this value", s.span);
+                            };
+                            // A variable is read directly; a temporary is bound first.
+                            let recv = if super::is_place_kind(s) {
+                                Self::paren(&x, PREC_POSTFIX)
+                            } else {
+                                temps += 1;
+                                let v = self.owned(x, &st);
+                                prelude.push_str(&format!("let spread_{temps} = {v}; "));
+                                format!("spread_{temps}")
+                            };
+                            for f in &src.fields {
+                                if info.field(&f.name).is_none() {
+                                    continue;
+                                }
+                                let fty = if f.optional {
+                                    Ty::Option(Box::new(f.ty.clone()))
+                                } else {
+                                    f.ty.clone()
+                                };
+                                let access = format!("{recv}.{}", snake(&f.name));
+                                let code = if self.is_copy(&fty) {
+                                    access
+                                } else {
+                                    format!("{access}.clone()")
+                                };
+                                copied.retain(|(k, _)| *k != f.name);
+                                copied.push((f.name.clone(), code));
+                            }
+                        }
+                        _ => return self.err("cannot spread this value", s.span),
+                    }
                 }
                 PropValue::Expr(v) => {
                     let key = p.key.name().unwrap_or_default();
@@ -729,12 +771,14 @@ impl<'a> Gen<'a> {
                     };
                     let val = self.expr_to(v, &target)?;
                     let rust_key = snake(&key);
-                    seen.push(key);
-                    if val == rust_key {
-                        fields.push(rust_key);
+                    let code = if val == rust_key {
+                        rust_key
                     } else {
-                        fields.push(format!("{rust_key}: {val}"));
-                    }
+                        format!("{rust_key}: {val}")
+                    };
+                    copied.retain(|(k, _)| *k != key);
+                    given.retain(|(k, _)| *k != key);
+                    given.push((key, code));
                 }
                 PropValue::Shorthand(id) => {
                     let key = p.key.name().unwrap_or_default();
@@ -750,34 +794,42 @@ impl<'a> Gen<'a> {
                     x.var = Some((binding, *id));
                     let val = self.owned_as(x, &var_ty, &target);
                     let rust_key = snake(&key);
-                    seen.push(key);
-                    if val == rust_key {
-                        fields.push(rust_key);
+                    let code = if val == rust_key {
+                        rust_key
                     } else {
-                        fields.push(format!("{rust_key}: {val}"));
-                    }
+                        format!("{rust_key}: {val}")
+                    };
+                    copied.retain(|(k, _)| *k != key);
+                    given.retain(|(k, _)| *k != key);
+                    given.push((key, code));
                 }
                 _ => return self.err("object methods are not supported", p.span),
             }
         }
-        if base.is_none() {
-            for f in &info.fields {
-                if f.optional && !seen.contains(&f.name) {
-                    fields.push(format!("{}: None", snake(&f.name)));
-                }
+        let mut fields = Vec::new();
+        for f in &info.fields {
+            if let Some((_, code)) = given.iter().find(|(k, _)| *k == f.name) {
+                fields.push(code.clone());
+            } else if let Some((_, code)) = copied.iter().find(|(k, _)| *k == f.name) {
+                fields.push(format!("{}: {code}", snake(&f.name)));
+            } else if base.is_none() && f.optional {
+                fields.push(format!("{}: None", snake(&f.name)));
             }
         }
         if let Some(b) = base {
             fields.push(format!("..{b}"));
         }
         let name = pascal(&struct_name);
-        if fields.is_empty() {
-            return Ok(E::atom(format!("{name} {{}}"), Repr::Owned));
+        let literal = if fields.is_empty() {
+            format!("{name} {{}}")
+        } else {
+            format!("{name} {{ {} }}", fields.join(", "))
+        };
+        if prelude.is_empty() {
+            Ok(E::atom(literal, Repr::Owned))
+        } else {
+            Ok(E::owned(format!("{{ {prelude}{literal} }}"), PREC_ATOM))
         }
-        Ok(E::atom(
-            format!("{name} {{ {} }}", fields.join(", ")),
-            Repr::Owned,
-        ))
     }
 
     fn unary(&mut self, op: UnaryOp, arg: &'a Expr) -> GResult<E> {
@@ -1853,6 +1905,8 @@ impl<'a> Gen<'a> {
     ) -> GResult<E> {
         let info = self.p.funcs[&f.id].clone();
         let mut params = Vec::new();
+        // `({ x, y }) => …`: the parameter is taken apart at the start of the body.
+        let mut prelude: Vec<String> = Vec::new();
         self.push_scope();
         for (i, p) in f.params.iter().enumerate() {
             let binding = info.params[i];
@@ -1879,7 +1933,20 @@ impl<'a> Gen<'a> {
             }
             params.push(text);
             if !matches!(p.pat, Pattern::Ident { .. }) {
-                return self.err("destructured closure parameters are not supported", p.span);
+                let lines = self.capture(|g| match &p.pat {
+                    Pattern::Object { props, .. } => g.destructure_object(props, &name, &pty),
+                    Pattern::Array { elems, rest, .. } => {
+                        g.destructure_array(elems, rest, &name, &pty)
+                    }
+                    Pattern::Ident { .. } => Ok(()),
+                })?;
+                prelude.extend(
+                    lines
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty())
+                        .map(str::to_string),
+                );
             }
         }
         let ret_ty = info.sig.ret.clone();
@@ -1945,6 +2012,25 @@ impl<'a> Gen<'a> {
                 s.push('}');
                 s
             }
+        };
+        let body = if prelude.is_empty() {
+            body
+        } else if let Some(rest) = body.strip_prefix("{\n") {
+            let pad = "    ".repeat(self.indent + 1);
+            let mut s = String::from("{\n");
+            for l in &prelude {
+                s.push_str(&pad);
+                s.push_str(l);
+                s.push('\n');
+            }
+            s.push_str(rest);
+            s
+        } else {
+            let inner = body
+                .strip_prefix("{ ")
+                .and_then(|b| b.strip_suffix(" }"))
+                .unwrap_or(&body);
+            format!("{{ {} {inner} }}", prelude.join(" "))
         };
         let m = if info.escapes { "move " } else { "" };
         let code = format!("{m}|{}| {body}", params.join(", "));

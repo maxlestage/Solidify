@@ -58,6 +58,7 @@ impl<'m> Infer<'m> {
                 calls: Vec::new(),
                 uses_this: false,
                 exported: false,
+                rest: false,
                 span: Span::default(),
             },
         );
@@ -477,6 +478,17 @@ impl<'m> Infer<'m> {
                 }
             }
         }
+        // A property's getter and setter see one type.
+        for g in methods.iter().filter(|m| m.kind == MethodKind::Get) {
+            if let Some(s) = methods
+                .iter()
+                .find(|m| m.kind == MethodKind::Set && m.name == g.name)
+                && let Some(st) = self.funcs[&s.fn_id].sig.params.first().cloned()
+            {
+                let gt = self.funcs[&g.fn_id].sig.ret.clone();
+                self.unify(&gt, &st, c.span)?;
+            }
+        }
         for field in declared {
             // A field declared again in a subclass keeps its place.
             match fields.iter().position(|g: &FieldInfo| g.name == field.name) {
@@ -548,9 +560,13 @@ impl<'m> Infer<'m> {
         let mut params = Vec::new();
         let mut optional = Vec::new();
         let mut defaults = Vec::new();
+        let mut rest = false;
         for (i, p) in f.params.iter().enumerate() {
             if p.rest {
-                return self.err("rest parameters are not supported: pass an array", p.span);
+                if i + 1 != f.params.len() {
+                    return self.err("a rest parameter comes last", p.span);
+                }
+                rest = true;
             }
             let name_hint = match &p.pat {
                 Pattern::Ident { name, .. } => name.clone(),
@@ -558,8 +574,12 @@ impl<'m> Infer<'m> {
             };
             let mut ty = match &p.ty {
                 Some(t) => self.ann(t, &name_hint)?,
+                None if p.rest => Ty::Array(Box::new(self.types.fresh())),
                 None => self.types.fresh(),
             };
+            if p.rest && !matches!(self.types.resolve(&ty), Ty::Array(_)) {
+                return self.err("a rest parameter is an array: `...xs: T[]`", p.span);
+            }
             if p.optional {
                 ty = match self.types.resolve(&ty) {
                     Ty::Option(t) => Ty::Option(t),
@@ -603,6 +623,7 @@ impl<'m> Infer<'m> {
             method_kind,
             is_static,
             is_abstract: false,
+            rest,
             mutates_self: false,
             captures: Vec::new(),
             escapes: false,

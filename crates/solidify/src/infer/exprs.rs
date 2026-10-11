@@ -800,19 +800,31 @@ impl<'m> Infer<'m> {
             }
             return Ok(Ty::Map(Box::new(k), Box::new(v), record));
         }
-        let spread_struct = match props.iter().find_map(|p| match &p.value {
-            PropValue::Spread(s) => Some(s),
-            _ => None,
-        }) {
-            Some(s) if expected.is_none() => {
+        // Spreads of one same shape: the literal is of that shape too (when its own keys
+        // fit); spreads of different shapes make a new one.
+        let mut spread_struct: Option<String> = None;
+        if expected.is_none() {
+            for p in props {
+                let PropValue::Spread(s) = &p.value else {
+                    continue;
+                };
                 let st = self.expr(s, None)?;
-                match self.types.resolve(&st) {
-                    Ty::Named(n) if self.struct_by_name(&n).is_some() => Some(n),
-                    _ => None,
+                let name = match self.types.resolve(&st) {
+                    Ty::Named(n) if self.struct_by_name(&n).is_some() => n,
+                    _ => {
+                        spread_struct = None;
+                        break;
+                    }
+                };
+                match &spread_struct {
+                    Some(prev) if *prev != name => {
+                        spread_struct = None;
+                        break;
+                    }
+                    _ => spread_struct = Some(name),
                 }
             }
-            _ => None,
-        };
+        }
         let struct_name = match (expected, spread_struct) {
             (Some(Ty::Named(n)), _) if self.struct_by_name(n).is_some() => n.clone(),
             (Some(Ty::Named(n)), _) if self.union_by_name(n).is_some() => {
@@ -824,7 +836,7 @@ impl<'m> Infer<'m> {
                     }
                 }
             }
-            (_, Some(n)) => n,
+            (_, Some(n)) if self.props_fit(&n, props) => n,
             _ => return self.anonymous_object(e, props),
         };
         self.literal_struct.insert(e.id, struct_name.clone());
@@ -834,12 +846,31 @@ impl<'m> Infer<'m> {
             .fields
             .clone();
         let mut seen = HashSet::new();
-        let mut spread = false;
+        // A spread of this very shape gives every field; one of another shape gives the
+        // fields the shapes share.
+        let mut same_spread = false;
+        let mut covered: HashSet<String> = HashSet::new();
         for p in props {
             if let PropValue::Spread(s) = &p.value {
-                let st = self.expr(s, Some(&Ty::Named(struct_name.clone())))?;
-                self.expect(&st, &Ty::Named(struct_name.clone()), s.span)?;
-                spread = true;
+                let st = self.expr(s, None)?;
+                match self.types.resolve(&st) {
+                    Ty::Named(n) if n == struct_name => same_spread = true,
+                    Ty::Named(n) if self.struct_by_name(&n).is_some() => {
+                        let src = self.struct_by_name(&n).expect("struct").fields.clone();
+                        for sf in &src {
+                            if let Some(tf) = fields.iter().find(|f| f.name == sf.name) {
+                                let a = field_ty(sf);
+                                let b = field_ty(tf);
+                                self.expect(&a, &b, s.span)?;
+                                covered.insert(sf.name.clone());
+                            }
+                        }
+                    }
+                    other => {
+                        let d = self.describe(&other);
+                        return self.err(format!("cannot spread {d} into an object"), s.span);
+                    }
+                }
                 continue;
             }
             let Some(key) = p.key.name() else {
@@ -868,9 +899,9 @@ impl<'m> Infer<'m> {
             }
             seen.insert(key);
         }
-        if !spread {
+        if !same_spread {
             for f in &fields {
-                if !f.optional && !seen.contains(&f.name) {
+                if !f.optional && !seen.contains(&f.name) && !covered.contains(&f.name) {
                     return self.err(
                         format!("property `{}` of {struct_name} is missing", f.name),
                         e.span,
@@ -879,6 +910,17 @@ impl<'m> Infer<'m> {
             }
         }
         Ok(Ty::Named(struct_name))
+    }
+
+    /// Whether every key of a literal is a field of `struct_name` (spreads aside).
+    fn props_fit(&self, struct_name: &str, props: &[Prop]) -> bool {
+        let Some(s) = self.struct_by_name(struct_name) else {
+            return false;
+        };
+        props.iter().all(|p| {
+            matches!(p.value, PropValue::Spread(_))
+                || p.key.name().is_some_and(|k| s.field(&k).is_some())
+        })
     }
 
     /// `{ x }`: the variable named like the key.
@@ -904,6 +946,32 @@ impl<'m> Infer<'m> {
             let Some(key) = p.key.name() else {
                 return self.err("computed keys need a `Record` or `Map` type", p.span);
             };
+            // `{ ...base, z }`: the fields of `base`, then the literal's own.
+            if let PropValue::Spread(s) = &p.value {
+                let st = self.expr(s, None)?;
+                let src = match self.types.resolve(&st) {
+                    Ty::Named(n) => self.struct_by_name(&n).map(|s| s.fields.clone()),
+                    _ => None,
+                };
+                let Some(src) = src else {
+                    let d = self.describe(&st);
+                    return self.err(format!("cannot spread {d} into an object"), s.span);
+                };
+                for sf in src {
+                    let field = FieldInfo {
+                        span: p.span,
+                        access: None,
+                        readonly: false,
+                        has_init: false,
+                        ..sf
+                    };
+                    match fields.iter().position(|f: &FieldInfo| f.name == field.name) {
+                        Some(i) => fields[i] = field,
+                        None => fields.push(field),
+                    }
+                }
+                continue;
+            }
             let fty = match &p.value {
                 PropValue::Expr(v) => {
                     self.hints.insert(v.id, format!("{hint} {key}"));
@@ -912,9 +980,7 @@ impl<'m> Infer<'m> {
                     t
                 }
                 PropValue::Shorthand(id) => self.shorthand(&key, *id, p.span)?,
-                PropValue::Spread(_) => {
-                    return self.err("spread needs a known struct type", p.span);
-                }
+                PropValue::Spread(_) => unreachable!(),
                 _ => return self.err("object methods are not supported: use a class", p.span),
             };
             let fty = match self.types.resolve(&fty) {
@@ -926,7 +992,7 @@ impl<'m> Infer<'m> {
                 }
                 _ => fty,
             };
-            fields.push(FieldInfo {
+            let field = FieldInfo {
                 name: key,
                 ty: fty,
                 optional: false,
@@ -935,7 +1001,12 @@ impl<'m> Infer<'m> {
                 has_init: false,
                 literal: None,
                 span: p.span,
-            });
+            };
+            // A key given again (after a spread) keeps its place, with the new type.
+            match fields.iter().position(|f: &FieldInfo| f.name == field.name) {
+                Some(i) => fields[i] = field,
+                None => fields.push(field),
+            }
         }
         // The same shape seen before: reuse it.
         if let Some(existing) = self.same_shape(&fields) {
@@ -1440,24 +1511,34 @@ impl<'m> Infer<'m> {
         fn_id: NodeId,
         span: Span,
     ) -> IResult<()> {
+        // `...rest`: the last parameter takes every extra argument.
+        let rest_at = if info.rest {
+            Some(info.sig.params.len() - 1)
+        } else {
+            None
+        };
+        let fixed = rest_at.unwrap_or(info.sig.params.len());
         let required = info
             .optional
             .iter()
             .zip(&info.defaults)
+            .take(fixed)
             .filter(|(o, d)| !**o && !**d)
             .count();
-        if args.len() < required || args.len() > info.sig.params.len() {
+        if args.len() < required || (rest_at.is_none() && args.len() > info.sig.params.len()) {
             let name = info.name.clone().unwrap_or_else(|| "the function".into());
             let n = info.sig.params.len();
             return self.err(
                 format!(
                     "`{name}` takes {} argument{}, {} given",
-                    if required == n {
+                    if rest_at.is_some() {
+                        format!("at least {required}")
+                    } else if required == n {
                         required.to_string()
                     } else {
                         format!("{required} to {n}")
                     },
-                    if n == 1 { "" } else { "s" },
+                    if n == 1 && rest_at.is_none() { "" } else { "s" },
                     args.len()
                 ),
                 span,
@@ -1469,6 +1550,32 @@ impl<'m> Infer<'m> {
             subst.insert(tp.clone(), self.types.fresh());
         }
         for (i, a) in args.iter().enumerate() {
+            if let Some(r) = rest_at
+                && i >= r
+            {
+                let mut pt = info.sig.params[r].clone();
+                if !subst.is_empty() {
+                    pt = substitute(&pt, &subst, &self.types);
+                }
+                let Ty::Array(item) = self.types.resolve(&pt) else {
+                    return self.err("the rest parameter is not an array", a.expr.span);
+                };
+                if a.spread {
+                    if i != r || args.len() != r + 1 {
+                        return self.err(
+                            "a spread is the only argument a rest parameter can take: `f(a, ...xs)` mixes them",
+                            a.expr.span,
+                        );
+                    }
+                    let at = self.expr(&a.expr, Some(&pt))?;
+                    self.expect(&at, &pt, a.expr.span)?;
+                } else {
+                    let at = self.expr(&a.expr, Some(&item))?;
+                    self.expect(&at, &item, a.expr.span)?;
+                    self.mark_stored(&a.expr);
+                }
+                continue;
+            }
             if a.spread {
                 return self.err("spread arguments are not supported here", a.expr.span);
             }
@@ -1654,6 +1761,18 @@ impl<'m> Infer<'m> {
 
     /// `parseInt(…)`, `String(…)`…
     fn global_call(&mut self, e: &'m Expr, name: &str, args: &'m [Arg], span: Span) -> IResult<Ty> {
+        // `Array(n)` is `new Array(n)`.
+        if name == "Array" {
+            self.no_more_than(args, 1, name, span)?;
+            let t = self.types.fresh();
+            if let Some(a) = args.first() {
+                let n = self.types.int();
+                let at = self.expr(&a.expr, Some(&n))?;
+                self.expect(&at, &n, a.expr.span)?;
+            }
+            self.calls.insert(e.id, Callee::Builtin("new Array"));
+            return Ok(Ty::Array(Box::new(t)));
+        }
         let ty = match name {
             "parseInt" => self.parse_int_call(args, name, span)?,
             "parseFloat" => {
@@ -2084,5 +2203,14 @@ fn singular(hint: &str) -> String {
         stem.to_string()
     } else {
         hint.to_string()
+    }
+}
+
+/// The type of a field as a value: optional fields are `Option`.
+fn field_ty(f: &FieldInfo) -> Ty {
+    if f.optional {
+        Ty::Option(Box::new(f.ty.clone()))
+    } else {
+        f.ty.clone()
     }
 }

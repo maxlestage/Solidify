@@ -110,7 +110,7 @@ static EN: Dict = Dict {
         cta2: "Install the CLI",
         facts: [
             ("0", "dependencies"),
-            ("26", "programs checked against Node.js"),
+            ("27", "programs checked against Node.js"),
             ("1", "Rust file out, however many files in"),
         ],
     },
@@ -242,6 +242,10 @@ static EN: Dict = Dict {
                 "the exact text Node.js prints",
             ),
             ("any, unknown", "inferred from use"),
+            (
+                "...rest, f(...xs), { ...base, z }, [a, ...rest], ({ x, y }) =>",
+                "slices, vec!, struct literals field by field, xs[1..].to_vec()",
+            ),
         ],
         limits_title: "What stays different",
         limits: "Rust values are not JavaScript references: an object stored in two places is copied, and changing one copy leaves the other alone (variables changed inside closures that outlive them are shared). Numbers are `i64` until a float is involved, so an integer that overflows panics where JavaScript would lose precision. Imports go between your own files only, not to packages. `JSON` replacers and revivers, `Symbol`, `Proxy`, `eval`, prototypes and `arguments` have no Rust counterpart and are refused with a clear message.",
@@ -283,7 +287,7 @@ static FR: Dict = Dict {
         cta2: "Installer la ligne de commande",
         facts: [
             ("0", "dépendance"),
-            ("26", "programmes vérifiés contre Node.js"),
+            ("27", "programmes vérifiés contre Node.js"),
             (
                 "1",
                 "fichier Rust en sortie, autant de fichiers en entrée que voulu",
@@ -418,6 +422,10 @@ static FR: Dict = Dict {
                 "le texte exact qu'imprime Node.js",
             ),
             ("any, unknown", "déduits de l'usage"),
+            (
+                "...rest, f(...xs), { ...base, z }, [a, ...rest], ({ x, y }) =>",
+                "slices, vec!, littéraux de struct champ par champ, xs[1..].to_vec()",
+            ),
         ],
         limits_title: "Ce qui reste différent",
         limits: "Les valeurs Rust ne sont pas des références JavaScript : un objet rangé à deux endroits est copié, et modifier une copie ne touche pas l'autre (les variables modifiées dans des closures qui leur survivent sont partagées). Les nombres sont des `i64` tant qu'un flottant n'intervient pas : un entier qui déborde fait paniquer là où JavaScript perdrait de la précision. Les imports vont entre vos propres fichiers, pas vers des paquets. Les replacers et revivers de `JSON`, `Symbol`, `Proxy`, `eval`, les prototypes et `arguments` n'ont pas d'équivalent Rust et sont refusés avec un message clair.",
