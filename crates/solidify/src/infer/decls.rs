@@ -1,0 +1,527 @@
+//! Declarations: interfaces, type aliases, enums, classes and function signatures are
+//! registered before any body is looked at, so that they can be used in any order.
+
+use std::rc::Rc;
+
+use super::{
+    EnumInfo, EnumKind, EnumValue, FieldInfo, FnCtx, FnInfo, IResult, Infer, MethodInfo, Role,
+    StructInfo, StructKind, Variant,
+};
+use crate::ast::*;
+use crate::error::Span;
+use crate::infer::pascal;
+use crate::types::{FuncTy, Ty};
+
+impl<'m> Infer<'m> {
+    pub(super) fn run(&mut self, module: &'m Module) -> IResult<()> {
+        // The top level is a function: `main`.
+        self.fns.push(FnCtx {
+            id: self.main_id,
+            ret: Ty::Void,
+            this: None,
+            in_ctor: false,
+            is_static: false,
+            try_depth: 0,
+            loop_depth: 0,
+            type_params: Vec::new(),
+            captures: Vec::new(),
+            this_fn: self.main_id,
+            has_return_value: false,
+        });
+        self.funcs.insert(
+            self.main_id,
+            FnInfo {
+                id: self.main_id,
+                name: Some("main".into()),
+                params: Vec::new(),
+                optional: Vec::new(),
+                defaults: Vec::new(),
+                sig: FuncTy {
+                    params: Vec::new(),
+                    ret: Ty::Void,
+                },
+                type_params: Vec::new(),
+                throws: false,
+                throw_direct: false,
+                is_async: false,
+                is_arrow: false,
+                method_of: None,
+                method_kind: None,
+                is_static: false,
+                mutates_self: false,
+                captures: Vec::new(),
+                escapes: false,
+                is_closure: false,
+                parent: None,
+                calls: Vec::new(),
+                uses_this: false,
+                exported: false,
+                span: Span::default(),
+            },
+        );
+        self.collect_types(&module.body)?;
+        self.collect_values(&module.body, true)?;
+        for s in &module.body {
+            self.stmt(s)?;
+            if !matches!(
+                s.kind,
+                StmtKind::Func(_)
+                    | StmtKind::Class(_)
+                    | StmtKind::Interface(_)
+                    | StmtKind::TypeAlias(_)
+                    | StmtKind::Enum(_)
+                    | StmtKind::Empty
+                    | StmtKind::Import(_)
+                    | StmtKind::ExportNames(_)
+            ) {
+                self.has_main = true;
+            }
+        }
+        let ctx = self.fns.pop().expect("main");
+        let info = self.funcs.get_mut(&self.main_id).expect("main");
+        info.captures = ctx.captures;
+        Ok(())
+    }
+
+    /// Registers interfaces, type aliases, enums and classes (any order).
+    pub(super) fn collect_types(&mut self, stmts: &'m [Stmt]) -> IResult<()> {
+        // Names first, so that types can refer to each other.
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Interface(i) => {
+                    self.check_type_name(&i.name, i.span)?;
+                    self.structs.push(StructInfo {
+                        name: i.name.clone(),
+                        kind: StructKind::Interface,
+                        fields: Vec::new(),
+                        methods: Vec::new(),
+                        ctor: None,
+                        exported: i.exported,
+                        span: i.span,
+                        statics: Vec::new(),
+                    });
+                }
+                StmtKind::Class(c) => {
+                    self.check_type_name(&c.name, c.span)?;
+                    self.structs.push(StructInfo {
+                        name: c.name.clone(),
+                        kind: StructKind::Class,
+                        fields: Vec::new(),
+                        methods: Vec::new(),
+                        ctor: None,
+                        exported: c.exported,
+                        span: c.span,
+                        statics: Vec::new(),
+                    });
+                }
+                StmtKind::Enum(e) => {
+                    self.check_type_name(&e.name, e.span)?;
+                    self.define_enum(e)?;
+                }
+                StmtKind::TypeAlias(a) => {
+                    self.check_type_name(&a.name, a.span)?;
+                    if !a.type_params.is_empty() {
+                        return self.err("generic type aliases are not supported", a.span);
+                    }
+                    match &a.ty {
+                        TypeAnn::Object(_, _) => self.structs.push(StructInfo {
+                            name: a.name.clone(),
+                            kind: StructKind::Interface,
+                            fields: Vec::new(),
+                            methods: Vec::new(),
+                            ctor: None,
+                            exported: a.exported,
+                            span: a.span,
+                            statics: Vec::new(),
+                        }),
+                        TypeAnn::Union(members, span)
+                            if members.len() > 1
+                                && members
+                                    .iter()
+                                    .all(|m| matches!(m, TypeAnn::Lit(Lit::Str(_), _))) =>
+                        {
+                            let literals: Vec<String> = members
+                                .iter()
+                                .map(|m| match m {
+                                    TypeAnn::Lit(Lit::Str(s), _) => s.clone(),
+                                    _ => unreachable!(),
+                                })
+                                .collect();
+                            self.define_literal_enum(&a.name, &literals, a.exported, *span);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Other aliases, which may name the types above.
+        for s in stmts {
+            if let StmtKind::TypeAlias(a) = &s.kind
+                && !self.type_exists(&a.name)
+            {
+                let ty = self.ann(&a.ty, &a.name)?;
+                self.aliases.insert(a.name.clone(), ty);
+            }
+        }
+        // Fields and signatures.
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Interface(i) => {
+                    if !i.type_params.is_empty() {
+                        return self.err("generic interfaces are not supported", i.span);
+                    }
+                    let mut fields = Vec::new();
+                    for base in &i.extends {
+                        let TypeAnn::Named { name, .. } = base else {
+                            return self.err(
+                                "an interface can only extend a named interface",
+                                base.span(),
+                            );
+                        };
+                        let Some(parent) = self.struct_by_name(name) else {
+                            return self.err(format!("unknown interface `{name}`"), base.span());
+                        };
+                        if parent.kind == StructKind::Class {
+                            return self.err("an interface cannot extend a class", base.span());
+                        }
+                        fields.extend(parent.fields.iter().cloned());
+                    }
+                    fields.extend(self.fields_from_members(&i.name, &i.members)?);
+                    self.struct_mut(&i.name).expect("interface").fields = fields;
+                }
+                StmtKind::TypeAlias(a) => {
+                    if let TypeAnn::Object(members, _) = &a.ty {
+                        let fields = self.fields_from_members(&a.name, members)?;
+                        self.struct_mut(&a.name).expect("alias").fields = fields;
+                    }
+                }
+                StmtKind::Class(c) => self.collect_class(c)?,
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn check_type_name(&self, name: &str, span: Span) -> IResult<()> {
+        if self.type_exists(name) {
+            return self.err(format!("`{name}` is declared twice"), span);
+        }
+        Ok(())
+    }
+
+    fn define_enum(&mut self, e: &EnumDecl) -> IResult<()> {
+        let mut variants = Vec::new();
+        let mut next = 0.0;
+        let mut kind = EnumKind::Numeric;
+        for m in &e.members {
+            let value = match &m.init {
+                None => {
+                    let v = next;
+                    next += 1.0;
+                    EnumValue::Num(v)
+                }
+                Some(Expr {
+                    kind: ExprKind::Num { value, .. },
+                    ..
+                }) => {
+                    next = value + 1.0;
+                    EnumValue::Num(*value)
+                }
+                Some(Expr {
+                    kind:
+                        ExprKind::Unary {
+                            op: UnaryOp::Neg,
+                            arg,
+                        },
+                    ..
+                }) if matches!(arg.kind, ExprKind::Num { .. }) => {
+                    let ExprKind::Num { value, .. } = &arg.kind else {
+                        unreachable!()
+                    };
+                    next = -value + 1.0;
+                    EnumValue::Num(-value)
+                }
+                Some(Expr {
+                    kind: ExprKind::Str(s),
+                    ..
+                }) => {
+                    kind = EnumKind::Strings;
+                    EnumValue::Str(s.clone())
+                }
+                Some(other) => {
+                    return self.err("enum members must be numbers or strings", other.span);
+                }
+            };
+            variants.push(Variant {
+                name: pascal(&m.name),
+                source: m.name.clone(),
+                value: Some(value),
+            });
+        }
+        self.enums.push(EnumInfo {
+            name: e.name.clone(),
+            variants,
+            kind,
+            exported: e.exported,
+            span: e.span,
+        });
+        Ok(())
+    }
+
+    /// Fields, methods and the constructor of a class (signatures only).
+    fn collect_class(&mut self, c: &'m Class) -> IResult<()> {
+        if c.extends.is_some() {
+            return self.err(
+                "`extends` is not supported: Rust has no inheritance, prefer a field holding the base (composition)",
+                c.span,
+            );
+        }
+        if !c.type_params.is_empty() {
+            return self.err("generic classes are not supported", c.span);
+        }
+        if c.name.is_empty() {
+            return self.err("classes need a name", c.span);
+        }
+        self.this_class_stack.push(c.name.clone());
+        let mut fields = Vec::new();
+        let mut methods = Vec::new();
+        let mut statics = Vec::new();
+        let mut ctor = None;
+        for m in &c.members {
+            match m {
+                ClassMember::Field(f) => {
+                    let ty = match &f.ty {
+                        Some(t) => self.ann(t, &format!("{} {}", c.name, f.name))?,
+                        None => self.types.fresh(),
+                    };
+                    let (ty, optional) = match (self.types.resolve(&ty), f.optional) {
+                        (Ty::Option(inner), true) => (*inner, true),
+                        (_, o) => (ty, o),
+                    };
+                    if f.is_static {
+                        statics.push((f.name.clone(), ty, None));
+                        continue;
+                    }
+                    fields.push(FieldInfo {
+                        name: f.name.clone(),
+                        ty,
+                        optional,
+                        access: f.access,
+                        readonly: f.readonly,
+                        has_init: f.init.is_some(),
+                        span: f.span,
+                    });
+                }
+                ClassMember::Method(m) => {
+                    if m.kind == MethodKind::Constructor {
+                        // Parameter properties become fields.
+                        for p in &m.func.params {
+                            if p.access.is_some() || p.readonly {
+                                let Pattern::Ident { name, span, .. } = &p.pat else {
+                                    return self
+                                        .err("parameter properties must be plain names", p.span);
+                                };
+                                let ty = match &p.ty {
+                                    Some(t) => self.ann(t, &format!("{} {name}", c.name))?,
+                                    None => self.types.fresh(),
+                                };
+                                let (ty, optional) = match (self.types.resolve(&ty), p.optional) {
+                                    (Ty::Option(inner), true) => (*inner, true),
+                                    (_, o) => (ty, o),
+                                };
+                                fields.push(FieldInfo {
+                                    name: name.clone(),
+                                    ty,
+                                    optional,
+                                    access: p.access,
+                                    readonly: p.readonly,
+                                    has_init: true,
+                                    span: *span,
+                                });
+                            }
+                        }
+                        ctor = Some(m.func.id);
+                    }
+                    let info = self.signature(&m.func, Some(&c.name), Some(m.kind), m.is_static)?;
+                    self.funcs.insert(m.func.id, info);
+                    if m.kind != MethodKind::Constructor {
+                        methods.push(MethodInfo {
+                            name: m.name.clone(),
+                            fn_id: m.func.id,
+                            kind: m.kind,
+                            is_static: m.is_static,
+                        });
+                    }
+                }
+                ClassMember::StaticBlock(b) => {
+                    return self.err("static blocks are not supported", b.span);
+                }
+            }
+        }
+        self.this_class_stack.pop();
+        let s = self.struct_mut(&c.name).expect("class");
+        s.fields = fields;
+        s.methods = methods;
+        s.ctor = ctor;
+        s.statics = statics;
+        Ok(())
+    }
+
+    /// The signature of a function, with fresh variables where annotations are missing.
+    pub(super) fn signature(
+        &mut self,
+        f: &'m Function,
+        method_of: Option<&str>,
+        method_kind: Option<MethodKind>,
+        is_static: bool,
+    ) -> IResult<FnInfo> {
+        if f.is_generator {
+            return self.err("generators are not supported", f.span);
+        }
+        let type_params: Vec<String> = f.type_params.iter().map(|t| t.name.clone()).collect();
+        // Type parameters are visible while reading the annotations.
+        self.fns.push(FnCtx {
+            id: f.id,
+            ret: Ty::Void,
+            this: None,
+            in_ctor: false,
+            is_static,
+            try_depth: 0,
+            loop_depth: 0,
+            type_params: type_params.clone(),
+            captures: Vec::new(),
+            this_fn: f.id,
+            has_return_value: false,
+        });
+        let result = self.signature_inner(f, method_of, method_kind, is_static, type_params);
+        self.fns.pop();
+        result
+    }
+
+    fn signature_inner(
+        &mut self,
+        f: &'m Function,
+        method_of: Option<&str>,
+        method_kind: Option<MethodKind>,
+        is_static: bool,
+        type_params: Vec<String>,
+    ) -> IResult<FnInfo> {
+        let hint = f.name.clone().unwrap_or_default();
+        let mut params = Vec::new();
+        let mut optional = Vec::new();
+        let mut defaults = Vec::new();
+        for (i, p) in f.params.iter().enumerate() {
+            if p.rest {
+                return self.err("rest parameters are not supported: pass an array", p.span);
+            }
+            let name_hint = match &p.pat {
+                Pattern::Ident { name, .. } => name.clone(),
+                _ => format!("{hint} arg{i}"),
+            };
+            let mut ty = match &p.ty {
+                Some(t) => self.ann(t, &name_hint)?,
+                None => self.types.fresh(),
+            };
+            if p.optional {
+                ty = match self.types.resolve(&ty) {
+                    Ty::Option(t) => Ty::Option(t),
+                    t => Ty::Option(Box::new(t)),
+                };
+            }
+            params.push(ty);
+            optional.push(p.optional);
+            defaults.push(p.default.is_some());
+        }
+        let ret = match &f.ret {
+            Some(t) => self.ann(t, &hint)?,
+            None => {
+                if matches!(method_kind, Some(MethodKind::Constructor | MethodKind::Set)) {
+                    Ty::Void
+                } else {
+                    self.types.fresh()
+                }
+            }
+        };
+        Ok(FnInfo {
+            id: f.id,
+            name: f.name.clone(),
+            params: Vec::new(),
+            optional,
+            defaults,
+            sig: FuncTy { params, ret },
+            type_params,
+            throws: false,
+            throw_direct: false,
+            is_async: f.is_async,
+            is_arrow: f.is_arrow,
+            method_of: method_of.map(str::to_string),
+            method_kind,
+            is_static,
+            mutates_self: false,
+            captures: Vec::new(),
+            escapes: false,
+            is_closure: false,
+            parent: None,
+            calls: Vec::new(),
+            uses_this: false,
+            exported: f.exported,
+            span: f.span,
+        })
+    }
+
+    /// Declares the functions of a block, so that they can be called before their
+    /// declaration, and the top-level variables, so that functions declared earlier see
+    /// them.
+    pub(super) fn collect_values(&mut self, stmts: &'m [Stmt], top: bool) -> IResult<()> {
+        for s in stmts {
+            match &s.kind {
+                StmtKind::Func(f) if f.id != usize::MAX => {
+                    let name = f.name.clone().expect("declared function");
+                    let info = self.signature(f, None, None, false)?;
+                    let ty = Ty::Func(Rc::new(info.sig.clone()));
+                    self.funcs.insert(f.id, info);
+                    let id = self.synth_id();
+                    self.declare(&name, id, ty, Role::Func, f.span);
+                    self.fn_bindings.insert(id, f.id);
+                }
+                StmtKind::Class(c) => {
+                    let id = self.synth_id();
+                    self.declare(&c.name, id, Ty::Named(c.name.clone()), Role::Class, c.span);
+                }
+                StmtKind::Enum(e) => {
+                    let id = self.synth_id();
+                    self.declare(&e.name, id, Ty::Named(e.name.clone()), Role::Enum, e.span);
+                }
+                StmtKind::Var(v) if top => {
+                    for d in &v.decls {
+                        if !matches!(d.pat, Pattern::Ident { .. }) {
+                            // Destructured at the top level: bound when reached.
+                            continue;
+                        }
+                        let hint = match &d.pat {
+                            Pattern::Ident { name, .. } => name.clone(),
+                            _ => String::new(),
+                        };
+                        let ty = match &d.ty {
+                            Some(t) => self.ann(t, &hint)?,
+                            None => self.types.fresh(),
+                        };
+                        self.bind_pattern(&d.pat, &ty, Role::TopLevel)?;
+                        if let (Pattern::Ident { id, .. }, Some(init)) = (&d.pat, &d.init) {
+                            let literal = matches!(
+                                init.kind,
+                                ExprKind::Num { .. } | ExprKind::Str(_) | ExprKind::Bool(_)
+                            ) || matches!(&init.kind, ExprKind::Unary { op: UnaryOp::Neg, arg } if matches!(arg.kind, ExprKind::Num { .. }));
+                            if v.kind == VarKind::Const && literal {
+                                self.vars.get_mut(id).expect("var").const_literal = true;
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}

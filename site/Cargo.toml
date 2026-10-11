@@ -1,0 +1,25 @@
+[package]
+name = "solidify-site"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Presentation site of Solidify, written with active: the transpiler runs in the browser as WebAssembly."
+
+# The library holds the pages and islands (shared by the server and the browser) and,
+# compiled to WebAssembly, the browser bundle. The binary is the web server and the exporter.
+[lib]
+name = "solidify_site"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "solidify-site"
+path = "src/main.rs"
+
+[dependencies]
+solidify = { path = "../crates/solidify" }
+active = { git = "https://github.com/maxlestage/Active", branch = "master" }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+active = { git = "https://github.com/maxlestage/Active", branch = "master", features = ["client"] }
+wasm-bindgen = "=0.2.129"
+web-sys = { version = "0.3", features = ["Window", "Navigator", "Clipboard", "Performance", "HtmlTextAreaElement", "HtmlElement", "Element", "Document"] }
