@@ -122,16 +122,12 @@ fn logo() -> Element {
                 .attr("width", "14")
                 .attr("height", "14")
                 .attr("rx", "3")
-                .attr("fill", "#ff5a1f"),
+                .attr("fill", "#ffd23f"),
         )
 }
 
 fn header(lang: Lang) -> Element {
     let d = t(lang);
-    let other = match lang {
-        Lang::En => Lang::Fr,
-        Lang::Fr => Lang::En,
-    };
     let nav_link = |href: &'static str, label: &'static str| a().href(href).text(label);
     el("header")
         .class("top")
@@ -149,14 +145,28 @@ fn header(lang: Lang) -> Element {
                 .child(nav_link("#supported", d.nav.supported))
                 .child(nav_link("#install", d.nav.install))
                 .child(a().href(GITHUB).attr("rel", "external").text(d.nav.github))
-                .child(
-                    a().class("lang")
-                        .href(link(other.path()))
-                        .attr("hreflang", other.code())
-                        .attr("lang", other.code())
-                        .text(d.other_lang),
-                ),
+                .child(lang_switch(lang)),
         )
+}
+
+/// The other languages, by their code (`FR`, `ES`), named in full for screen readers.
+fn lang_switch(lang: Lang) -> Element {
+    let mut list = span().class("langs");
+    for other in Lang::ALL {
+        if other == lang {
+            continue;
+        }
+        list = list.child(
+            a().class("lang")
+                .href(link(other.path()))
+                .attr("hreflang", other.code())
+                .attr("lang", other.code())
+                .attr("title", t(other).lang_name)
+                .attr("aria-label", t(other).lang_name)
+                .text(other.code().to_uppercase()),
+        );
+    }
+    list
 }
 
 fn main_content(lang: Lang) -> Element {
