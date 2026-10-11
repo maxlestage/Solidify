@@ -12,6 +12,13 @@ enum Pet {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+enum Token {
+    Num(Num),
+    Op(Op),
+    End(End),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 enum StringOrNumber {
     String(String),
     Number(i64),
@@ -49,6 +56,18 @@ enum CircleOrSquare {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+enum OpOrEnd {
+    Op(Op),
+    End(End),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum StringOrBoolean {
+    String(String),
+    Boolean(bool),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 struct Cat {
     pub name: String,
     pub lives: i64,
@@ -58,6 +77,41 @@ struct Cat {
 struct Robot {
     pub name: String,
     pub battery: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Lexer {
+    pub tokens: Vec<Token>,
+    pub current: Option<Token>,
+}
+
+impl Lexer {
+    pub fn push(&mut self, t: Token) {
+        self.tokens.push(t.clone());
+        self.current = Some(t);
+    }
+
+    pub fn describe(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for t in &self.tokens {
+            match t {
+                Token::Num(t) => {
+                    parts.push(format!("num({})", t.value));
+                }
+                Token::Op(t) => {
+                    parts.push(format!("op({})", t.symbol));
+                }
+                Token::End(t) => {
+                    parts.push("end".to_string());
+                }
+            }
+        }
+        parts.join(" ")
+    }
+
+    pub fn new() -> Self {
+        Self { tokens: Vec::new(), current: None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +131,23 @@ pub struct Rect {
     pub kind: String,
     pub width: f64,
     pub height: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Num {
+    pub r#type: String,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Op {
+    pub r#type: String,
+    pub symbol: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct End {
+    pub r#type: String,
 }
 
 fn area(shape: &Shape) -> f64 {
@@ -140,6 +211,35 @@ fn label(id: &NumberOrStringOrBoolean) -> String {
     (*id + 1).to_string()
 }
 
+fn number_of(t: &Token) -> i64 {
+    let t = match t {
+        Token::Num(t) => t,
+        _ => {
+            return 0;
+        }
+    };
+    t.value
+}
+
+fn show(x: Option<&NumberOrStringOrBoolean>) -> String {
+    let Some(x) = x else {
+        return "null".to_string();
+    };
+    let x = match x {
+        NumberOrStringOrBoolean::Number(x) => {
+            return format!("n:{x}");
+        }
+        other => match other { NumberOrStringOrBoolean::String(v) => StringOrBoolean::String(v.clone()), NumberOrStringOrBoolean::Boolean(v) => StringOrBoolean::Boolean(*v), _ => unreachable!() },
+    };
+    let x = match &x {
+        StringOrBoolean::String(x) => {
+            return format!("s:{x}");
+        }
+        StringOrBoolean::Boolean(x) => x,
+    };
+    format!("b:{x}")
+}
+
 fn main() {
     let shapes = vec![Shape::Circle(Circle { kind: "circle".to_string(), radius: 1.0 }), Shape::Square(Square { kind: "square".to_string(), side: 2.0 }), Shape::Rect(Rect { kind: "rect".to_string(), width: 2.0, height: 3.0 })];
     for s in &shapes {
@@ -160,6 +260,15 @@ fn main() {
     let mut value = StringOrNumber::Number(5);
     value = StringOrNumber::String("five".to_string());
     println!("{} {} {}", js_show(&value.js_value()), &value == &StringOrNumber::String("five".to_string()), &value == &StringOrNumber::Number(5));
+    let mut lx = Lexer::new();
+    lx.push(Token::Num(Num { r#type: "num".to_string(), value: 4 }));
+    lx.push(Token::Op(Op { r#type: "op".to_string(), symbol: "+".to_string() }));
+    lx.push(Token::End(End { r#type: "end".to_string() }));
+    println!("{} {} {} {}", lx.describe(), lx.tokens.len(), number_of(&lx.tokens[0]), number_of(&lx.tokens[1]));
+    let found = lx.tokens.iter().find(|t| t.r#type().as_str() == "op").cloned();
+    println!("{} {} {} {} {}", found.as_ref().map_or("null".to_string(), |v| js_inspect(&v.js_value())), show(Some(&NumberOrStringOrBoolean::Number(3))), show(Some(&NumberOrStringOrBoolean::String("x".to_string()))), show(Some(&NumberOrStringOrBoolean::Boolean(false))), show(None));
+    let kinds = lx.tokens.iter().map(|t| t.r#type().clone()).collect::<Vec<_>>();
+    println!("{} {}", js_inspect(&kinds.js_value()), lx.current.as_ref().map_or("null".to_string(), |v| js_inspect(&v.js_value())));
 }
 
 impl Shape {
@@ -168,6 +277,16 @@ impl Shape {
             Shape::Circle(v) => &v.kind,
             Shape::Square(v) => &v.kind,
             Shape::Rect(v) => &v.kind,
+        }
+    }
+}
+
+impl Token {
+    fn r#type(&self) -> &String {
+        match self {
+            Token::Num(v) => &v.r#type,
+            Token::Op(v) => &v.r#type,
+            Token::End(v) => &v.r#type,
         }
     }
 }
@@ -650,6 +769,24 @@ impl JsInspect for Circle {
     }
 }
 
+impl JsInspect for End {
+    fn js_value(&self) -> JsValue {
+        JsValue::Object(None, vec![("type".to_string(), self.r#type.js_value())])
+    }
+}
+
+impl JsInspect for Num {
+    fn js_value(&self) -> JsValue {
+        JsValue::Object(None, vec![("type".to_string(), self.r#type.js_value()), ("value".to_string(), self.value.js_value())])
+    }
+}
+
+impl JsInspect for Op {
+    fn js_value(&self) -> JsValue {
+        JsValue::Object(None, vec![("type".to_string(), self.r#type.js_value()), ("symbol".to_string(), self.symbol.js_value())])
+    }
+}
+
 impl JsInspect for Rect {
     fn js_value(&self) -> JsValue {
         JsValue::Object(None, vec![("kind".to_string(), self.kind.js_value()), ("width".to_string(), self.width.js_value()), ("height".to_string(), self.height.js_value())])
@@ -677,6 +814,16 @@ impl JsInspect for StringOrNumber {
         match self {
             StringOrNumber::String(v) => v.js_value(),
             StringOrNumber::Number(v) => v.js_value(),
+        }
+    }
+}
+
+impl JsInspect for Token {
+    fn js_value(&self) -> JsValue {
+        match self {
+            Token::Num(v) => v.js_value(),
+            Token::Op(v) => v.js_value(),
+            Token::End(v) => v.js_value(),
         }
     }
 }
