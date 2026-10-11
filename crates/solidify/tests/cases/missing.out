@@ -1,0 +1,13 @@
+undefined 3 yes null
+undefined
+2
+undefined null undefined undefined n undefined
+{ name: 'a', next: null, extra: undefined } {
+  name: 'b',
+  note: 'n',
+  next: { name: 'a', next: null, extra: undefined },
+  extra: 2
+}
+[ undefined, 1 ] [ null ]
+undefined undefined null
+[ undefined, undefined ] ,

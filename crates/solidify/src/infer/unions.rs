@@ -58,7 +58,7 @@ impl<'m> Infer<'m> {
             for (a, b) in pairs {
                 let _ = self.types.unify(&a, &b);
             }
-            return Ok(Ty::Named(name));
+            return Ok(Ty::named(name));
         }
         let mut names: Vec<String> = Vec::new();
         for t in &distinct {
@@ -77,7 +77,7 @@ impl<'m> Infer<'m> {
             let tag = discriminant
                 .as_ref()
                 .and_then(|d| match self.types.resolve(&t) {
-                    Ty::Named(n) => self
+                    Ty::Named(n, ..) => self
                         .struct_by_name(&n)
                         .and_then(|s| s.field(d))
                         .and_then(|f| f.literal.clone()),
@@ -97,7 +97,7 @@ impl<'m> Infer<'m> {
             exported: false,
             span,
         });
-        Ok(Ty::Named(name))
+        Ok(Ty::named(name))
     }
 
     /// The variant name for a member type: `String`, `Number`, `Circle`, `StringArray`…
@@ -111,7 +111,7 @@ impl<'m> Infer<'m> {
             Ty::Map(..) => "Map".into(),
             Ty::Set(_) => "Set".into(),
             Ty::Func(_) => "Function".into(),
-            Ty::Named(n) => pascal(&n),
+            Ty::Named(n, ..) => pascal(&n),
             Ty::Option(t) => format!("Optional{}", self.variant_name(&t)),
             _ => "Value".into(),
         }
@@ -121,7 +121,7 @@ impl<'m> Infer<'m> {
     fn find_discriminant(&self, members: &[Ty]) -> Option<String> {
         let mut structs = Vec::new();
         for m in members {
-            let Ty::Named(n) = self.types.resolve(m) else {
+            let Ty::Named(n, ..) = self.types.resolve(m) else {
                 return None;
             };
             structs.push(self.struct_by_name(&n)?);
@@ -160,7 +160,7 @@ impl<'m> Infer<'m> {
             Ty::Option(inner) => self.types.resolve(&inner),
             other => other,
         };
-        let Ty::Named(n) = target else {
+        let Ty::Named(n, ..) = target else {
             return false;
         };
         let Some(u) = self.union_by_name(&n) else {
@@ -170,7 +170,7 @@ impl<'m> Infer<'m> {
             Ty::Option(inner) => self.types.resolve(&inner),
             other => other,
         };
-        if let Ty::Named(f) = &found
+        if let Ty::Named(f, ..) = &found
             && *f == n
         {
             return true;
@@ -197,13 +197,13 @@ impl<'m> Infer<'m> {
                 _ => None,
             })?;
             return union.member_with_tag(&tag).and_then(|m| match &m.ty {
-                Ty::Named(n) => Some(n.clone()),
+                Ty::Named(n, ..) => Some(n.clone()),
                 _ => None,
             });
         }
         let keys: Vec<String> = props.iter().filter_map(|p| p.key.name()).collect();
         for m in &union.members {
-            let Ty::Named(n) = self.types.resolve(&m.ty) else {
+            let Ty::Named(n, ..) = self.types.resolve(&m.ty) else {
                 continue;
             };
             let Some(s) = self.struct_by_name(&n) else {
@@ -321,7 +321,7 @@ impl<'m> Infer<'m> {
         }
         // The tested value must be a union (what a narrowing bound it to, if any).
         let vt = self.expr(value, None)?;
-        let Ty::Named(n) = self.types.resolve(&vt) else {
+        let Ty::Named(n, ..) = self.types.resolve(&vt) else {
             return Ok(None);
         };
         let Some(union) = self.union_by_name(&n).cloned() else {
@@ -341,14 +341,14 @@ impl<'m> Infer<'m> {
             Pick::Class(c) => union
                 .members
                 .iter()
-                .position(|m| matches!(&m.ty, Ty::Named(x) if x == c)),
+                .position(|m| matches!(&m.ty, Ty::Named(x, ..) if x == c)),
             Pick::Field(f) => {
                 let with: Vec<usize> = union
                     .members
                     .iter()
                     .enumerate()
                     .filter(|(_, m)| match &m.ty {
-                        Ty::Named(x) => {
+                        Ty::Named(x, ..) => {
                             self.struct_by_name(x).is_some_and(|s| s.field(f).is_some())
                         }
                         _ => false,
@@ -451,7 +451,7 @@ impl<'m> Infer<'m> {
     pub(super) fn union_field(&self, union: &UnionInfo, prop: &str) -> Option<Ty> {
         let mut found: Option<Ty> = None;
         for m in &union.members {
-            let Ty::Named(n) = self.types.resolve(&m.ty) else {
+            let Ty::Named(n, ..) = self.types.resolve(&m.ty) else {
                 return None;
             };
             let f = self.struct_by_name(&n)?.field(prop)?;

@@ -1,0 +1,14 @@
+3 2 2
+a Stack { items: [ 'a' ] }
+7 2
+4 x Pair { first: 3, second: 'x' }
+n=20 Box { value: 'n=20' }
+[ 'c', 'b', 'a' ] 3
+2 2 { items: [ 1, 2 ], total: 2 }
+{ items: [], total: 0 }
+one 1
+bob undefined
+{ name: 'b' }
+[ 1, 2 ]
+<1> <s> <[object Object]>
+5 x

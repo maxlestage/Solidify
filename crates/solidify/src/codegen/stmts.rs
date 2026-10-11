@@ -63,7 +63,14 @@ impl<'a> Gen<'a> {
     /// The value of `return e`, wrapped as the function needs.
     fn return_value(&mut self, e: &'a Expr) -> GResult<String> {
         let ret = self.fn_ctx().ret_ty.clone();
-        let code = self.expr_to(e, &ret)?;
+        let id = self.fn_ctx().id;
+        let code = if matches!(e.kind, ExprKind::This)
+            && self.p.funcs.get(&id).is_some_and(|f| self.fluent(f))
+        {
+            "self".to_string()
+        } else {
+            self.expr_to(e, &ret)?
+        };
         let in_try = self.fn_ctx().try_ctx.last().is_some_and(|t| t.returns);
         Ok(if in_try {
             format!("Ok(Some({code}))")
@@ -325,7 +332,18 @@ impl<'a> Gen<'a> {
                     let Some(init) = &d.init else {
                         let t = self.rust_ty(&ty, *span)?;
                         let name = self.bind(*id, Repr::Owned);
-                        self.line(&format!("let {name}: {t};"));
+                        // `let x: T | undefined;` is `undefined` until set: it may be read
+                        // before.
+                        if matches!(self.resolve(&ty), Ty::Option(_)) {
+                            let m = if self.p.var(*id).reassigned || self.p.var(*id).mutated {
+                                "mut "
+                            } else {
+                                ""
+                            };
+                            self.line(&format!("let {m}{name}: {t} = None;"));
+                        } else {
+                            self.line(&format!("let {name}: {t};"));
+                        }
                         continue;
                     };
                     self.local_from(*id, init, &ty, d.span)?;
@@ -428,7 +446,7 @@ impl<'a> Gen<'a> {
                 _ => format!("{base}.{}", snake(&p.key)),
             };
             let field_optional = match self.resolve(it) {
-                Ty::Named(n) => self
+                Ty::Named(n, ..) => self
                     .p
                     .struct_info(&n)
                     .and_then(|s| s.field(&p.key))
@@ -572,7 +590,8 @@ impl<'a> Gen<'a> {
                     | "None"
                     | "String::new()"
             ) || matches!(self.resolve(&it), Ty::Null)
-                || matches!(init.kind, ExprKind::Num { .. }) && self.is_float(ty);
+                || matches!(init.kind, ExprKind::Num { .. }) && self.is_float(ty)
+                || self.generic_instance(ty);
             let name = self.bind(id, Repr::Owned);
             self.shared.insert(id);
             self.uses_rc = true;
@@ -595,7 +614,7 @@ impl<'a> Gen<'a> {
                     optional: false,
                     ..
                 }
-        ) && !matches!(self.resolve(&it), Ty::Named(ref n) if n == "Error");
+        ) && !matches!(self.resolve(&it), Ty::Named(ref n, ..) if n == "Error");
         // A string literal kept as a `&str`.
         if let ExprKind::Str(s) = &init.kind
             && fixed
@@ -692,7 +711,8 @@ impl<'a> Gen<'a> {
                 | "None"
                 | "String::new()"
         ) || matches!(self.resolve(&it), Ty::Null)
-            || float_literal;
+            || float_literal
+            || self.generic_instance(ty);
         let closure_mut = match &init.kind {
             ExprKind::Arrow(f) | ExprKind::Func(f) => self.p.funcs[&f.id]
                 .captures
@@ -844,7 +864,7 @@ impl<'a> Gen<'a> {
         // `re.lastIndex = i`
         if let ExprKind::Member { obj, prop, .. } = &t.kind
             && prop == "lastIndex"
-            && matches!(self.ty_of(obj), Ty::Named(ref n) if n == "RegExp")
+            && matches!(self.ty_of(obj), Ty::Named(ref n, ..) if n == "RegExp")
             && op == AssignOp::Assign
         {
             let r = self.expr(obj)?;
@@ -867,7 +887,7 @@ impl<'a> Gen<'a> {
         }
         // A field of a union value: through its mutable accessor.
         if let ExprKind::Member { obj, prop, .. } = &t.kind
-            && let Ty::Named(n) = self.ty_of(obj)
+            && let Ty::Named(n, ..) = self.ty_of(obj)
             && self.p.union_info(&n).is_some()
             && op == AssignOp::Assign
         {
@@ -879,10 +899,21 @@ impl<'a> Gen<'a> {
             self.line(&format!("*{base}.{}_mut() = {val};", snake(prop)));
             return Ok(());
         }
+        // A field of a constrained type parameter: through the trait's mutable accessor.
+        if let ExprKind::Member { obj, prop, .. } = &t.kind
+            && let Some((_, c)) = self.constrained(&self.ty_of(obj))
+        {
+            self.bound_setters.insert((c, prop.to_string()));
+            let o = self.expr_mut_root(obj)?;
+            let base = Self::paren(&o, PREC_POSTFIX);
+            let place = format!("*{base}.{}_mut()", snake(prop));
+            let x = E::new(place, PREC_UNARY, Repr::Owned);
+            return self.assign_to(op, x, value, &tt, &vt, e);
+        }
         // A field of a value held dynamically: through its mutable accessor.
         if let ExprKind::Member { obj, prop, .. } = &t.kind
             && !matches!(obj.kind, ExprKind::This)
-            && let Ty::Named(n) = self.ty_of(obj)
+            && let Ty::Named(n, ..) = self.ty_of(obj)
             && self.p.is_dyn(&n)
             && self
                 .p
@@ -898,7 +929,7 @@ impl<'a> Gen<'a> {
         }
         // A setter.
         if let ExprKind::Member { obj, prop, .. } = &t.kind
-            && let Ty::Named(n) = self.ty_of(obj)
+            && let Ty::Named(n, ..) = self.ty_of(obj)
             && let Some(info) = self.p.struct_info(&n)
             && info.field(prop).is_none()
             && self.p.find_method(&n, prop, MethodKind::Set).is_some()
@@ -1308,7 +1339,7 @@ impl<'a> Gen<'a> {
         let to_name = pascal(&target.name);
         let mut arms = Vec::new();
         for m in &target.members {
-            let Some((_, from_variant)) = self.union_variant(&m.ty, &Ty::Named(from.to_string()))
+            let Some((_, from_variant)) = self.union_variant(&m.ty, &Ty::named(from.to_string()))
             else {
                 continue;
             };
@@ -1362,7 +1393,7 @@ impl<'a> Gen<'a> {
         };
         // The chain: (variant of the root union, body) per test, and the final `else`.
         let root = sides0.union.clone();
-        let root_ty = Ty::Named(root.clone());
+        let root_ty = Ty::named(root.clone());
         let mut arms: Vec<(String, &'a Stmt)> = Vec::new();
         let mut last_side: Option<Side> = None;
         let mut current: Option<(&'a Expr, &'a Stmt, Option<&'a Stmt>)> =
@@ -2162,7 +2193,7 @@ impl<'a> Gen<'a> {
             unreachable!()
         };
         let covered = match self.resolve(&dt) {
-            Ty::Named(n) => self.p.enum_info(&n).is_some_and(|en| {
+            Ty::Named(n, ..) => self.p.enum_info(&n).is_some_and(|en| {
                 en.variants.iter().all(|v| {
                     patterns
                         .iter()
