@@ -23,6 +23,8 @@ pub struct Nav {
     pub install: &'static str,
     pub github: &'static str,
     pub skip: &'static str,
+    /// The button that installs the site as an app, shown when the browser offers it.
+    pub install_app: &'static str,
 }
 
 pub struct Hero {
@@ -100,6 +102,7 @@ static EN: Dict = Dict {
         install: "Install",
         github: "GitHub",
         skip: "Skip to content",
+        install_app: "Install the app",
     },
     hero: Hero {
         eyebrow: "A transpiler written in Rust, no dependency",
@@ -311,8 +314,8 @@ static EN: Dict = Dict {
     },
     install: Install {
         title: "Install",
-        lead: "One crate, no dependency, a single binary. Translate a file and the files it imports, or pipe one file through the standard input.",
-        cli: "Command line",
+        lead: "Nothing to install but Node.js: npx runs Solidify, compiled to WebAssembly, on your files. Translate a file and the files it imports, or pipe one file through the standard input.",
+        cli: "With npx",
         library: "As a library",
         check: "Check without writing",
     },
@@ -336,6 +339,7 @@ static FR: Dict = Dict {
         install: "Installer",
         github: "GitHub",
         skip: "Aller au contenu",
+        install_app: "Installer l'app",
     },
     hero: Hero {
         eyebrow: "Un transpileur écrit en Rust, sans dépendance",
@@ -550,8 +554,8 @@ static FR: Dict = Dict {
     },
     install: Install {
         title: "Installer",
-        lead: "Une crate, aucune dépendance, un seul binaire. Traduisez un fichier et ceux qu'il importe, ou passez un fichier par l'entrée standard.",
-        cli: "Ligne de commande",
+        lead: "Rien à installer d'autre que Node.js : npx lance Solidify, compilé en WebAssembly, sur vos fichiers. Traduisez un fichier et ceux qu'il importe, ou passez un fichier par l'entrée standard.",
+        cli: "Avec npx",
         library: "Comme bibliothèque",
         check: "Vérifier sans écrire",
     },
@@ -575,6 +579,7 @@ static ES: Dict = Dict {
         install: "Instalar",
         github: "GitHub",
         skip: "Ir al contenido",
+        install_app: "Instalar la app",
     },
     hero: Hero {
         eyebrow: "Un transpilador escrito en Rust, sin dependencias",
@@ -792,8 +797,8 @@ static ES: Dict = Dict {
     },
     install: Install {
         title: "Instalar",
-        lead: "Un crate, ninguna dependencia, un solo binario. Traduce un archivo y los que importa, o pasa un archivo por la entrada estándar.",
-        cli: "Línea de comandos",
+        lead: "Nada que instalar salvo Node.js: npx ejecuta Solidify, compilado a WebAssembly, sobre tus archivos. Traduce un archivo y los que importa, o pasa un archivo por la entrada estándar.",
+        cli: "Con npx",
         library: "Como biblioteca",
         check: "Comprobar sin escribir",
     },

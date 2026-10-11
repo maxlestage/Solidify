@@ -1,0 +1,4 @@
+# Built by CI from crates/solidify (wasm32-wasip1) and the repository root.
+solidify.wasm
+LICENSE
+*.tgz

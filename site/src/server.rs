@@ -27,6 +27,7 @@ fn content_type(path: &str) -> &'static str {
         Some("png") => "image/png",
         Some("woff2") => "font/woff2",
         Some("txt") => "text/plain; charset=utf-8",
+        Some("webmanifest") => "application/manifest+json",
         Some("html") => "text/html; charset=utf-8",
         _ => "application/octet-stream",
     }
@@ -61,6 +62,23 @@ pub fn respond(path: &str, host: &str) -> (&'static str, &'static str, Vec<u8>) 
         );
     }
     let relative = path.strip_prefix(base()).unwrap_or(path);
+    match relative {
+        "/manifest.webmanifest" => {
+            return (
+                "200 OK",
+                content_type(relative),
+                crate::pwa::manifest().into_bytes(),
+            );
+        }
+        "/sw.js" => {
+            return (
+                "200 OK",
+                content_type(relative),
+                service_worker(&origin(host)).into_bytes(),
+            );
+        }
+        _ => {}
+    }
     let file = match relative {
         "/favicon.svg" => Some(site_dir().join("static/favicon.svg")),
         p if p.starts_with("/static/") || p.starts_with("/pkg/") => Some(site_dir().join(&p[1..])),
@@ -74,6 +92,22 @@ pub fn respond(path: &str, host: &str) -> (&'static str, &'static str, Vec<u8>) 
             pages::home(Lang::En, &origin(host)).into_bytes(),
         ),
     }
+}
+
+/// The service worker for the pages as rendered at `origin`.
+fn service_worker(origin: &str) -> String {
+    let pages: Vec<(String, String)> = Lang::ALL
+        .iter()
+        .map(|lang| {
+            let path = match lang.path().trim_start_matches('/') {
+                "" => "./".to_string(),
+                p => p.to_string(),
+            };
+            (path, pages::home(*lang, origin))
+        })
+        .collect();
+    let (files, version) = crate::pwa::offline_files(&site_dir(), &pages);
+    crate::pwa::service_worker(&files, &version)
 }
 
 /// Serves the site until the process is stopped.
@@ -139,6 +173,9 @@ pub fn export(out: &Path) -> io::Result<usize> {
         write(&format!("{}index.html", lang.path()), html.as_bytes())?;
     }
     write("404.html", pages::home(Lang::En, &origin).as_bytes())?;
+    // The installable app: its manifest, and the service worker that keeps it offline.
+    write("manifest.webmanifest", crate::pwa::manifest().as_bytes())?;
+    write("sw.js", service_worker(&origin).as_bytes())?;
     let dir = site_dir();
     for folder in ["static", "pkg"] {
         let root = dir.join(folder);
@@ -205,6 +242,9 @@ mod tests {
         assert!(dir.join("fr/index.html").exists());
         assert!(dir.join("static/app.css").exists());
         assert!(dir.join(".nojekyll").exists());
+        assert!(dir.join("manifest.webmanifest").exists());
+        let sw = std::fs::read_to_string(dir.join("sw.js")).unwrap();
+        assert!(sw.contains("\"static/app.css\"") && sw.contains("\"fr/\""));
         let _ = std::fs::remove_dir_all(dir);
     }
 }

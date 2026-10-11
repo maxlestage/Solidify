@@ -6,6 +6,7 @@ pub mod highlight;
 pub mod i18n;
 pub mod islands;
 pub mod pages;
+pub mod pwa;
 pub mod routes;
 
 #[cfg(not(target_arch = "wasm32"))]

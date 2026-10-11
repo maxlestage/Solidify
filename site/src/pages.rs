@@ -20,13 +20,12 @@ pub const FAMILY: [(&str, &str); 6] = [
     ("FerroSwift", "https://maxlestage.github.io/FerroSwift/"),
 ];
 
-const INSTALL_CLI: &str = "cargo install --git https://github.com/maxlestage/Solidify solidify\n\
-solidify main.ts -o app.rs     # follows the imports of main.ts, one Rust file out\n\
-solidify < app.ts > app.rs     # or through the standard input\n\
+const INSTALL_CLI: &str = "npx solidify-rs main.ts -o app.rs     # follows the imports of main.ts, one Rust file out\n\
+npx solidify-rs < app.ts > app.rs     # or through the standard input\n\
 rustc --edition 2024 app.rs && ./app";
 
 const INSTALL_CHECK: &str =
-    "solidify --check app.ts        # errors with line and column, nothing written";
+    "npx solidify-rs --check app.ts        # errors with line and column, nothing written";
 
 const INSTALL_LIB: &str = "let options = solidify::Options::default();\n\
 let rust: String = solidify::transpile(typescript, &options)?;\n\
@@ -75,12 +74,18 @@ fn head_extra() -> String {
     format!(
         "<link rel=\"icon\" href=\"{}\" type=\"image/svg+xml\"/>\
          <meta name=\"theme-color\" content=\"#0b0b0c\"/>\
+         <link rel=\"manifest\" href=\"{}\"/>\
+         <link rel=\"apple-touch-icon\" href=\"{}\"/>\
+         <meta name=\"apple-mobile-web-app-capable\" content=\"yes\"/>\
+         <meta name=\"apple-mobile-web-app-title\" content=\"Solidify\"/>\
          <link rel=\"preload\" href=\"{}\" as=\"font\" type=\"font/woff2\" crossorigin=\"\"/>\
          <link rel=\"preload\" href=\"{}\" as=\"font\" type=\"font/woff2\" crossorigin=\"\"/>",
         link("/static/favicon.svg"),
+        link("/manifest.webmanifest"),
+        link("/static/apple-touch-icon.png"),
         link("/static/fonts/geist-latin-wght-normal.woff2"),
         link("/static/fonts/geist-mono-latin-wght-normal.woff2"),
-    )
+    ) + &crate::pwa::register_script(&link("/sw.js"))
 }
 
 fn json_ld(lang: Lang) -> String {
@@ -145,6 +150,14 @@ fn header(lang: Lang) -> Element {
                 .child(nav_link("#supported", d.nav.supported))
                 .child(nav_link("#install", d.nav.install))
                 .child(a().href(GITHUB).attr("rel", "external").text(d.nav.github))
+                .child(
+                    button()
+                        .id("install-app")
+                        .class("install-app")
+                        .attr("type", "button")
+                        .attr("hidden", "")
+                        .text(d.nav.install_app),
+                )
                 .child(lang_switch(lang)),
         )
 }
