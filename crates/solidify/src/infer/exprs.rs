@@ -1332,6 +1332,10 @@ impl<'m> Infer<'m> {
         Ok(Ty::named(name))
     }
 
+    pub(super) fn same_shape_named(&self, fields: &[FieldInfo]) -> Option<String> {
+        self.same_shape(fields)
+    }
+
     fn same_shape(&self, fields: &[FieldInfo]) -> Option<String> {
         'outer: for s in &self.structs {
             if s.fields.len() != fields.len() || s.kind == StructKind::Class {

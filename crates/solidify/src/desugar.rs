@@ -24,6 +24,7 @@ pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) -> Option<String> {
     literal_code(body, next_id);
     error_classes(body, next_id);
     object_methods(body, next_id);
+    flatten_patterns(body, next_id);
     proxy_targets(body);
     let mut ids = Ids(next_id);
     constructor_functions(body, &mut ids);
@@ -1540,5 +1541,472 @@ fn object_methods(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
                 comments: Vec::new(),
             },
         );
+    }
+}
+
+/// Destructuring the rest of Solidify reads one level at a time: nested patterns
+/// (`const { user: { id } } = x`), object patterns of `for … of` loops and of
+/// assignments become simple ones, through temporaries.
+fn flatten_patterns(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
+    let mut f = Flatten { next_id, count: 0 };
+    f.list(body);
+    for_each_function(body, &mut |func| {
+        f.params(func);
+        if let FnBody::Block(b) = &mut func.body {
+            f.list(&mut b.stmts);
+        }
+    });
+}
+
+struct Flatten<'a> {
+    next_id: &'a mut NodeId,
+    count: usize,
+}
+
+impl Flatten<'_> {
+    fn id(&mut self) -> NodeId {
+        let id = *self.next_id;
+        *self.next_id += 1;
+        id
+    }
+
+    fn temp(&mut self) -> String {
+        self.count += 1;
+        format!("destructured{}", self.count)
+    }
+
+    fn ident(&mut self, name: &str, span: Span) -> Expr {
+        Expr {
+            kind: ExprKind::Ident(name.to_string()),
+            span,
+            id: self.id(),
+        }
+    }
+
+    fn nested(p: &Pattern) -> bool {
+        match p {
+            Pattern::Ident { .. } => false,
+            Pattern::Array { elems, rest, .. } => {
+                elems
+                    .iter()
+                    .flatten()
+                    .any(|e| !matches!(e.pat, Pattern::Ident { .. }))
+                    || rest
+                        .as_ref()
+                        .is_some_and(|r| !matches!(**r, Pattern::Ident { .. }))
+            }
+            Pattern::Object { props, rest, .. } => {
+                props
+                    .iter()
+                    .any(|p| !matches!(p.value, Pattern::Ident { .. }))
+                    || rest
+                        .as_ref()
+                        .is_some_and(|r| !matches!(**r, Pattern::Ident { .. }))
+            }
+        }
+    }
+
+    /// The pattern with its nested parts replaced by temporaries, and those parts.
+    fn lift(&mut self, p: &mut Pattern) -> Vec<(String, Pattern)> {
+        let mut out = Vec::new();
+        let mut take = |me: &mut Self, sub: &mut Pattern| {
+            if !matches!(sub, Pattern::Ident { .. }) {
+                let name = me.temp();
+                let span = sub.span();
+                let id = me.id();
+                let inner = std::mem::replace(
+                    sub,
+                    Pattern::Ident {
+                        name: name.clone(),
+                        span,
+                        id,
+                    },
+                );
+                out.push((name, inner));
+            }
+        };
+        match p {
+            Pattern::Ident { .. } => {}
+            Pattern::Array { elems, rest, .. } => {
+                for e in elems.iter_mut().flatten() {
+                    take(self, &mut e.pat);
+                }
+                if let Some(r) = rest {
+                    take(self, r);
+                }
+            }
+            Pattern::Object { props, rest, .. } => {
+                for prop in props.iter_mut() {
+                    take(self, &mut prop.value);
+                }
+                if let Some(r) = rest {
+                    take(self, r);
+                }
+            }
+        }
+        out
+    }
+
+    fn decls(&mut self, v: &mut VarDecl) {
+        let mut out = Vec::new();
+        let mut pending: std::collections::VecDeque<Declarator> = v.decls.drain(..).collect();
+        while let Some(mut d) = pending.pop_front() {
+            let parts = self.lift(&mut d.pat);
+            let span = d.span;
+            out.push(d);
+            for (name, pat) in parts.into_iter().rev() {
+                let init = self.ident(&name, span);
+                pending.push_front(Declarator {
+                    pat,
+                    ty: None,
+                    init: Some(init),
+                    span,
+                });
+            }
+        }
+        v.decls = out;
+    }
+
+    /// `function f({ a: { b } })`: the parameter taken apart in the body.
+    fn params(&mut self, func: &mut Function) {
+        let mut decls = Vec::new();
+        for p in &mut func.params {
+            if !Self::nested(&p.pat) {
+                continue;
+            }
+            let name = self.temp();
+            let span = p.pat.span();
+            let id = self.id();
+            let pat = std::mem::replace(
+                &mut p.pat,
+                Pattern::Ident {
+                    name: name.clone(),
+                    span,
+                    id,
+                },
+            );
+            let init = self.ident(&name, span);
+            decls.push(Stmt {
+                kind: StmtKind::Var(VarDecl {
+                    kind: VarKind::Const,
+                    decls: vec![Declarator {
+                        pat,
+                        ty: None,
+                        init: Some(init),
+                        span,
+                    }],
+                    exported: false,
+                }),
+                span,
+                comments: Vec::new(),
+            });
+        }
+        if decls.is_empty() {
+            return;
+        }
+        let FnBody::Block(b) = &mut func.body else {
+            // `({ a: { b } }) => b`: a block returning the value.
+            let FnBody::Expr(e) = std::mem::replace(
+                &mut func.body,
+                FnBody::Block(Block {
+                    stmts: Vec::new(),
+                    span: func.span,
+                }),
+            ) else {
+                unreachable!()
+            };
+            let span = e.span;
+            decls.push(Stmt {
+                kind: StmtKind::Return(Some(*e)),
+                span,
+                comments: Vec::new(),
+            });
+            func.body = FnBody::Block(Block { stmts: decls, span });
+            return;
+        };
+        decls.append(&mut b.stmts);
+        b.stmts = decls;
+    }
+
+    /// `pat = value` as a statement: the variables set one by one.
+    fn assignment(&mut self, pat: Pattern, value: Expr, span: Span, out: &mut Vec<Stmt>) {
+        let name = self.temp();
+        let id = self.id();
+        out.push(Stmt {
+            kind: StmtKind::Var(VarDecl {
+                kind: VarKind::Const,
+                decls: vec![Declarator {
+                    pat: Pattern::Ident {
+                        name: name.clone(),
+                        span,
+                        id,
+                    },
+                    ty: None,
+                    init: Some(value),
+                    span,
+                }],
+                exported: false,
+            }),
+            span,
+            comments: Vec::new(),
+        });
+        let mut parts: Vec<(Pattern, Expr, Option<Expr>)> = Vec::new();
+        match pat {
+            Pattern::Object { props, .. } => {
+                for p in props {
+                    let obj = self.ident(&name, span);
+                    let read = Expr {
+                        kind: ExprKind::Member {
+                            obj: Box::new(obj),
+                            prop: p.key.clone(),
+                            optional: false,
+                        },
+                        span,
+                        id: self.id(),
+                    };
+                    parts.push((p.value, read, p.default));
+                }
+            }
+            Pattern::Array { elems, .. } => {
+                for (i, e) in elems.into_iter().enumerate() {
+                    let Some(e) = e else { continue };
+                    let obj = self.ident(&name, span);
+                    let index = Expr {
+                        kind: ExprKind::Num {
+                            value: i as f64,
+                            raw: i.to_string(),
+                            int: true,
+                        },
+                        span,
+                        id: self.id(),
+                    };
+                    let read = Expr {
+                        kind: ExprKind::Index {
+                            obj: Box::new(obj),
+                            index: Box::new(index),
+                            optional: false,
+                        },
+                        span,
+                        id: self.id(),
+                    };
+                    parts.push((e.pat, read, e.default));
+                }
+            }
+            Pattern::Ident { .. } => {}
+        }
+        for (target, read, default) in parts {
+            let read = match default {
+                Some(d) => Expr {
+                    kind: ExprKind::Logical {
+                        op: LogicalOp::Nullish,
+                        left: Box::new(read),
+                        right: Box::new(d),
+                    },
+                    span,
+                    id: self.id(),
+                },
+                None => read,
+            };
+            match target {
+                Pattern::Ident { name, .. } => {
+                    let t = self.ident(&name, span);
+                    out.push(Stmt {
+                        kind: StmtKind::Expr(Expr {
+                            kind: ExprKind::Assign {
+                                op: AssignOp::Assign,
+                                target: AssignTarget::Expr(Box::new(t)),
+                                value: Box::new(read),
+                            },
+                            span,
+                            id: self.id(),
+                        }),
+                        span,
+                        comments: Vec::new(),
+                    });
+                }
+                nested => self.assignment(nested, read, span, out),
+            }
+        }
+    }
+
+    /// A statement list, and the lists nested in its statements (functions apart).
+    fn list(&mut self, stmts: &mut Vec<Stmt>) {
+        let mut i = 0;
+        while i < stmts.len() {
+            // `({ a, b } = obj);`
+            let rewrite = match &stmts[i].kind {
+                StmtKind::Expr(Expr {
+                    kind:
+                        ExprKind::Assign {
+                            op: AssignOp::Assign,
+                            target: AssignTarget::Pat(p),
+                            ..
+                        },
+                    ..
+                }) => matches!(p, Pattern::Object { .. }) || Self::nested(p),
+                _ => false,
+            };
+            if rewrite {
+                let s = stmts.remove(i);
+                let StmtKind::Expr(Expr {
+                    kind:
+                        ExprKind::Assign {
+                            target: AssignTarget::Pat(p),
+                            value,
+                            ..
+                        },
+                    ..
+                }) = s.kind
+                else {
+                    unreachable!()
+                };
+                let mut out = Vec::new();
+                self.assignment(p, *value, s.span, &mut out);
+                stmts.insert(
+                    i,
+                    Stmt {
+                        kind: StmtKind::Block(Block {
+                            stmts: out,
+                            span: s.span,
+                        }),
+                        span: s.span,
+                        comments: s.comments,
+                    },
+                );
+            }
+            // `for (const { a, b } of items)`: the item taken apart in the body.
+            if let StmtKind::ForOf {
+                kind, pat, body, ..
+            } = &mut stmts[i].kind
+                && (matches!(pat, Pattern::Object { .. }) || Self::nested(pat))
+            {
+                let name = self.temp();
+                let span = pat.span();
+                let id = self.id();
+                let inner = std::mem::replace(
+                    pat,
+                    Pattern::Ident {
+                        name: name.clone(),
+                        span,
+                        id,
+                    },
+                );
+                let init = self.ident(&name, span);
+                let decl = Stmt {
+                    kind: StmtKind::Var(VarDecl {
+                        kind: *kind,
+                        decls: vec![Declarator {
+                            pat: inner,
+                            ty: None,
+                            init: Some(init),
+                            span,
+                        }],
+                        exported: false,
+                    }),
+                    span,
+                    comments: Vec::new(),
+                };
+                let old = std::mem::replace(
+                    &mut **body,
+                    Stmt {
+                        kind: StmtKind::Empty,
+                        span,
+                        comments: Vec::new(),
+                    },
+                );
+                let bspan = old.span;
+                let stmts_in = match old.kind {
+                    StmtKind::Block(b) => {
+                        let mut v = vec![decl];
+                        v.extend(b.stmts);
+                        v
+                    }
+                    other => vec![
+                        decl,
+                        Stmt {
+                            kind: other,
+                            span: bspan,
+                            comments: Vec::new(),
+                        },
+                    ],
+                };
+                **body = Stmt {
+                    kind: StmtKind::Block(Block {
+                        stmts: stmts_in,
+                        span: bspan,
+                    }),
+                    span: bspan,
+                    comments: Vec::new(),
+                };
+            }
+            match &mut stmts[i].kind {
+                StmtKind::Var(v) => {
+                    if v.decls.iter().any(|d| Self::nested(&d.pat)) {
+                        self.decls(v);
+                    }
+                }
+                StmtKind::Block(b) => self.list(&mut b.stmts),
+                StmtKind::If {
+                    then, otherwise, ..
+                } => {
+                    self.one(then);
+                    if let Some(o) = otherwise {
+                        self.one(o);
+                    }
+                }
+                StmtKind::While { body, .. }
+                | StmtKind::DoWhile { body, .. }
+                | StmtKind::Labeled { body, .. }
+                | StmtKind::ForOf { body, .. } => self.one(body),
+                StmtKind::For { init, body, .. } => {
+                    if let Some(i) = init {
+                        self.one(i);
+                    }
+                    self.one(body);
+                }
+                StmtKind::Switch { cases, .. } => {
+                    for c in cases {
+                        self.list(&mut c.body);
+                    }
+                }
+                StmtKind::Try {
+                    block,
+                    catch,
+                    finally,
+                } => {
+                    self.list(&mut block.stmts);
+                    if let Some(c) = catch {
+                        self.list(&mut c.body.stmts);
+                    }
+                    if let Some(f) = finally {
+                        self.list(&mut f.stmts);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+    }
+
+    fn one(&mut self, s: &mut Stmt) {
+        let mut v = vec![std::mem::replace(
+            s,
+            Stmt {
+                kind: StmtKind::Empty,
+                span: Span::default(),
+                comments: Vec::new(),
+            },
+        )];
+        self.list(&mut v);
+        *s = if v.len() == 1 {
+            v.pop().expect("one")
+        } else {
+            let span = v[0].span;
+            Stmt {
+                kind: StmtKind::Block(Block { stmts: v, span }),
+                span,
+                comments: Vec::new(),
+            }
+        };
     }
 }
