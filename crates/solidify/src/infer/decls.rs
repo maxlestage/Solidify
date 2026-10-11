@@ -941,7 +941,10 @@ impl<'m> Infer<'m> {
                                 init.kind,
                                 ExprKind::Num { .. } | ExprKind::Str(_) | ExprKind::Bool(_)
                             ) || matches!(&init.kind, ExprKind::Unary { op: UnaryOp::Neg, arg } if matches!(arg.kind, ExprKind::Num { .. }));
-                            if v.kind == VarKind::Const && literal {
+                            if v.kind == VarKind::Const
+                                && literal
+                                && !self.types.resolve(&ty).is_dynamic()
+                            {
                                 self.vars.get_mut(id).expect("var").const_literal = true;
                             }
                         }

@@ -293,7 +293,8 @@ impl<'a> Gen<'a> {
                         out.push_str("        JsValue::Str(self.to_string())\n");
                     }
                 } else if let Some(info) = self.p.struct_info(&name).cloned() {
-                    let class = if info.kind == StructKind::Class {
+                    let object = name.starts_with(crate::desugar::OBJECT_CLASS);
+                    let class = if info.kind == StructKind::Class && !object {
                         format!("Some({})", string_literal(&name))
                     } else {
                         "None".to_string()
@@ -331,6 +332,72 @@ impl<'a> Gen<'a> {
                             _ => self.js_value_of(&format!("self.{field}"), &f.ty),
                         };
                         parts.push((format!("({key}.to_string(), {value})"), None));
+                    }
+                    // An object written with methods shows them, like Node.
+                    if object {
+                        let mut accessors: Vec<(String, bool, bool)> = Vec::new();
+                        for m in &info.methods {
+                            match m.kind {
+                                MethodKind::Method => parts.push((
+                                    format!(
+                                        "({}.to_string(), JsValue::Func({}))",
+                                        string_literal(&m.name),
+                                        string_literal(&m.name)
+                                    ),
+                                    None,
+                                )),
+                                MethodKind::Get | MethodKind::Set => {
+                                    let get = m.kind == MethodKind::Get;
+                                    match accessors.iter_mut().find(|(n, ..)| *n == m.name) {
+                                        Some(a) => {
+                                            a.1 |= get;
+                                            a.2 |= !get;
+                                        }
+                                        None => accessors.push((m.name.clone(), get, !get)),
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        for (n, get, set) in accessors {
+                            let shown = match (get, set) {
+                                (true, true) => "[Getter/Setter]",
+                                (true, false) => "[Getter]",
+                                _ => "[Setter]",
+                            };
+                            parts.push((
+                                format!(
+                                    "({}.to_string(), JsValue::Raw({}.to_string()))",
+                                    string_literal(&n),
+                                    string_literal(shown)
+                                ),
+                                None,
+                            ));
+                        }
+                    }
+                    // In the order the object was written.
+                    if object && let Some(ast) = self.class_asts.get(&name).copied() {
+                        let order: Vec<&str> = ast
+                            .members
+                            .iter()
+                            .filter_map(|m| match m {
+                                ClassMember::Field(f) => Some(f.name.as_str()),
+                                ClassMember::Method(m) if m.kind != MethodKind::Constructor => {
+                                    Some(m.name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let key_of = |entry: &str| -> String {
+                            entry.split('"').nth(1).unwrap_or_default().to_string()
+                        };
+                        parts.sort_by_key(|(entry, opt)| {
+                            let k = match opt {
+                                Some(_) => entry.trim_matches('"').to_string(),
+                                None => key_of(entry),
+                            };
+                            order.iter().position(|o| *o == k).unwrap_or(usize::MAX)
+                        });
                     }
                     if parts.iter().all(|(_, o)| o.is_none()) {
                         let entries: Vec<String> = parts.into_iter().map(|(e, _)| e).collect();

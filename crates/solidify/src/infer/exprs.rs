@@ -150,7 +150,12 @@ impl<'m> Infer<'m> {
                             }
                             let xt = self.expr(x, Some(&item))?;
                             self.mark_stored(x);
-                            match self.expect(&xt, &item, x.span) {
+                            let converted = self.dyn_cast(x, &xt, &item);
+                            match if converted {
+                                Ok(())
+                            } else {
+                                self.expect(&xt, &item, x.span)
+                            } {
                                 Ok(()) => {}
                                 Err(_)
                                     if free && !matches!(self.types.resolve(&item), Ty::Var(_)) =>
@@ -1066,7 +1071,9 @@ impl<'m> Infer<'m> {
                 }
                 let vt = self.expr(value, Some(&v))?;
                 self.mark_stored(value);
-                self.expect(&vt, &v, value.span)?;
+                if !self.dyn_cast(value, &vt, &v) {
+                    self.expect(&vt, &v, value.span)?;
+                }
             }
             return Ok(Ty::Map(Box::new(k), Box::new(v), record));
         }
@@ -1171,7 +1178,7 @@ impl<'m> Infer<'m> {
                     self.hints.insert(v.id, format!("{struct_name} {key}"));
                     let vt = self.expr(v, Some(&fty))?;
                     self.mark_stored(v);
-                    self.expect(&vt, &fty, v.span)?;
+                    self.expect_flow(&vt, &fty, v)?;
                 }
                 PropValue::Shorthand(id) => {
                     let vt = self.shorthand(&key, *id, p.span)?;
@@ -1577,6 +1584,8 @@ impl<'m> Infer<'m> {
                 ),
                 obj.span,
             ),
+            // `record.key`: `record["key"]`.
+            Ty::Map(k, v, true) if matches!(self.types.resolve(k), Ty::Str) => Ok((**v).clone()),
             Ty::Any => self.err(
                 format!(
                     "`{}` is `any`: give it a type to use `.{prop}`",
@@ -2389,7 +2398,7 @@ impl<'m> Infer<'m> {
         Ok(match self.types.resolve(&t) {
             Ty::Num(_) => self.types.int(),
             other => {
-                self.expect(&other, &Ty::Str, args[0].expr.span)?;
+                self.expect_flow(&other, &Ty::Str, &args[0].expr)?;
                 Ty::Option(Box::new(self.types.int()))
             }
         })
@@ -2402,6 +2411,11 @@ impl<'m> Infer<'m> {
             Ty::Option(inner) => {
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&inner, &n, args[0].expr.span)?;
+            }
+            d if d.is_dynamic() => {
+                let f = self.types.float();
+                self.dyn_cast(&args[0].expr, &t, &f);
+                return Ok(f);
             }
             other => {
                 let n = self.types.num(Flavor::Unknown);
