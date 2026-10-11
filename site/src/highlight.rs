@@ -10,25 +10,76 @@ pub enum Language {
 }
 
 const TS_KEYWORDS: &[&str] = &[
-    "abstract", "as", "async", "await", "break", "case", "catch", "class", "const", "continue", "default",
-    "delete", "do", "else", "enum", "export", "extends", "false", "finally", "for", "from", "function", "get",
-    "if", "implements", "import", "in", "instanceof", "interface", "let", "new", "null", "of", "private",
-    "protected", "public", "readonly", "return", "set", "static", "super", "switch", "this", "throw", "true",
-    "try", "type", "typeof", "undefined", "var", "void", "while", "yield",
+    "abstract",
+    "as",
+    "async",
+    "await",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "const",
+    "continue",
+    "default",
+    "delete",
+    "do",
+    "else",
+    "enum",
+    "export",
+    "extends",
+    "false",
+    "finally",
+    "for",
+    "from",
+    "function",
+    "get",
+    "if",
+    "implements",
+    "import",
+    "in",
+    "instanceof",
+    "interface",
+    "let",
+    "new",
+    "null",
+    "of",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "return",
+    "set",
+    "static",
+    "super",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "type",
+    "typeof",
+    "undefined",
+    "var",
+    "void",
+    "while",
+    "yield",
 ];
 
-const TS_TYPES: &[&str] = &["number", "string", "boolean", "void", "any", "unknown", "never", "object"];
+const TS_TYPES: &[&str] = &[
+    "number", "string", "boolean", "void", "any", "unknown", "never", "object",
+];
 
 const RUST_KEYWORDS: &[&str] = &[
-    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
-    "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref", "return",
-    "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while",
+    "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern",
+    "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+    "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+    "unsafe", "use", "where", "while",
 ];
 
 const RUST_TYPES: &[&str] = &[
-    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
-    "bool", "char", "str", "String", "Vec", "Option", "Result", "Box", "HashMap", "HashSet", "Some", "None",
-    "Ok", "Err",
+    "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32",
+    "f64", "bool", "char", "str", "String", "Vec", "Option", "Result", "Box", "HashMap", "HashSet",
+    "Some", "None", "Ok", "Err",
 ];
 
 /// Highlights `code` as HTML.
@@ -73,7 +124,9 @@ pub fn highlight(code: &str, lang: Language) -> String {
         // Numbers.
         if c.is_ascii_digit() {
             let mut end = i + 1;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.') {
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'.')
+            {
                 if bytes[end] == b'.' && bytes.get(end + 1) == Some(&b'.') {
                     break;
                 }
@@ -86,7 +139,9 @@ pub fn highlight(code: &str, lang: Language) -> String {
         // Words.
         if c.is_ascii_alphabetic() || c == b'_' || c == b'$' {
             let mut end = i + 1;
-            while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$') {
+            while end < bytes.len()
+                && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_' || bytes[end] == b'$')
+            {
                 end += 1;
             }
             let word = &code[i..end];
@@ -94,11 +149,17 @@ pub fn highlight(code: &str, lang: Language) -> String {
             let after_macro = lang == Language::Rust && next == Some(b'!');
             let class = if keywords.contains(&word) {
                 Some("k")
-            } else if types.contains(&word) || word.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            } else if types.contains(&word)
+                || word.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            {
                 Some("t")
             } else if after_macro {
                 Some("m")
-            } else if next == Some(b'(') || (lang == Language::Rust && bytes.get(end) == Some(&b':') && bytes.get(end + 1) == Some(&b':')) {
+            } else if next == Some(b'(')
+                || (lang == Language::Rust
+                    && bytes.get(end) == Some(&b':')
+                    && bytes.get(end + 1) == Some(&b':'))
+            {
                 Some("f")
             } else {
                 None
@@ -161,7 +222,10 @@ mod tests {
         assert!(html.contains("<span class=\"t\">number</span>"));
         assert!(html.contains("<span class=\"s\">&quot;a&lt;b&quot;</span>"));
         assert!(html.contains("<span class=\"c\">// hi</span>"));
-        let rust = highlight("fn main() { println!(\"{}\", Vec::<i64>::new()); }", Language::Rust);
+        let rust = highlight(
+            "fn main() { println!(\"{}\", Vec::<i64>::new()); }",
+            Language::Rust,
+        );
         assert!(rust.contains("<span class=\"f\">main</span>"));
         assert!(rust.contains("<span class=\"m\">println</span>"));
         assert!(rust.contains("<span class=\"t\">Vec</span>"));
