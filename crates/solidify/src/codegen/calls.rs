@@ -47,6 +47,10 @@ impl<'a> Gen<'a> {
                             list.push("None".into());
                             continue;
                         }
+                        if matches!(self.resolve(&f.params[i]), Ty::Void) {
+                            list.push("()".into());
+                            continue;
+                        }
                         let Some(d) = ast.params.get(i).and_then(|p| p.default.as_ref()) else {
                             return self.err("missing argument", e.span);
                         };
@@ -76,7 +80,11 @@ impl<'a> Gen<'a> {
                     let ExprKind::Member { obj, .. } = &callee.kind else {
                         unreachable!()
                     };
-                    let o = self.expr(obj)?;
+                    let o = if info.mutates_self {
+                        self.expr_mut_root(obj)?
+                    } else {
+                        self.expr(obj)?
+                    };
                     let base = if info.mutates_self && o.repr == Repr::Ref {
                         return self.err(
                             format!("`{name}` changes the object, but it is only borrowed here"),
@@ -119,7 +127,7 @@ impl<'a> Gen<'a> {
                 let receiver_kind = name.split('.').next().unwrap_or("");
                 match receiver_kind {
                     "console" | "Math" | "Number" | "String" | "Object" | "Array" | "Date"
-                    | "performance" | "process" => self.namespace_call(e, name, args),
+                    | "performance" | "process" | "Promise" => self.namespace_call(e, name, args),
                     _ => self.method_builtin(e, obj, name, args),
                 }
             }
@@ -187,7 +195,11 @@ impl<'a> Gen<'a> {
             match args.get(i) {
                 Some(a) => {
                     let at = self.ty_of(&a.expr);
-                    let x = self.expr(&a.expr)?;
+                    let x = if mode == Mode::RefMut {
+                        self.expr_mut_root(&a.expr)?
+                    } else {
+                        self.expr(&a.expr)?
+                    };
                     // A member passed where a union is borrowed: the variant, borrowed.
                     if mode != Mode::Value
                         && mode != Mode::FnImpl
@@ -331,6 +343,27 @@ impl<'a> Gen<'a> {
                     ));
                 }
                 Ok(built)
+            }
+            Some(Callee::Builtin("new Promise")) => {
+                let promise = self.helper(Helper::Promise);
+                self.helper(Helper::BlockOn);
+                let (ExprKind::Arrow(f) | ExprKind::Func(f)) = &args[0].expr.kind else {
+                    return self.err(
+                        "`new Promise` needs an inline executor function",
+                        args[0].expr.span,
+                    );
+                };
+                let c = self.closure(f, &[Repr::Owned, Repr::Owned], false)?;
+                // The executor always gets `resolve` and `reject`.
+                let code = match f.params.len() {
+                    0 => c.code.replacen("||", "|_, _|", 1),
+                    1 => c.code.replacen("|", "|", 1).replacen("| ", ", _| ", 1),
+                    _ => c.code,
+                };
+                Ok(E::owned(
+                    format!("{promise}::new({code}).await"),
+                    PREC_POSTFIX,
+                ))
             }
             Some(Callee::Builtin("new Error")) => match args.first() {
                 Some(a) => {
@@ -479,6 +512,21 @@ impl<'a> Gen<'a> {
             "global.structuredClone" => {
                 let x = self.expr_as(&args[0].expr, Want::Owned)?;
                 E::owned(x, PREC_POSTFIX)
+            }
+            "global.setTimeout" | "global.setInterval" => {
+                let (cb, ms) = self.timer_parts(args)?;
+                self.helper(Helper::Timers);
+                let f = if name == "global.setTimeout" {
+                    "js_set_timeout"
+                } else {
+                    "js_set_interval"
+                };
+                E::owned(format!("{f}({cb}, {ms})"), PREC_POSTFIX)
+            }
+            "global.clearTimeout" | "global.clearInterval" => {
+                let id = self.expr_as(&args[0].expr, Want::Owned)?;
+                self.helper(Helper::Timers);
+                E::owned(format!("js_clear_timer({id})"), PREC_POSTFIX)
             }
             _ => return self.err(format!("`{name}` is not supported"), e.span),
         })
@@ -771,6 +819,7 @@ impl<'a> Gen<'a> {
                     None => E::owned(format!("{src}.collect::<Vec<_>>()"), PREC_POSTFIX),
                 }
             }
+            "Promise.all" | "Promise.resolve" => self.expr(&args[0].expr)?,
             "Date.now" => E::owned(
                 "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)",
                 PREC_POSTFIX,
@@ -788,6 +837,36 @@ impl<'a> Gen<'a> {
             }
             _ => return self.err(format!("`{name}` is not supported"), e.span),
         })
+    }
+
+    /// The callback and the delay of `setTimeout(cb, ms)`, as Rust code.
+    pub(super) fn timer_parts(&mut self, args: &'a [Arg]) -> GResult<(String, String)> {
+        let cb = &args[0].expr;
+        let code = match &cb.kind {
+            ExprKind::Arrow(f) | ExprKind::Func(f) => self.closure(f, &[], false)?.code,
+            _ => {
+                let ct = self.ty_of(cb);
+                let c = self.expr(cb)?;
+                // `setTimeout(resolve, ms)`: a function of one (void) argument.
+                match self.resolve(&ct) {
+                    Ty::Func(f) if !f.params.is_empty() => format!("move || {}(())", c.code),
+                    _ => c.code,
+                }
+            }
+        };
+        let ms = match args.get(1) {
+            Some(a) => {
+                let x = self.expr_as(&a.expr, Want::Owned)?;
+                let at = self.ty_of(&a.expr);
+                if self.is_float(&at) {
+                    x
+                } else {
+                    self.as_f64(&E::owned(x, PREC_ATOM))
+                }
+            }
+            None => "0.0".into(),
+        };
+        Ok((code, ms))
     }
 
     /// `isNaN(x)` / `isFinite(x)`: on a float, the test; on the `Option` of `parseInt`,
@@ -853,6 +932,23 @@ impl<'a> Gen<'a> {
         args: &'a [Arg],
     ) -> GResult<E> {
         let (kind, method) = name.split_once('.').unwrap_or(("", name));
+        // Methods that change their receiver borrow a shared one mutably.
+        self.want_mut_root = matches!(
+            method,
+            "push"
+                | "pop"
+                | "shift"
+                | "unshift"
+                | "splice"
+                | "sort"
+                | "reverse"
+                | "fill"
+                | "set"
+                | "delete"
+                | "clear"
+                | "add"
+                | "next"
+        );
         match kind {
             "generator" => {
                 let g = self.expr_as(obj, Want::RefMut)?;

@@ -21,6 +21,22 @@ impl<'m> Infer<'m> {
                 t.mutated = true;
             }
         }
+        // A variable captured by a closure that is kept (returned, stored, given to a
+        // timer) and changed somewhere is shared between the closure and its scope.
+        let escaping: Vec<NodeId> = self
+            .funcs
+            .values()
+            .filter(|f| f.escapes)
+            .flat_map(|f| f.captures.iter().copied())
+            .collect();
+        for id in escaping {
+            if let Some(v) = self.vars.get_mut(&id)
+                && (v.reassigned || v.mutated || v.mutated_in_closure)
+                && !matches!(v.role, Role::Func | Role::Class | Role::Enum)
+            {
+                v.shared = true;
+            }
+        }
         let boxed = self.boxed_structs();
         self.generalize()?;
         self.check_locals()?;
@@ -83,6 +99,7 @@ impl<'m> Infer<'m> {
             boxed,
             polymorphic: self.polymorphic,
             overrides: self.overrides,
+            uses_timers: self.uses_timers,
         })
     }
 

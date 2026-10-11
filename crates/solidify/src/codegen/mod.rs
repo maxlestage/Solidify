@@ -174,6 +174,13 @@ pub(super) struct Gen<'a> {
     pub instance_tests: BTreeSet<(String, String, bool)>,
     /// `super.m()` helpers to write: class → (declaring class, method).
     pub super_helpers: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// Variables held in an `Rc<RefCell<T>>` (shared with closures that outlive the scope).
+    pub shared: HashSet<NodeId>,
+    pub uses_rc: bool,
+    /// The next variable read is written through: borrow a shared one mutably.
+    pub want_mut_root: bool,
+    /// Parameters to wrap in `Rc<RefCell<T>>` at the start of the body.
+    pub param_rebinds: Vec<String>,
     /// Binding → Rust name.
     pub names: HashMap<NodeId, String>,
     /// Binding → how the variable holds its value.
@@ -208,6 +215,10 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         dyn_setters: BTreeSet::new(),
         instance_tests: BTreeSet::new(),
         super_helpers: BTreeMap::new(),
+        shared: HashSet::new(),
+        uses_rc: false,
+        want_mut_root: false,
+        param_rebinds: Vec::new(),
         names: HashMap::new(),
         reprs: HashMap::new(),
         fn_asts: HashMap::new(),
@@ -757,6 +768,9 @@ impl<'a> Gen<'a> {
 
     pub(super) fn helper(&mut self, h: Helper) -> &'static str {
         self.helpers.insert(h);
+        if h == Helper::BlockOn {
+            self.helpers.insert(Helper::Timers);
+        }
         match h {
             Helper::StrSlice => "js_slice",
             Helper::StrSubstring => "js_substring",
@@ -786,6 +800,8 @@ impl<'a> Gen<'a> {
             Helper::JsMap => "JsMap",
             Helper::JsSet => "JsSet",
             Helper::Generator => "JsGenerator",
+            Helper::Timers => "js_run_timers",
+            Helper::Promise => "JsPromise",
         }
     }
 

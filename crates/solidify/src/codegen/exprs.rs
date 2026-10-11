@@ -232,7 +232,13 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Await(inner) => {
                 let x = self.expr(inner)?;
-                if x.code.ends_with(".await") {
+                // Already awaited where it is made, or a value that was never a promise.
+                if x.code.ends_with(".await")
+                    || matches!(
+                        self.p.calls.get(&inner.id),
+                        Some(Callee::Builtin("Promise.all" | "Promise.resolve"))
+                    )
+                {
                     return Ok(x);
                 }
                 Ok(E::owned(
@@ -298,7 +304,11 @@ impl<'a> Gen<'a> {
     /// An expression as the context wants it.
     pub(super) fn expr_as(&mut self, e: &'a Expr, want: Want) -> GResult<String> {
         let ty = self.ty_of(e);
-        let x = self.expr(e)?;
+        let x = if want == Want::RefMut {
+            self.expr_mut_root(e)?
+        } else {
+            self.expr(e)?
+        };
         Ok(match want {
             Want::Owned => self.owned(x, &ty),
             other => self.coerce(x, &ty, other),
@@ -380,11 +390,30 @@ impl<'a> Gen<'a> {
                 Ok(E::atom(self.name(binding), repr))
             }
             _ => {
+                let mutable = std::mem::take(&mut self.want_mut_root);
+                if self.shared.contains(&binding) {
+                    // Shared with a closure: read or written through the cell.
+                    let borrow = if mutable { "borrow_mut" } else { "borrow" };
+                    return Ok(E::new(
+                        format!("(*{}.{borrow}())", self.name(binding)),
+                        PREC_ATOM,
+                        Repr::Place,
+                    ));
+                }
                 let mut x = E::atom(self.name(binding), self.repr_of(binding));
                 x.var = Some((binding, e.id));
                 Ok(x)
             }
         }
+    }
+
+    /// An expression that is written through (an assignment target, a receiver of a
+    /// changing method): a shared variable at its root is borrowed mutably.
+    pub(super) fn expr_mut_root(&mut self, e: &'a Expr) -> GResult<E> {
+        self.want_mut_root = true;
+        let r = self.expr(e);
+        self.want_mut_root = false;
+        r
     }
 
     fn template(&mut self, quasis: &[String], exprs: &'a [Expr]) -> GResult<E> {
@@ -982,7 +1011,7 @@ impl<'a> Gen<'a> {
         }
     }
 
-    fn as_f64(&mut self, x: &E) -> String {
+    pub(super) fn as_f64(&mut self, x: &E) -> String {
         if is_int_literal_e(x) {
             return format!("{}.0", x.code);
         }
@@ -1766,6 +1795,24 @@ impl<'a> Gen<'a> {
             labels: 0,
         });
         let body = match &f.body {
+            FnBody::Expr(x) if matches!(self.resolve(&ret_ty), Ty::Void) => {
+                // The value of the expression is dropped: a statement.
+                let xt = self.ty_of(x);
+                let plain_call = matches!(self.resolve(&xt), Ty::Void)
+                    && matches!(
+                        x.kind,
+                        ExprKind::Call { .. } | ExprKind::New { .. } | ExprKind::Await(_)
+                    );
+                let r = if plain_call {
+                    self.expr(x).map(|e| e.code)
+                } else {
+                    self.capture(|g| g.expr_stmt(x))
+                        .map(|text| format!("{{ {} }}", text.trim()))
+                };
+                self.fns.pop();
+                self.pop_scope();
+                r?
+            }
             FnBody::Expr(x) => {
                 let r = self.expr_to(x, &ret_ty);
                 self.fns.pop();
@@ -1797,9 +1844,26 @@ impl<'a> Gen<'a> {
             }
         };
         let m = if info.escapes { "move " } else { "" };
+        let code = format!("{m}|{}| {body}", params.join(", "));
+        // A kept closure takes its own handle on each shared variable.
+        let clones: Vec<String> = if info.escapes {
+            info.captures
+                .iter()
+                .filter(|c| self.shared.contains(c))
+                .map(|c| {
+                    let n = self.name(*c);
+                    format!("let {n} = {n}.clone(); ")
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if clones.is_empty() {
+            return Ok(E::owned(code, PREC_ASSIGN));
+        }
         Ok(E::owned(
-            format!("{m}|{}| {body}", params.join(", ")),
-            PREC_ASSIGN,
+            format!("{{ {}{code} }}", clones.join("")),
+            PREC_ATOM,
         ))
     }
 }
