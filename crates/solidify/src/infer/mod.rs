@@ -213,6 +213,8 @@ pub struct StructInfo {
     /// `class C extends P`: the base class.
     pub parent: Option<String>,
     pub is_abstract: bool,
+    /// `class C implements I`: the interfaces (also those a class is found to satisfy).
+    pub implements: Vec<String>,
 }
 
 impl StructInfo {
@@ -389,9 +391,14 @@ impl Program {
         out
     }
 
-    /// Whether `class` is `base` or descends from it.
+    /// Whether `class` is `base`, descends from it, or implements it.
     pub fn is_subclass(&self, class: &str, base: &str) -> bool {
-        self.ancestry(class).iter().any(|c| c == base)
+        self.ancestry(class).iter().any(|c| {
+            c == base
+                || self
+                    .struct_info(c)
+                    .is_some_and(|s| s.implements.iter().any(|i| i == base))
+        })
     }
 
     /// The classes descending from `base` (not `base` itself).
@@ -968,7 +975,12 @@ impl<'m> Infer<'m> {
     }
 
     pub(super) fn is_subclass(&self, class: &str, base: &str) -> bool {
-        self.ancestry(class).iter().any(|c| c == base)
+        self.ancestry(class).iter().any(|c| {
+            c == base
+                || self
+                    .struct_by_name(c)
+                    .is_some_and(|s| s.implements.iter().any(|i| i == base))
+        })
     }
 
     /// A method of the class or of an ancestor, with the class declaring it.
@@ -1023,16 +1035,88 @@ impl<'m> Infer<'m> {
         let (Ty::Named(base), Ty::Named(class)) = (target, found) else {
             return false;
         };
-        if base == class
-            || self
-                .struct_by_name(&base)
-                .is_none_or(|s| s.kind != StructKind::Class)
-            || !self.is_subclass(&class, &base)
+        if base == class {
+            return false;
+        }
+        let Some(base_info) = self.struct_by_name(&base).cloned() else {
+            return false;
+        };
+        if self
+            .struct_by_name(&class)
+            .is_none_or(|s| s.kind != StructKind::Class)
         {
             return false;
         }
+        match base_info.kind {
+            StructKind::Class => {
+                if !self.is_subclass(&class, &base) {
+                    return false;
+                }
+            }
+            // An interface the class declares, or satisfies with its fields and methods.
+            _ => {
+                if !self.is_subclass(&class, &base) {
+                    if !self.satisfies(&class, &base_info) {
+                        return false;
+                    }
+                    if let Some(s) = self.struct_mut(&class) {
+                        s.implements.push(base.clone());
+                    }
+                }
+            }
+        }
         self.polymorphic.insert(base);
         true
+    }
+
+    /// Whether a class has every field and method of an interface, with the same types.
+    fn satisfies(&mut self, class: &str, iface: &StructInfo) -> bool {
+        for f in &iface.fields {
+            let Some(cf) = self.ancestry(class).iter().find_map(|c| {
+                self.struct_by_name(c)
+                    .and_then(|s| s.field(&f.name).cloned())
+            }) else {
+                return false;
+            };
+            if cf.optional != f.optional || self.types.unify(&cf.ty, &f.ty).is_err() {
+                return false;
+            }
+        }
+        for m in &iface.methods {
+            let Some((_, cm)) = self.find_method(class, &m.name, m.kind) else {
+                return false;
+            };
+            let (a, b) = (
+                self.funcs[&m.fn_id].sig.clone(),
+                self.funcs[&cm.fn_id].sig.clone(),
+            );
+            if a.params.len() != b.params.len()
+                || a.params
+                    .iter()
+                    .zip(&b.params)
+                    .any(|(x, y)| self.types.unify(x, y).is_err())
+                || self.types.unify(&a.ret, &b.ret).is_err()
+            {
+                return false;
+            }
+            self.link_implementation(m.fn_id, cm.fn_id);
+        }
+        true
+    }
+
+    /// The method of a class implements one of an interface: the calls through the
+    /// interface are dispatched to it.
+    pub(super) fn link_implementation(&mut self, iface_fn: NodeId, class_fn: NodeId) {
+        let params = self.funcs[&class_fn].params.clone();
+        if let Some(f) = self.funcs.get_mut(&iface_fn)
+            && f.params.is_empty()
+        {
+            f.params = params;
+        }
+        let list = self.overrides.entry(iface_fn).or_default();
+        if !list.contains(&class_fn) {
+            list.push(class_fn);
+        }
     }
 
     /// The union a type names, if any.

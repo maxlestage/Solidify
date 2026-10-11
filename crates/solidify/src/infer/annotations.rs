@@ -8,7 +8,7 @@ use super::{
 };
 use crate::ast::*;
 use crate::error::Span;
-use crate::infer::pascal;
+use crate::infer::{FnInfo, MethodInfo, pascal};
 use crate::types::{Flavor, FuncTy, Ty};
 
 /// The field of inline object types that holds a different string literal in each: the
@@ -343,6 +343,7 @@ impl<'m> Infer<'m> {
             statics: Vec::new(),
             parent: None,
             is_abstract: false,
+            implements: Vec::new(),
         });
         let fields = self.fields_from_members(name, members)?;
         self.struct_mut(name).expect("struct").fields = fields;
@@ -354,7 +355,27 @@ impl<'m> Infer<'m> {
         owner: &str,
         members: &[TypeMember],
     ) -> IResult<Vec<FieldInfo>> {
+        let (fields, methods) = self.members_of(owner, members)?;
+        if let Some(m) = methods.first() {
+            return self.err(
+                format!(
+                    "`{}` has a method (`{}`): only an interface can declare methods",
+                    owner, m.name
+                ),
+                self.funcs[&m.fn_id].span,
+            );
+        }
+        Ok(fields)
+    }
+
+    /// The fields and the method signatures of an interface or an object type.
+    pub(super) fn members_of(
+        &mut self,
+        owner: &str,
+        members: &[TypeMember],
+    ) -> IResult<(Vec<FieldInfo>, Vec<MethodInfo>)> {
         let mut fields = Vec::new();
+        let mut methods = Vec::new();
         for m in members {
             match m {
                 TypeMember::Prop {
@@ -384,13 +405,25 @@ impl<'m> Infer<'m> {
                         span: *span,
                     });
                 }
-                TypeMember::Method { name, span, .. } => {
-                    return self.err(
-                        format!(
-                            "interface methods are not supported (`{name}`): use a class, or a field of function type"
-                        ),
-                        *span,
-                    );
+                TypeMember::Method {
+                    name,
+                    type_params,
+                    params,
+                    ret,
+                    optional,
+                    span,
+                } => {
+                    if !type_params.is_empty() {
+                        return self.err("generic interface methods are not supported", *span);
+                    }
+                    if *optional {
+                        return self.err(
+                            format!("optional methods are not supported (`{name}?`)"),
+                            *span,
+                        );
+                    }
+                    let method = self.interface_method(owner, name, params, ret, *span)?;
+                    methods.push(method);
                 }
                 TypeMember::Index { span, .. } => {
                     return self.err(
@@ -403,6 +436,92 @@ impl<'m> Infer<'m> {
                 }
             }
         }
-        Ok(fields)
+        Ok((fields, methods))
+    }
+
+    /// The signature of an interface method: an abstract method of the interface, which
+    /// the classes implementing it provide.
+    fn interface_method(
+        &mut self,
+        owner: &str,
+        name: &str,
+        params: &[Param],
+        ret: &Option<TypeAnn>,
+        span: Span,
+    ) -> IResult<MethodInfo> {
+        let mut ptys = Vec::new();
+        let mut optional = Vec::new();
+        let mut defaults = Vec::new();
+        for p in params {
+            if p.rest {
+                return self.err(
+                    "rest parameters in interface methods are not supported",
+                    p.span,
+                );
+            }
+            let hint = match &p.pat {
+                Pattern::Ident { name, .. } => name.clone(),
+                _ => String::new(),
+            };
+            let mut ty = match &p.ty {
+                Some(t) => self.ann(t, &hint)?,
+                None => self.types.fresh(),
+            };
+            if p.optional {
+                ty = match self.types.resolve(&ty) {
+                    Ty::Option(t) => Ty::Option(t),
+                    t => Ty::Option(Box::new(t)),
+                };
+            }
+            ptys.push(ty);
+            optional.push(p.optional);
+            defaults.push(false);
+        }
+        let ret_ty = match ret {
+            Some(t) => self.ann(t, name)?,
+            None => Ty::Void,
+        };
+        let id = self.synth_id();
+        self.funcs.insert(
+            id,
+            FnInfo {
+                id,
+                name: Some(name.to_string()),
+                params: Vec::new(),
+                optional,
+                defaults,
+                sig: FuncTy {
+                    params: ptys,
+                    ret: ret_ty,
+                },
+                type_params: Vec::new(),
+                throws: false,
+                throw_direct: false,
+                is_async: matches!(ret, Some(TypeAnn::Named { name, .. }) if name == "Promise"),
+                is_arrow: false,
+                method_of: Some(owner.to_string()),
+                method_kind: Some(MethodKind::Method),
+                is_static: false,
+                is_abstract: true,
+                rest: false,
+                mutates_self: false,
+                captures: Vec::new(),
+                escapes: false,
+                is_closure: false,
+                parent: None,
+                calls: Vec::new(),
+                uses_this: false,
+                exported: false,
+                span,
+            },
+        );
+        Ok(MethodInfo {
+            name: name.to_string(),
+            fn_id: id,
+            kind: MethodKind::Method,
+            is_static: false,
+            is_abstract: true,
+            access: None,
+        })
     }
 }
