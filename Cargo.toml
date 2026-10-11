@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/solidify", "site"]
+members = ["crates/solidify", "site", "site/worker"]
 
 [profile.release]
 opt-level = 3
