@@ -153,7 +153,7 @@ Cuatro reglas que conviene conocer:
 | [`crates/solidify`](crates/solidify) | El transpilador: lexer, parser, inferencia de tipos, generación de código, línea de comandos |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programas traducidos, compilados con `rustc` y comparados con lo que imprime Node.js (una carpeta contiene un programa de varios archivos) |
 | [`npm`](npm) | El paquete `solidify-rs` para `npx`: un lanzador Node.js del transpilador compilado a WebAssembly (WASI), comprobado contra los programas de prueba con `node npm/test.js` |
-| [`site`](site) | El sitio web: un playground que ejecuta Solidify en WebAssembly, escrito con [active](https://github.com/maxlestage/Active) |
+| [`site`](site) | El sitio web, escrito con [active](https://github.com/maxlestage/Active): un playground que ejecuta Solidify en WebAssembly, tres idiomas elegidos automáticamente o a mano, una app instalable que funciona sin conexión, muchas animaciones. [`site/README.md`](site/README.md) lo documenta todo |
 
 ## Desarrollo
 

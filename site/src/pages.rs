@@ -53,6 +53,9 @@ pub fn home(lang: Lang, origin: &str) -> String {
     seo = seo.alternate("x-default", Lang::En.path());
     let body = fragment([
         skip_link(lang),
+        // Decorations driven by app.js: reading progress and the light under the pointer.
+        div().class("progress").attr("aria-hidden", "true"),
+        div().class("glow").attr("aria-hidden", "true"),
         header(lang),
         main_content(lang),
         footer(lang),
@@ -85,8 +88,29 @@ fn head_extra() -> String {
         link("/static/apple-touch-icon.png"),
         link("/static/fonts/geist-latin-wght-normal.woff2"),
         link("/static/fonts/geist-mono-latin-wght-normal.woff2"),
-    ) + &crate::pwa::register_script(&link("/sw.js"))
+    ) + LANGUAGE_SCRIPT
+        + &format!(
+            "<script src=\"{}\" defer=\"\"></script>",
+            link("/static/app.js")
+        )
+        + &crate::pwa::register_script(&link("/sw.js"))
 }
+
+/// Runs before the page is drawn: marks that scripts run (the hero's entrance waits for
+/// app.js, or 2.5 s at most), and opens the page in the visitor's language. A language picked in the menu is kept
+/// (`localStorage`); without one, the browser's languages decide, on the English home
+/// page only, so that a link to `/fr/` or `/es/` stays where it leads.
+const LANGUAGE_SCRIPT: &str = "<script>(function(){\
+var d=document.documentElement;d.classList.add(\"js\");\
+setTimeout(function(){d.classList.add(\"ready\")},2500);\
+var base=d.getAttribute(\"data-base\")||\"\",here=d.lang,pick=null;\
+try{pick=localStorage.getItem(\"solidify-lang\")}catch(e){}\
+if(!pick){if(here!==\"en\")return;var ls=navigator.languages||[navigator.language||\"en\"];\
+for(var i=0;i<ls.length;i++){var c=String(ls[i]).slice(0,2).toLowerCase();\
+if(c===\"en\"||c===\"fr\"||c===\"es\"){pick=c;break}}}\
+if(pick&&pick!==here&&(pick===\"en\"||pick===\"fr\"||pick===\"es\")){\
+location.replace(base+(pick===\"en\"?\"/\":\"/\"+pick+\"/\")+location.hash)}\
+})()</script>";
 
 fn json_ld(lang: Lang) -> String {
     let d = t(lang);
@@ -131,9 +155,26 @@ fn logo() -> Element {
         )
 }
 
+/// The sections, in order: anchor and menu label.
+fn sections(lang: Lang) -> [(&'static str, &'static str); 4] {
+    let d = t(lang);
+    [
+        ("playground", d.nav.playground),
+        ("how", d.nav.how),
+        ("supported", d.nav.supported),
+        ("install", d.nav.install),
+    ]
+}
+
+/// The bar at the top: the logo, the sections (a menu on small screens), the install
+/// button, the language picker.
 fn header(lang: Lang) -> Element {
     let d = t(lang);
-    let nav_link = |href: &'static str, label: &'static str| a().href(href).text(label);
+    let links = sections(lang).map(|(id, label)| {
+        a().href(format!("#{id}"))
+            .attr("data-spy", id)
+            .child(span().text(label))
+    });
     el("header")
         .class("top")
         .child(
@@ -144,12 +185,19 @@ fn header(lang: Lang) -> Element {
         )
         .child(
             nav()
+                .id("menu")
+                .class("menu")
                 .attr("aria-label", "Menu")
-                .child(nav_link("#playground", d.nav.playground))
-                .child(nav_link("#how", d.nav.how))
-                .child(nav_link("#supported", d.nav.supported))
-                .child(nav_link("#install", d.nav.install))
-                .child(a().href(GITHUB).attr("rel", "external").text(d.nav.github))
+                .children(links)
+                .child(
+                    a().href(GITHUB)
+                        .attr("rel", "external")
+                        .child(span().text(d.nav.github)),
+                ),
+        )
+        .child(
+            div()
+                .class("tools")
                 .child(
                     button()
                         .id("install-app")
@@ -158,28 +206,73 @@ fn header(lang: Lang) -> Element {
                         .attr("hidden", "")
                         .text(d.nav.install_app),
                 )
-                .child(lang_switch(lang)),
+                .child(lang_picker(lang))
+                .child(
+                    button()
+                        .class("menu-toggle")
+                        .attr("type", "button")
+                        .attr("aria-controls", "menu")
+                        .attr("aria-expanded", "false")
+                        .attr("data-open", d.nav.menu)
+                        .attr("data-close", d.nav.close)
+                        .attr("aria-label", d.nav.menu)
+                        .child(span().class("bars").attr("aria-hidden", "true")),
+                ),
         )
 }
 
-/// The other languages, by their code (`FR`, `ES`), named in full for screen readers.
-fn lang_switch(lang: Lang) -> Element {
-    let mut list = span().class("langs");
+/// The language picker: works without scripts (`<details>`); app.js remembers the
+/// choice, and "Automatic" hands it back to the browser.
+fn lang_picker(lang: Lang) -> Element {
+    let d = t(lang);
+    let mut list = ul().class("lang-list").attr("role", "list");
     for other in Lang::ALL {
+        let mut item = a()
+            .href(link(other.path()))
+            .attr("hreflang", other.code())
+            .attr("lang", other.code())
+            .attr("data-lang", other.code())
+            .child(span().class("code").text(other.code().to_uppercase()))
+            .child(span().text(t(other).lang_name));
         if other == lang {
-            continue;
+            item = item.attr("aria-current", "true");
         }
-        list = list.child(
-            a().class("lang")
-                .href(link(other.path()))
-                .attr("hreflang", other.code())
-                .attr("lang", other.code())
-                .attr("title", t(other).lang_name)
-                .attr("aria-label", t(other).lang_name)
-                .text(other.code().to_uppercase()),
-        );
+        list = list.child(li().child(item));
     }
-    list
+    list = list.child(
+        li().class("auto").child(
+            a().href(link(Lang::En.path()))
+                .attr("data-lang", "auto")
+                .child(span().class("code").text("A"))
+                .child(span().text(d.nav.automatic)),
+        ),
+    );
+    el("details")
+        .class("lang-picker")
+        .child(
+            el("summary")
+                .attr(
+                    "aria-label",
+                    format!("{} : {}", d.nav.language, d.lang_name),
+                )
+                .child(globe())
+                .child(span().text(lang.code().to_uppercase()))
+                .child(span().class("chev").attr("aria-hidden", "true")),
+        )
+        .child(list)
+}
+
+fn globe() -> Element {
+    svg()
+        .attr("viewBox", "0 0 24 24")
+        .attr("width", "16")
+        .attr("height", "16")
+        .attr("aria-hidden", "true")
+        .attr("fill", "none")
+        .attr("stroke", "currentColor")
+        .attr("stroke-width", "1.6")
+        .child(el("circle").attr("cx", "12").attr("cy", "12").attr("r", "9"))
+        .child(el("path").attr("d", "M3 12h18M12 3c2.5 2.6 3.8 5.6 3.8 9s-1.3 6.4-3.8 9M12 3c-2.5 2.6-3.8 5.6-3.8 9s1.3 6.4 3.8 9"))
 }
 
 fn main_content(lang: Lang) -> Element {
@@ -187,13 +280,20 @@ fn main_content(lang: Lang) -> Element {
     main()
         .id("main")
         .child(hero(lang))
+        .child(marquee())
         .child(
             section()
                 .id("playground")
                 .class("block")
-                .child(h2().text(d.play.title))
-                .child(p().class("lead").text(d.play.lead))
-                .child(island("playground", lang.code(), playground)),
+                .child(kicker(1, d.nav.playground))
+                .child(split(h2(), d.play.title))
+                .child(p().class("lead").attr("data-reveal", "").text(d.play.lead))
+                .child(
+                    div()
+                        .class("play-wrap")
+                        .attr("data-reveal", "scale")
+                        .child(island("playground", lang.code(), playground)),
+                ),
         )
         .child(how(lang))
         .child(supported(lang))
@@ -204,41 +304,177 @@ fn hero(lang: Lang) -> Element {
     let d = t(lang);
     section()
         .class("hero")
-        .child(p().class("eyebrow").text(d.hero.eyebrow))
-        .child(emphasized(h1(), d.hero.title))
-        .child(p().class("lead").text(d.hero.lead))
+        .child(aurora())
         .child(
-            div()
-                .class("cta")
-                .child(
-                    a().class("button primary")
-                        .href("#playground")
-                        .text(d.hero.cta),
-                )
-                .child(a().class("button").href("#install").text(d.hero.cta2)),
+            p().class("eyebrow intro")
+                .attr("style", "--d:0")
+                .child(span().class("dot").attr("aria-hidden", "true"))
+                .text(d.hero.eyebrow),
+        )
+        .child(emphasized(h1(), d.hero.title))
+        .child(
+            p().class("lead intro")
+                .attr("style", "--d:6")
+                .text(d.hero.lead),
         )
         .child(
-            ul().class("facts")
+            div()
+                .class("cta intro")
+                .attr("style", "--d:8")
+                .child(
+                    a().class("button primary magnetic")
+                        .href("#playground")
+                        .child(span().text(d.hero.cta))
+                        .child(arrow()),
+                )
+                .child(
+                    a().class("button magnetic")
+                        .href("#install")
+                        .child(span().text(d.hero.cta2))
+                        .child(arrow()),
+                ),
+        )
+        .child(
+            ul().class("facts intro")
+                .attr("style", "--d:10")
                 .children(d.hero.facts.iter().map(|(value, label)| {
-                    li().child(strong().text(*value)).child(span().text(*label))
+                    li().child(strong().attr("data-count", *value).text(*value))
+                        .child(span().text(*label))
                 })),
+        )
+        .child(
+            a().class("scroll-cue")
+                .href("#playground")
+                .attr("aria-label", d.nav.playground)
+                .child(span().attr("aria-hidden", "true")),
         )
 }
 
-/// A title where `*words*` are set in the accent serif.
+/// A title where `*words*` are set in the accent serif. Each word sits in a mask it
+/// rises out of when the page opens (`--i` orders them).
 fn emphasized(root: Element, text: &str) -> Element {
-    let mut root = root;
+    let mut root = root.class("split");
+    let mut n = 0;
     for (i, part) in text.split('*').enumerate() {
-        if part.is_empty() {
-            continue;
+        for (j, word) in part.split(' ').enumerate() {
+            if j > 0 {
+                root = root.text(" ");
+            }
+            if word.is_empty() {
+                continue;
+            }
+            let inner = if i % 2 == 1 {
+                // A trailing period stays upright.
+                match word.strip_suffix('.') {
+                    Some(w) => span()
+                        .class("w-in")
+                        .child(em().text(w.to_string()))
+                        .text("."),
+                    None => span().class("w-in").child(em().text(word.to_string())),
+                }
+            } else {
+                span().class("w-in").text(word.to_string())
+            };
+            root = root.child(
+                span()
+                    .class("w")
+                    .attr("style", format!("--i:{n}"))
+                    .child(inner),
+            );
+            n += 1;
         }
-        root = if i % 2 == 1 {
-            root.child(em().text(part.to_string()))
-        } else {
-            root.text(part.to_string())
-        };
     }
     root
+}
+
+/// A heading whose words rise in turn when it scrolls into view.
+fn split(root: Element, text: &str) -> Element {
+    emphasized(root.attr("data-reveal", "words"), text)
+}
+
+/// `01 — Playground` above a section's title.
+fn kicker(n: usize, label: &str) -> Element {
+    p().class("kicker")
+        .attr("data-reveal", "")
+        .child(span().class("kicker-n").text(format!("{n:02}")))
+        .child(span().class("kicker-line").attr("aria-hidden", "true"))
+        .text(label.to_string())
+}
+
+/// The light behind the hero: blurred shapes drifting slowly, over a fading grid.
+fn aurora() -> Element {
+    div()
+        .class("aurora")
+        .attr("aria-hidden", "true")
+        .child(span().class("blob b1"))
+        .child(span().class("blob b2"))
+        .child(span().class("blob b3"))
+        .child(span().class("grid"))
+}
+
+fn arrow() -> Element {
+    svg()
+        .class("arrow")
+        .attr("viewBox", "0 0 16 16")
+        .attr("width", "14")
+        .attr("height", "14")
+        .attr("aria-hidden", "true")
+        .attr("fill", "none")
+        .attr("stroke", "currentColor")
+        .attr("stroke-width", "1.8")
+        .child(el("path").attr("d", "M3 8h10M9 4l4 4-4 4"))
+}
+
+/// What becomes what, on two bands sliding in opposite directions. The same in every
+/// language: code reads the same everywhere.
+const PAIRS: [(&str, &str); 16] = [
+    ("T | null", "Option<T>"),
+    ("throw", "Result<T, E>"),
+    ("interface", "struct"),
+    ("A | B", "enum"),
+    ("async / await", "Promise<T>"),
+    ("xs.map(f)", "iter().map(f)"),
+    ("Map<K, V>", "HashMap<K, V>"),
+    ("extends", "trait"),
+    ("bigint", "JsBigInt"),
+    ("switch", "match"),
+    ("a?.b", "map(|a| a.b)"),
+    ("function*", "JsGenerator<T>"),
+    ("for … of", "for x in &v"),
+    ("number", "i64 · f64"),
+    ("JSON.parse", "JsFromJson"),
+    ("import", "mod"),
+];
+
+fn marquee() -> Element {
+    let band = |pairs: &[(&'static str, &'static str)], reverse: bool| {
+        let chips = |hidden: bool| {
+            let mut group = div().class("marquee-group");
+            if hidden {
+                group = group.attr("aria-hidden", "true");
+            }
+            group.children(pairs.iter().map(|(ts, rs)| {
+                span()
+                    .class("chip")
+                    .child(code().class("ts").text(*ts))
+                    .child(span().class("to").attr("aria-hidden", "true").text("→"))
+                    .child(code().class("rs").text(*rs))
+            }))
+        };
+        div()
+            .class(if reverse {
+                "marquee-row reverse"
+            } else {
+                "marquee-row"
+            })
+            .child(chips(false))
+            .child(chips(true))
+    };
+    div()
+        .class("marquee")
+        .attr("data-reveal", "")
+        .child(band(&PAIRS[..8], false))
+        .child(band(&PAIRS[8..], true))
 }
 
 /// Text where `` `code` `` becomes `<code>`.
@@ -261,24 +497,35 @@ fn how(lang: Lang) -> Element {
     section()
         .id("how")
         .class("block")
-        .child(h2().text(d.how.title))
-        .child(p().class("lead").text(d.how.lead))
+        .child(kicker(2, d.nav.how))
+        .child(split(h2(), d.how.title))
+        .child(p().class("lead").attr("data-reveal", "").text(d.how.lead))
         .child(
             ol().class("steps")
                 .children(d.how.steps.iter().enumerate().map(|(i, (title, text))| {
-                    li().child(span().class("num").text((i + 1).to_string()))
+                    li().class("spot")
+                        .attr("data-reveal", "")
+                        .attr("style", format!("--i:{i}"))
+                        .child(span().class("num").text((i + 1).to_string()))
                         .child(h3().text(*title))
                         .child(p().children(rich(text)))
                 })),
         )
-        .child(h3().class("sub").text(d.how.rules_title))
         .child(
-            dl().class("rules")
-                .children(d.how.rules.iter().flat_map(|(title, text)| {
-                    [
-                        Node::from(dt().text(*title)),
-                        Node::from(dd().children(rich(text))),
-                    ]
+            h3().class("sub")
+                .attr("data-reveal", "")
+                .text(d.how.rules_title),
+        )
+        .child(
+            div()
+                .class("rules")
+                .children(d.how.rules.iter().enumerate().map(|(i, (title, text))| {
+                    div()
+                        .class("rule spot")
+                        .attr("data-reveal", "")
+                        .attr("style", format!("--i:{i}"))
+                        .child(h4().text(*title))
+                        .child(p().children(rich(text)))
                 })),
         )
 }
@@ -288,11 +535,17 @@ fn supported(lang: Lang) -> Element {
     section()
         .id("supported")
         .class("block")
-        .child(h2().text(d.supported.title))
-        .child(p().class("lead").text(d.supported.lead))
+        .child(kicker(3, d.nav.supported))
+        .child(split(h2(), d.supported.title))
+        .child(
+            p().class("lead")
+                .attr("data-reveal", "")
+                .text(d.supported.lead),
+        )
         .child(
             table()
                 .class("mapping")
+                .attr("data-reveal", "rows")
                 .child(
                     thead().child(
                         tr().child(th().text(d.supported.head.0))
@@ -304,8 +557,13 @@ fn supported(lang: Lang) -> Element {
                         .child(td().text(*rs))
                 }))),
         )
-        .child(h3().class("sub").text(d.supported.limits_title))
-        .child(p().children(rich(d.supported.limits)))
+        .child(
+            div()
+                .class("limits spot")
+                .attr("data-reveal", "")
+                .child(h3().text(d.supported.limits_title))
+                .child(p().children(rich(d.supported.limits))),
+        )
 }
 
 fn install(lang: Lang) -> Element {
@@ -317,22 +575,37 @@ fn install(lang: Lang) -> Element {
         };
         div()
             .class("snippet")
+            .attr("data-reveal", "")
             .child(h3().text(title))
-            .child(pre().child(code().html(html)))
+            .child(pre().class("spot").child(code().html(html)))
     };
     section()
         .id("install")
         .class("block")
-        .child(h2().text(d.install.title))
-        .child(p().class("lead").text(d.install.lead))
+        .child(kicker(4, d.nav.install))
+        .child(split(h2(), d.install.title))
+        .child(
+            p().class("lead")
+                .attr("data-reveal", "")
+                .text(d.install.lead),
+        )
         .child(block(d.install.cli, INSTALL_CLI, None))
         .child(block(d.install.check, INSTALL_CHECK, None))
         .child(
             div()
                 .class("snippet")
+                .attr("data-reveal", "")
                 .child(h3().text(d.install.library))
-                .child(pre().child(code().html(shell_html(CARGO_LIB))))
-                .child(pre().child(code().html(highlight(INSTALL_LIB, Language::Rust)))),
+                .child(
+                    pre()
+                        .class("spot")
+                        .child(code().html(shell_html(CARGO_LIB))),
+                )
+                .child(
+                    pre()
+                        .class("spot")
+                        .child(code().html(highlight(INSTALL_LIB, Language::Rust))),
+                ),
         )
 }
 
@@ -356,44 +629,139 @@ fn shell_html(text: &str) -> String {
     out
 }
 
+pub const NPM: &str = "https://www.npmjs.com/package/solidify-rs";
+const ISSUES: &str = "https://github.com/maxlestage/Solidify/issues";
+const DOCS: [&str; 3] = [
+    "https://github.com/maxlestage/Solidify#readme",
+    "https://github.com/maxlestage/Solidify/blob/master/README.fr.md",
+    "https://github.com/maxlestage/Solidify/blob/master/README.es.md",
+];
+
+/// The footer: the brand and the command to run it, then the product, resources,
+/// languages and family columns, a large wordmark, and the legal line.
 fn footer(lang: Lang) -> Element {
     let d = t(lang);
+    let f = &d.footer;
+    let column = |title: &'static str, links: Vec<Element>, i: usize| {
+        div()
+            .class("foot-col")
+            .attr("data-reveal", "")
+            .attr("style", format!("--i:{i}"))
+            .child(h2().class("foot-title").text(title))
+            .child(
+                ul().attr("role", "list")
+                    .children(links.into_iter().map(|l| li().child(l))),
+            )
+    };
+    let external = |href: &'static str, label: &'static str| {
+        a().href(href)
+            .attr("rel", "external")
+            .child(span().text(label))
+    };
+    let docs = DOCS[match lang {
+        Lang::En => 0,
+        Lang::Fr => 1,
+        Lang::Es => 2,
+    }];
+    let product: Vec<Element> = sections(lang)
+        .into_iter()
+        .map(|(id, label)| a().href(format!("#{id}")).child(span().text(label)))
+        .collect();
+    let resources = vec![
+        external(docs, f.docs),
+        external(GITHUB, f.source),
+        external(NPM, f.npm),
+        external(ISSUES, f.issues),
+        external(LICENSE, f.license_link),
+    ];
+    let languages: Vec<Element> = Lang::ALL
+        .iter()
+        .map(|other| {
+            let mut l = a()
+                .href(link(other.path()))
+                .attr("hreflang", other.code())
+                .attr("lang", other.code())
+                .attr("data-lang", other.code())
+                .child(span().text(t(*other).lang_name));
+            if *other == lang {
+                l = l.attr("aria-current", "true");
+            }
+            l
+        })
+        .chain(std::iter::once(
+            a().href(link(Lang::En.path()))
+                .attr("data-lang", "auto")
+                .child(span().text(d.nav.automatic)),
+        ))
+        .collect();
+    let family: Vec<Element> = FAMILY
+        .iter()
+        .map(|(name, url)| external(url, name))
+        .collect();
     el("footer")
         .class("bottom")
         .child(
-            p().child(span().text(d.footer.made))
-                .text(" ")
-                .child(a().href(AUTHOR_URL).attr("rel", "external").text(AUTHOR))
-                .text(", ")
-                .text(d.footer.family)
-                .text(" ")
-                .children(FAMILY.iter().enumerate().flat_map(|(i, (name, url))| {
-                    let sep: Node = if i + 1 == FAMILY.len() {
-                        ".".into()
-                    } else {
-                        ", ".into()
-                    };
-                    [
-                        a().href(*url).attr("rel", "external").text(*name).into(),
-                        sep,
-                    ]
-                })),
+            div()
+                .class("foot-grid")
+                .child(
+                    div()
+                        .class("foot-brand")
+                        .attr("data-reveal", "")
+                        .child(
+                            a().class("brand")
+                                .href(link(lang.path()))
+                                .child(logo())
+                                .child(span().text("Solidify")),
+                        )
+                        .child(p().class("foot-tagline").text(f.tagline))
+                        .child(
+                            div()
+                                .class("npx")
+                                .child(code().text("npx solidify-rs main.ts"))
+                                .child(
+                                    button()
+                                        .class("npx-copy")
+                                        .attr("type", "button")
+                                        .attr("data-copy", "npx solidify-rs main.ts")
+                                        .attr("data-done", f.copied)
+                                        .text(f.copy),
+                                ),
+                        )
+                        .child(
+                            p().class("status")
+                                .child(span().class("pulse").attr("aria-hidden", "true"))
+                                .text(f.status),
+                        ),
+                )
+                .child(column(f.product, product, 1))
+                .child(column(f.resources, resources, 2))
+                .child(column(d.nav.language, languages, 3))
+                .child(column(f.projects, family, 4)),
         )
         .child(
-            p().class("fine")
+            div()
+                .class("wordmark-wrap")
+                .attr("aria-hidden", "true")
+                .child(p().class("wordmark").text("Solidify")),
+        )
+        .child(
+            div()
+                .class("foot-legal")
                 .child(
-                    a().href(LICENSE)
-                        .attr("rel", "external")
-                        .text(d.footer.license),
+                    p().text(format!("© 2026 {AUTHOR}."))
+                        .text(" ")
+                        .child(span().class("fine").text(f.license)),
                 )
-                .text(" · ")
                 .child(
-                    a().href(GITHUB)
-                        .attr("rel", "external")
-                        .text(d.footer.source),
-                )
-                .text(" · ")
-                .text(format!("Solidify {}", env!("CARGO_PKG_VERSION"))),
+                    p().class("foot-meta")
+                        .child(span().text(f.made))
+                        .text(" ")
+                        .child(a().href(AUTHOR_URL).attr("rel", "external").text(AUTHOR))
+                        .text(" · ")
+                        .child(span().text(format!("v{}", env!("CARGO_PKG_VERSION"))))
+                        .text(" · ")
+                        .child(a().class("to-top").href("#main").text(f.top)),
+                ),
         )
 }
 

@@ -25,6 +25,12 @@ pub struct Nav {
     pub skip: &'static str,
     /// The button that installs the site as an app, shown when the browser offers it.
     pub install_app: &'static str,
+    /// The button that opens the menu on small screens, and closes it.
+    pub menu: &'static str,
+    pub close: &'static str,
+    /// The language picker: its label, and the choice that follows the browser.
+    pub language: &'static str,
+    pub automatic: &'static str,
 }
 
 pub struct Hero {
@@ -80,6 +86,22 @@ pub struct Footer {
     pub family: &'static str,
     pub license: &'static str,
     pub source: &'static str,
+    /// One sentence under the logo.
+    pub tagline: &'static str,
+    /// Column titles.
+    pub product: &'static str,
+    pub resources: &'static str,
+    pub projects: &'static str,
+    /// Links of the resources column.
+    pub docs: &'static str,
+    pub npm: &'static str,
+    pub issues: &'static str,
+    pub license_link: &'static str,
+    /// The bottom line: a status, and the way back up.
+    pub status: &'static str,
+    pub top: &'static str,
+    pub copy: &'static str,
+    pub copied: &'static str,
 }
 
 pub fn t(lang: Lang) -> &'static Dict {
@@ -103,13 +125,17 @@ static EN: Dict = Dict {
         github: "GitHub",
         skip: "Skip to content",
         install_app: "Install the app",
+        menu: "Menu",
+        close: "Close",
+        language: "Language",
+        automatic: "Automatic",
     },
     hero: Hero {
         eyebrow: "A transpiler written in Rust, no dependency",
         title: "Write *TypeScript*. Ship *Rust*.",
         lead: "Solidify reads TypeScript or JavaScript and writes the Rust you would write by hand: structs, enums, Option, Result, iterators, ownership. No virtual machine and no garbage collector in the output, a plain Rust program.",
         cta: "Try it in the browser",
-        cta2: "Install the CLI",
+        cta2: "Run it with npx",
         facts: [
             ("0", "dependencies"),
             ("54", "programs checked against Node.js"),
@@ -324,6 +350,18 @@ static EN: Dict = Dict {
         family: "as part of one family of Rust projects:",
         license: "Proprietary software, all rights reserved. Free to use as a dependency of your programs.",
         source: "Source on GitHub",
+        tagline: "Write TypeScript or JavaScript, get the Rust you would have written by hand. In your browser, in your terminal with npx, offline as an app.",
+        product: "Product",
+        resources: "Resources",
+        projects: "Rust family",
+        docs: "Documentation",
+        npm: "npm package",
+        issues: "Report an issue",
+        license_link: "License",
+        status: "54 programs checked against Node.js",
+        top: "Back to top",
+        copy: "Copy",
+        copied: "Copied",
     },
 };
 
@@ -340,13 +378,17 @@ static FR: Dict = Dict {
         github: "GitHub",
         skip: "Aller au contenu",
         install_app: "Installer l'app",
+        menu: "Menu",
+        close: "Fermer",
+        language: "Langue",
+        automatic: "Automatique",
     },
     hero: Hero {
         eyebrow: "Un transpileur écrit en Rust, sans dépendance",
         title: "Écrivez du *TypeScript*. Livrez du *Rust*.",
         lead: "Solidify lit du TypeScript ou du JavaScript et écrit le Rust que vous auriez écrit à la main : structs, enums, Option, Result, itérateurs, propriété. Ni machine virtuelle ni ramasse-miettes en sortie, un programme Rust ordinaire.",
         cta: "Essayer dans le navigateur",
-        cta2: "Installer la ligne de commande",
+        cta2: "Lancer avec npx",
         facts: [
             ("0", "dépendance"),
             ("54", "programmes vérifiés contre Node.js"),
@@ -564,6 +606,18 @@ static FR: Dict = Dict {
         family: "au sein d'une même famille de projets Rust :",
         license: "Logiciel propriétaire, tous droits réservés. Libre d'utilisation comme dépendance de vos programmes.",
         source: "Source sur GitHub",
+        tagline: "Écrivez du TypeScript ou du JavaScript, obtenez le Rust que vous auriez écrit à la main. Dans le navigateur, dans le terminal avec npx, hors ligne en app.",
+        product: "Produit",
+        resources: "Ressources",
+        projects: "Famille Rust",
+        docs: "Documentation",
+        npm: "Paquet npm",
+        issues: "Signaler un problème",
+        license_link: "Licence",
+        status: "54 programmes vérifiés contre Node.js",
+        top: "Haut de page",
+        copy: "Copier",
+        copied: "Copié",
     },
 };
 
@@ -580,13 +634,17 @@ static ES: Dict = Dict {
         github: "GitHub",
         skip: "Ir al contenido",
         install_app: "Instalar la app",
+        menu: "Menú",
+        close: "Cerrar",
+        language: "Idioma",
+        automatic: "Automático",
     },
     hero: Hero {
         eyebrow: "Un transpilador escrito en Rust, sin dependencias",
         title: "Escribe *TypeScript*. Entrega *Rust*.",
         lead: "Solidify lee TypeScript o JavaScript y escribe el Rust que habrías escrito a mano: structs, enums, Option, Result, iteradores, propiedad. Sin máquina virtual ni recolector de basura en la salida, un programa Rust normal.",
         cta: "Probar en el navegador",
-        cta2: "Instalar la línea de comandos",
+        cta2: "Ejecutar con npx",
         facts: [
             ("0", "dependencias"),
             ("54", "programas verificados contra Node.js"),
@@ -807,5 +865,17 @@ static ES: Dict = Dict {
         family: "dentro de una misma familia de proyectos Rust:",
         license: "Software propietario, todos los derechos reservados. Libre de usar como dependencia de tus programas.",
         source: "Código en GitHub",
+        tagline: "Escribe TypeScript o JavaScript, obtén el Rust que habrías escrito a mano. En el navegador, en la terminal con npx, sin conexión como app.",
+        product: "Producto",
+        resources: "Recursos",
+        projects: "Familia Rust",
+        docs: "Documentación",
+        npm: "Paquete npm",
+        issues: "Informar de un problema",
+        license_link: "Licencia",
+        status: "54 programas verificados contra Node.js",
+        top: "Volver arriba",
+        copy: "Copiar",
+        copied: "Copiado",
     },
 };
