@@ -12,6 +12,7 @@ mod decls;
 mod exprs;
 mod files;
 mod finish;
+mod growth;
 mod stmts;
 mod unions;
 
@@ -777,6 +778,8 @@ pub(super) struct Infer<'m> {
     pub(super) bound_uses: Vec<(String, Ty, Span)>,
     /// Numeric enums whose values are mapped back to names (`Level[x]`).
     pub(super) enum_names: BTreeSet<String>,
+    /// Every assignment, for the numbers that grow without bound (see `growth`).
+    pub(super) assigns: Vec<(&'m AssignTarget, AssignOp, &'m Expr)>,
     /// `f<number>(…)`: the type arguments of the call being checked.
     pub(super) type_args: Option<(Span, Vec<Ty>)>,
     /// `return` statements of each function: (giving `this`, giving something else).
@@ -912,6 +915,7 @@ pub fn infer<'m>(
         fn_returns: Vec::new(),
         type_args: None,
         enum_names: BTreeSet::new(),
+        assigns: Vec::new(),
         bound_uses: Vec::new(),
         generic_aliases: HashMap::new(),
         hints: HashMap::new(),
@@ -971,6 +975,21 @@ impl<'m> Infer<'m> {
             );
         }
         Ok(())
+    }
+
+    /// Like [`Self::expect`] where a value goes somewhere (an argument, a returned or
+    /// assigned value): an integer may go into a double, converted.
+    pub(super) fn expect_flow(&mut self, found: &Ty, expected: &Ty, span: Span) -> IResult<()> {
+        if self.types.flow(found, expected) {
+            return Ok(());
+        }
+        if let (Ty::Num(_), Ty::Option(inner)) =
+            (self.types.resolve(found), self.types.resolve(expected))
+            && self.types.flow(found, &inner)
+        {
+            return Ok(());
+        }
+        self.expect(found, expected, span)
     }
 
     pub(super) fn set_ty(&mut self, id: NodeId, ty: Ty) -> Ty {
