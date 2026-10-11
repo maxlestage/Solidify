@@ -9,6 +9,7 @@ mod calls;
 mod dynamic;
 mod exprs;
 mod items;
+mod promise;
 mod runtime;
 mod stmts;
 
@@ -193,6 +194,8 @@ pub(super) struct Gen<'a> {
     pub statics: HashMap<NodeId, bool>,
     pub uses_lazy: bool,
     pub uses_mutex: bool,
+    /// A top-level value Rust keeps to one thread: `JsConst` makes it a static.
+    pub uses_const_cell: bool,
     /// The next variable read is written through: borrow a shared one mutably.
     pub want_mut_root: bool,
     /// Parameters to wrap in `Rc<RefCell<T>>` at the start of the body.
@@ -299,6 +302,7 @@ fn generate_with(
         statics: HashMap::new(),
         uses_lazy: false,
         uses_mutex: false,
+        uses_const_cell: false,
         want_mut_root: false,
         param_rebinds: Vec::new(),
         names: HashMap::new(),
@@ -901,7 +905,7 @@ impl<'a> Gen<'a> {
 
     pub(super) fn helper(&mut self, h: Helper) -> &'static str {
         self.helpers.insert(h);
-        if h == Helper::BlockOn {
+        if h == Helper::BlockOn || h == Helper::Promise {
             self.helpers.insert(Helper::Timers);
         }
         if h == Helper::Json {
@@ -970,7 +974,7 @@ impl<'a> Gen<'a> {
             Helper::JsSet => "JsSet",
             Helper::Generator => "JsGenerator",
             Helper::Timers => "js_run_timers",
-            Helper::Promise => "JsPromise",
+            Helper::Promise => "Promise",
             Helper::Regex => "JsRegex",
             Helper::Json => "js_json_stringify",
             Helper::Date => "JsDate",
@@ -1441,7 +1445,35 @@ impl<'a> Gen<'a> {
         {
             return self.resolve(to);
         }
-        self.resolve(&self.p.ty(e.id))
+        let t = self.resolve(&self.p.ty(e.id));
+        // A promise returned from an async body: its value.
+        if !self.casting.contains(&e.id) && self.p.auto_awaits.contains(&e.id) {
+            return self.promised(&t);
+        }
+        t
+    }
+
+    /// The value of a promise type, or the type itself.
+    pub(super) fn promised(&self, t: &Ty) -> Ty {
+        match self.resolve(t) {
+            Ty::Named(n, args) if n == crate::types::PROMISE => self.resolve(&args[0]),
+            t => t,
+        }
+    }
+
+    pub(super) fn is_promise(&self, t: &Ty) -> bool {
+        matches!(self.resolve(t), Ty::Named(n, _) if n == crate::types::PROMISE)
+    }
+
+    /// `p.await`, or `p.settled().await?` where a rejection is thrown on.
+    pub(super) fn await_code(&mut self, x: &E) -> E {
+        let base = Self::paren(x, PREC_POSTFIX);
+        let can_throw = self.fn_ctx().returns_result || !self.fn_ctx().try_ctx.is_empty();
+        if self.p.promise_rejects && can_throw {
+            E::owned(format!("{base}.settled().await?"), PREC_POSTFIX)
+        } else {
+            E::owned(format!("{base}.await"), PREC_POSTFIX)
+        }
     }
 
     pub(super) fn is_copy(&self, ty: &Ty) -> bool {
@@ -1782,6 +1814,10 @@ impl<'a> Gen<'a> {
             Ty::Gen(t) => {
                 let name = self.helper(Helper::Generator);
                 format!("{name}<{}>", self.rust_ty(&t, span)?)
+            }
+            Ty::Named(n, args) if n == crate::types::PROMISE => {
+                let h = self.helper(Helper::Promise);
+                format!("{h}<{}>", self.rust_ty(&args[0], span)?)
             }
             Ty::Named(n, ..) => {
                 if n == "Error" {

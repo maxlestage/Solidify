@@ -182,7 +182,10 @@ impl<'a> Gen<'a> {
             out.push('\n');
         }
         if self.uses_mutex {
-            out.push_str("\n/// A top-level variable that functions change. The program runs one piece at a\n/// time: read and written like a `RefCell`.\nstruct JsStatic<T>(std::cell::RefCell<T>);\n\nunsafe impl<T> Sync for JsStatic<T> {}\n\n#[allow(dead_code)]\nimpl<T> JsStatic<T> {\n    fn new(value: T) -> Self {\n        JsStatic(std::cell::RefCell::new(value))\n    }\n\n    fn read(&self) -> std::cell::Ref<'_, T> {\n        self.0.borrow()\n    }\n\n    fn write(&self) -> std::cell::RefMut<'_, T> {\n        self.0.borrow_mut()\n    }\n}\n");
+            out.push_str("\n/// A top-level variable that functions change. The program runs one piece at a\n/// time: read and written like a `RefCell`.\nstruct JsStatic<T>(std::cell::RefCell<T>);\n\nunsafe impl<T> Sync for JsStatic<T> {}\nunsafe impl<T> Send for JsStatic<T> {}\n\n#[allow(dead_code)]\nimpl<T> JsStatic<T> {\n    fn new(value: T) -> Self {\n        JsStatic(std::cell::RefCell::new(value))\n    }\n\n    fn read(&self) -> std::cell::Ref<'_, T> {\n        self.0.borrow()\n    }\n\n    fn write(&self) -> std::cell::RefMut<'_, T> {\n        self.0.borrow_mut()\n    }\n}\n");
+        }
+        if self.uses_const_cell {
+            out.push_str("\n/// A top-level value of a type Rust keeps to one thread (`Rc`, closures). The\n/// program runs on one thread: it is read like the value itself.\nstruct JsConst<T>(T);\n\nunsafe impl<T> Sync for JsConst<T> {}\nunsafe impl<T> Send for JsConst<T> {}\n\nimpl<T> std::ops::Deref for JsConst<T> {\n    type Target = T;\n    fn deref(&self) -> &T {\n        &self.0\n    }\n}\n");
         }
         if shared_json {
             out.push_str("\nimpl<T: JsFromJson> JsFromJson for Shared<T> {\n    fn from_json(v: &JsonValue) -> Result<Self, String> {\n        T::from_json(v).map(Shared::new)\n    }\n}\n");
@@ -569,6 +572,39 @@ impl<'a> Gen<'a> {
         Ok(items)
     }
 
+    /// Whether values of the type hold an `Rc` or a closure: Rust keeps them to one thread.
+    fn thread_bound(&self, ty: &Ty, seen: &mut std::collections::HashSet<String>) -> bool {
+        match self.resolve(ty) {
+            Ty::Func(_) | Ty::Gen(_) => true,
+            Ty::Array(t) | Ty::Option(t) | Ty::Set(t) => self.thread_bound(&t, seen),
+            Ty::Map(k, v, _) => self.thread_bound(&k, seen) || self.thread_bound(&v, seen),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.thread_bound(t, seen)),
+            Ty::Named(n, args) => {
+                if n == crate::types::PROMISE || n == crate::types::DYNAMIC || self.p.is_shared(&n)
+                {
+                    return true;
+                }
+                if args.iter().any(|t| self.thread_bound(t, seen)) {
+                    return true;
+                }
+                if !seen.insert(n.clone()) {
+                    return false;
+                }
+                if self.p.is_dyn(&n) {
+                    return true;
+                }
+                if let Some(s) = self.p.struct_info(&n) {
+                    return s.fields.iter().any(|f| self.thread_bound(&f.ty, seen));
+                }
+                if let Some(u) = self.p.unions.iter().find(|u| u.name == n) {
+                    return u.members.iter().any(|m| self.thread_bound(&m.ty, seen));
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
     /// Top-level `const`s holding literals.
     fn consts(&mut self, file: Option<usize>) -> GResult<()> {
         let mut written = false;
@@ -610,6 +646,11 @@ impl<'a> Gen<'a> {
                         self.uses_mutex = true;
                         self.line(&format!(
                             "{vis}static {name}: LazyLock<JsStatic<{t}>> = LazyLock::new(|| JsStatic::new({value}));"
+                        ));
+                    } else if self.thread_bound(&ty, &mut std::collections::HashSet::new()) {
+                        self.uses_const_cell = true;
+                        self.line(&format!(
+                            "{vis}static {name}: LazyLock<JsConst<{t}>> = LazyLock::new(|| JsConst({value}));"
                         ));
                     } else {
                         self.line(&format!(
@@ -1533,7 +1574,13 @@ impl<'a> Gen<'a> {
             .clone()
             .or_else(|| info.method_of.clone());
         self.push_scope();
-        let ret_ty = self.resolve(&info.sig.ret);
+        let promise_ty = self.resolve(&info.sig.ret);
+        // An async body returns the value of its promise.
+        let ret_ty = if info.is_async {
+            self.promised(&promise_ty)
+        } else {
+            promise_ty.clone()
+        };
         self.fns.push(FnGen {
             id: f.id,
             returns_result: info.throws,
@@ -1582,6 +1629,22 @@ impl<'a> Gen<'a> {
                 g.indent -= 1;
                 return Ok(());
             }
+            // An async body: a task started at once, which owns what it uses.
+            if info.is_async {
+                if method.is_some() && info.uses_this {
+                    // A shared object: the task holds a handle on it.
+                    let handle = class
+                        .as_ref()
+                        .is_some_and(|c| g.p.is_shared(c) && !g.p.is_shared_hierarchy(c));
+                    g.line("let this = self.clone();");
+                    g.fn_ctx_mut().this_name = "this";
+                    g.fn_ctx_mut().handle_this = handle;
+                }
+                let h = g.helper(Helper::Promise);
+                let spawn = if info.throws { "spawn_result" } else { "spawn" };
+                g.line(&format!("{h}::{spawn}(async move {{"));
+                g.indent += 1;
+            }
             match &f.body {
                 FnBody::Block(b) => g.block_body(&b.stmts, true)?,
                 FnBody::Expr(e) => {
@@ -1593,6 +1656,10 @@ impl<'a> Gen<'a> {
                     };
                     g.line(&code);
                 }
+            }
+            if info.is_async {
+                g.indent -= 1;
+                g.line("})");
             }
             g.indent -= 1;
             Ok(())
@@ -1618,6 +1685,9 @@ impl<'a> Gen<'a> {
         // Every value of the program can be copied (`Clone`): the parameters too.
         for tp in &info.type_params {
             ctx.bounds.entry(tp.clone()).or_default().insert("Clone");
+            if info.is_async {
+                ctx.bounds.entry(tp.clone()).or_default().insert("'static");
+            }
         }
         for (p, c) in &info.type_bounds {
             ctx.bounds
@@ -1639,7 +1709,11 @@ impl<'a> Gen<'a> {
         } else {
             format!("<{}>", generics.join(", "))
         };
-        let mut ret = self.fn_return_ty(&ret_ty, f.span)?;
+        let mut ret = if info.is_async {
+            self.rust_ty(&promise_ty, f.span)?
+        } else {
+            self.fn_return_ty(&ret_ty, f.span)?
+        };
         if method.is_some() && self.fluent(&info) {
             ret = if self.p.method_mutates(info.id) {
                 "&mut Self".into()
@@ -1647,7 +1721,7 @@ impl<'a> Gen<'a> {
                 "&Self".into()
             };
         }
-        let ret = if info.throws && !f.is_generator {
+        let ret = if info.throws && !f.is_generator && !info.is_async {
             format!(" -> Result<{ret}, String>")
         } else if ret == "()" {
             String::new()
@@ -1691,10 +1765,7 @@ impl<'a> Gen<'a> {
             (false, true) => self_param,
             (false, false) => format!("{self_param}, {params}"),
         };
-        let asyncness = if info.is_async { "async " } else { "" };
-        self.line(&format!(
-            "{vis}{asyncness}fn {name}{generics}({all_params}){ret} {{"
-        ));
+        self.line(&format!("{vis}fn {name}{generics}({all_params}){ret} {{"));
         self.out.push_str(&body);
         self.line("}");
         Ok(())

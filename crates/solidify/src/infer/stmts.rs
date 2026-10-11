@@ -66,6 +66,7 @@ impl<'m> Infer<'m> {
                 match value {
                     Some(e) => {
                         let t = self.expr(e, Some(&ret))?;
+                        let t = self.returned(e, &t, &ret)?;
                         self.mark_stored(e);
                         self.expect_flow(&t, &ret, e)?;
                         self.ctx_mut().has_return_value = true;
@@ -461,6 +462,10 @@ impl<'m> Infer<'m> {
         // A generator body yields values and returns nothing.
         let (ret, yield_ty) = match (f.is_generator, self.types.resolve(&info.sig.ret)) {
             (true, Ty::Gen(t)) => (Ty::Void, Some(*t)),
+            // An async body returns the value of its promise.
+            (false, Ty::Named(n, args)) if info.is_async && n == crate::types::PROMISE => {
+                (args[0].clone(), None)
+            }
             _ => (info.sig.ret.clone(), None),
         };
         self.fns.push(FnCtx {
@@ -515,7 +520,7 @@ impl<'m> Infer<'m> {
                 v.param_of = Some((f.id, i));
                 // A parameter property is kept in the instance; a generator keeps its
                 // parameters for as long as it runs.
-                if (in_ctor && (p.access.is_some() || p.readonly)) || f.is_generator {
+                if (in_ctor && (p.access.is_some() || p.readonly)) || f.is_generator || f.is_async {
                     v.stored = true;
                     self.param_stored.insert((f.id, i));
                 }
@@ -561,6 +566,7 @@ impl<'m> Infer<'m> {
                     self.expr(e, None)?;
                 } else {
                     let t = self.expr(e, Some(&ret))?;
+                    let t = self.returned(e, &t, &ret)?;
                     self.mark_stored(e);
                     self.expect_flow(&t, &ret, e)?;
                 }

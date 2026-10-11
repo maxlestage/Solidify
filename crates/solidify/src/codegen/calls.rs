@@ -96,11 +96,6 @@ impl<'a> Gen<'a> {
                     // A shared object in a hierarchy: its methods borrow the data, the
                     // arguments computed first (they may read it).
                     if self.p.is_shared_hierarchy(&class) && !matches!(obj.kind, ExprKind::This) {
-                        let borrow = if info.mutates_self {
-                            "borrow_mut"
-                        } else {
-                            "borrow"
-                        };
                         let base = Self::paren(&o, PREC_POSTFIX);
                         let n = info.sig.params.len();
                         let hoist = n > 0 && list.contains(".borrow") && !list.contains("&mut ");
@@ -115,17 +110,13 @@ impl<'a> Gen<'a> {
                         } else {
                             (String::new(), list)
                         };
-                        let call = if info.is_async {
-                            format!("{base}.{borrow}().{method}({list})")
+                        // The object is borrowed for the call only.
+                        let with = if info.mutates_self {
+                            "with_mut"
                         } else {
-                            // The object is borrowed for the call only.
-                            let with = if info.mutates_self {
-                                "with_mut"
-                            } else {
-                                "with"
-                            };
-                            format!("{base}.{with}(|o| o.{method}({list}))")
+                            "with"
                         };
+                        let call = format!("{base}.{with}(|o| o.{method}({list}))");
                         let call = self.finish_call(call, &info, e)?.code;
                         let code = if pre.is_empty() {
                             call
@@ -210,10 +201,7 @@ impl<'a> Gen<'a> {
                     let o = self.expr(obj)?;
                     self.option_source(&o)
                 };
-                let call = format!(
-                    "o.{method}({list}){}",
-                    if info.is_async { ".await" } else { "" }
-                );
+                let call = format!("o.{method}({list})");
                 if matches!(self.resolve(&info.sig.ret), Ty::Void) {
                     Ok(E::owned(
                         format!("if let Some(o) = {source} {{ {call} }}"),
@@ -292,20 +280,8 @@ impl<'a> Gen<'a> {
     /// it is async.
     fn finish_call(&mut self, code: String, info: &FnInfo, _e: &'a Expr) -> GResult<E> {
         let mut code = code;
-        let caller_async = self
-            .p
-            .funcs
-            .get(&self.fn_ctx().id)
-            .is_none_or(|f| f.is_async);
-        if info.is_async && caller_async {
-            code.push_str(".await");
-        } else if info.is_async {
-            // Called from code that does not wait: run to the end now.
-            let h = self.helper(Helper::BlockOn);
-            code = format!("{h}({code})");
-        }
-        let _ = ();
-        if info.throws {
+        // An async function gives its promise: a throw rejects it.
+        if info.throws && !info.is_async {
             if self.fn_ctx().returns_result || !self.fn_ctx().try_ctx.is_empty() {
                 code.push('?');
             } else {
@@ -601,7 +577,6 @@ impl<'a> Gen<'a> {
             }
             Some(Callee::Builtin("new Promise")) => {
                 let promise = self.helper(Helper::Promise);
-                self.helper(Helper::BlockOn);
                 let (ExprKind::Arrow(f) | ExprKind::Func(f)) = &args[0].expr.kind else {
                     return self.err(
                         "`new Promise` needs an inline executor function",
@@ -615,10 +590,7 @@ impl<'a> Gen<'a> {
                     1 => c.code.replacen("| ", ", _| ", 1),
                     _ => c.code,
                 };
-                Ok(E::owned(
-                    format!("{promise}::new({code}).await"),
-                    PREC_POSTFIX,
-                ))
+                Ok(E::owned(format!("{promise}::new({code})"), PREC_POSTFIX))
             }
             Some(Callee::Builtin("new RegExp")) => {
                 let h = self.helper(Helper::Regex);
@@ -1211,7 +1183,8 @@ impl<'a> Gen<'a> {
                     None => E::owned(format!("{src}.collect::<Vec<_>>()"), PREC_POSTFIX),
                 }
             }
-            "Promise.all" | "Promise.resolve" => self.expr(&args[0].expr)?,
+            "Promise.all" | "Promise.race" | "Promise.any" | "Promise.allSettled"
+            | "Promise.resolve" | "Promise.reject" => self.promise_static(e, name, args)?,
             "JSON.stringify" => {
                 let value = self.json_value_of(&args[0].expr)?;
                 let h = self.helper(Helper::Json);
@@ -1390,6 +1363,7 @@ impl<'a> Gen<'a> {
                 if self.is_float(&at) {
                     x
                 } else {
+                    let x = super::exprs::paren_unless_simple(&x);
                     self.as_f64(&E::owned(x, PREC_ATOM))
                 }
             }
@@ -1479,6 +1453,7 @@ impl<'a> Gen<'a> {
                 | "next"
         );
         match kind {
+            "promise" => self.promise_method(obj, method, args),
             "generator" => {
                 let g = self.expr_as(obj, Want::RefMut)?;
                 let g = g.trim_start_matches("&mut ").to_string();
