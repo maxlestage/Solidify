@@ -58,7 +58,12 @@ impl<'m> Infer<'m> {
             ExprKind::Tagged { .. } => self.err("tagged templates are not supported", e.span),
             ExprKind::Bool(_) => Ok(Ty::Bool),
             ExprKind::Null | ExprKind::Undefined => Ok(Ty::Null),
-            ExprKind::Regex { .. } => self.err("regular expressions are not supported", e.span),
+            ExprKind::Regex { pattern, flags } => {
+                if let Err(msg) = crate::codegen::regex_rt::JsRegex::parse(pattern, flags) {
+                    return self.err(format!("invalid regular expression: {msg}"), e.span);
+                }
+                Ok(Ty::Named("RegExp".into()))
+            }
             ExprKind::This => {
                 let Some(class) = self.ctx().this.clone() else {
                     return self.err("`this` outside a class", e.span);
@@ -306,7 +311,16 @@ impl<'m> Infer<'m> {
                 optional,
             } => {
                 if *optional {
-                    return self.err("`?.[` is not supported", e.span);
+                    // `a?.[i]`: nothing when `a` is null.
+                    let ot = self.expr(obj, None)?;
+                    let Ty::Option(inner) = self.types.resolve(&ot) else {
+                        return self.err("`?.[` on a value that is never null", obj.span);
+                    };
+                    let t = self.index_of(&inner, index, e.span)?;
+                    return Ok(match self.types.resolve(&t) {
+                        Ty::Option(t) => Ty::Option(t),
+                        t => Ty::Option(Box::new(t)),
+                    });
                 }
                 self.index(obj, index, e.span)
             }
@@ -1060,6 +1074,26 @@ impl<'m> Infer<'m> {
                         _ => self.err(format!("Error has no property `{prop}`"), span),
                     };
                 }
+                if n == "RegExp" {
+                    return match prop {
+                        "source" | "flags" => Ok(Ty::Str),
+                        "global" | "ignoreCase" | "multiline" | "dotAll" | "sticky" | "unicode" => {
+                            Ok(Ty::Bool)
+                        }
+                        "lastIndex" => Ok(self.types.int()),
+                        _ => self.err(format!("RegExp has no property `{prop}`"), span),
+                    };
+                }
+                if n == "RegExpMatch" {
+                    return match prop {
+                        "index" | "length" => Ok(self.types.int()),
+                        "input" => Ok(Ty::Str),
+                        _ => self.err(
+                            format!("a match has no property `{prop}`: its groups are `m[i]`"),
+                            span,
+                        ),
+                    };
+                }
                 if self.is_type_param(n) {
                     return self.err(
                         format!("`{prop}` is not known on the type parameter {n}"),
@@ -1131,6 +1165,12 @@ impl<'m> Infer<'m> {
     fn index(&mut self, obj: &'m Expr, index: &'m Expr, span: Span) -> IResult<Ty> {
         let ot = self.expr(obj, None)?;
         let ot = self.types.resolve(&ot);
+        self.index_of(&ot, index, span)
+    }
+
+    /// The type of `obj[index]` for a value of type `ot`.
+    fn index_of(&mut self, ot: &Ty, index: &'m Expr, span: Span) -> IResult<Ty> {
+        let ot = self.types.resolve(ot);
         match &ot {
             Ty::Array(t) => {
                 let it = self.expr(index, None)?;
@@ -1159,21 +1199,24 @@ impl<'m> Infer<'m> {
                 self.expect(&it, k, index.span)?;
                 Ok((**v).clone())
             }
+            Ty::Named(n) if n == "RegExpMatch" => {
+                let it = self.expr(index, None)?;
+                let n = self.types.num(Flavor::Unknown);
+                self.expect(&it, &n, index.span)?;
+                Ok(Ty::Str)
+            }
             Ty::Named(n) if self.struct_by_name(n).is_some() => {
                 let ExprKind::Str(key) = &index.kind else {
                     return self.err(format!("{n} is indexed with a property name"), index.span);
                 };
                 self.set_ty(index.id, Ty::Str);
                 let key = key.clone();
-                self.member_of(&ot, &key, span, obj)
+                self.member_of(&ot, &key, span, index)
             }
-            Ty::Option(_) => self.err(
-                format!("`{}` may be null here: test it first", self.text(obj)),
-                obj.span,
-            ),
+            Ty::Option(_) => self.err("this value may be null here: test it first", span),
             Ty::Var(_) => {
                 let t = self.types.fresh();
-                self.unify(&ot, &Ty::Array(Box::new(t.clone())), obj.span)?;
+                self.unify(&ot, &Ty::Array(Box::new(t.clone())), span)?;
                 let it = self.expr(index, None)?;
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&it, &n, index.span)?;
@@ -1306,7 +1349,27 @@ impl<'m> Infer<'m> {
                 self.calls.insert(e.id, Callee::Builtin("new Promise"));
                 Ok(value)
             }
-            "RegExp" => self.err("regular expressions are not supported", e.span),
+            "RegExp" => {
+                self.arg_typed(args, 0, Some(Ty::Str), "RegExp", e.span)?;
+                if args.len() > 1 {
+                    self.arg_typed(args, 1, Some(Ty::Str), "RegExp", e.span)?;
+                }
+                if let (Some(ExprKind::Str(p)), f) = (
+                    args.first().map(|a| &a.expr.kind),
+                    args.get(1).map(|a| &a.expr.kind),
+                ) {
+                    let flags = match f {
+                        None => String::new(),
+                        Some(ExprKind::Str(f)) => f.clone(),
+                        Some(_) => String::new(),
+                    };
+                    if let Err(msg) = crate::codegen::regex_rt::JsRegex::parse(p, &flags) {
+                        return self.err(format!("invalid regular expression: {msg}"), e.span);
+                    }
+                }
+                self.calls.insert(e.id, Callee::Builtin("new RegExp"));
+                Ok(Ty::Named("RegExp".into()))
+            }
             _ => self.err(format!("unknown class `{name}`"), callee.span),
         }
     }
@@ -1778,7 +1841,12 @@ impl<'m> Infer<'m> {
         let ot = self.expr(obj, None)?;
         let ot = self.types.resolve(&ot);
         match &ot {
-            Ty::Named(n) if n != "Error" && !self.is_type_param(n) => {
+            Ty::Named(n)
+                if n != "Error"
+                    && n != "RegExp"
+                    && n != "RegExpMatch"
+                    && !self.is_type_param(n) =>
+            {
                 let Some(s) = self.struct_by_name(n) else {
                     if self.union_by_name(n).is_some() {
                         return self.err(

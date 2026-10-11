@@ -40,7 +40,14 @@ pub enum Helper {
     Timers,
     /// `new Promise`.
     Promise,
+    /// `JsRegex`: regular expressions.
+    Regex,
 }
+
+/// The regular expression engine, compiled into Solidify too: patterns are checked when
+/// translating.
+#[path = "runtime/regex.rs"]
+pub mod regex_rt;
 
 impl Helper {
     pub fn source(self) -> &'static str {
@@ -336,6 +343,7 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Generator => include_str!("runtime/generator.rs"),
             Helper::Timers => include_str!("runtime/timers.rs"),
             Helper::Promise => include_str!("runtime/promise.rs"),
+            Helper::Regex => include_str!("runtime/regex.rs"),
             Helper::BlockOn => {
                 r#"/// Runs a future to completion, running the timers it waits on.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

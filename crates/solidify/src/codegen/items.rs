@@ -51,8 +51,21 @@ impl<'a> Gen<'a> {
         if !self.p.has_main {
             out.push_str("#![allow(dead_code)]\n\n");
         }
+        let mut uses: Vec<&str> = Vec::new();
         if self.uses_rc {
-            out.push_str("use std::cell::RefCell;\nuse std::rc::Rc;\n");
+            uses.push("use std::cell::RefCell;");
+        }
+        if self.uses_rc {
+            uses.push("use std::rc::Rc;");
+        }
+        match (self.uses_lazy, self.uses_mutex) {
+            (true, true) => uses.push("use std::sync::{LazyLock, Mutex};"),
+            (true, false) => uses.push("use std::sync::LazyLock;"),
+            _ => {}
+        }
+        if !uses.is_empty() {
+            out.push_str(&uses.join("\n"));
+            out.push('\n');
             if !(self.uses_hashmap || self.uses_hashset) {
                 out.push('\n');
             }
@@ -93,6 +106,11 @@ impl<'a> Gen<'a> {
         if self.helpers.contains(&Helper::JsSet) {
             out.push_str(
                 "\nimpl<T: JsInspect + std::hash::Hash + Eq + Clone> JsInspect for JsSet<T> {\n    fn js_value(&self) -> JsValue {\n        JsValue::Set(self.iter().map(JsInspect::js_value).collect())\n    }\n}\n",
+            );
+        }
+        if self.helpers.contains(&Helper::Regex) {
+            out.push_str(
+                "\nimpl JsInspect for JsRegex {\n    fn js_value(&self) -> JsValue {\n        JsValue::Raw(self.to_string())\n    }\n}\n\nimpl JsInspect for JsMatch {\n    fn js_value(&self) -> JsValue {\n        JsValue::Array(self.groups.iter().map(|g| g.as_ref().map_or(JsValue::Undefined, |s| JsValue::Str(s.clone()))).collect())\n    }\n}\n",
             );
         }
         // Fields may bring in more types: loop until the set is stable.
@@ -205,7 +223,44 @@ impl<'a> Gen<'a> {
                 let Pattern::Ident { id, span, .. } = &d.pat else {
                     continue;
                 };
-                let var = self.p.var(*id);
+                let var = self.p.var(*id).clone();
+                // A top-level variable used inside a function: a static, lazily made.
+                if !var.const_literal && var.role == Role::TopLevel && var.used_in_fn {
+                    let Some(init) = &d.init else {
+                        return self.err(
+                            format!("the top-level variable `{}` is used inside a function: give it a value where it is declared", var.name),
+                            *span,
+                        );
+                    };
+                    let ty = self.resolve(&var.ty);
+                    let mutable = var.reassigned || var.mutated;
+                    let name = screaming(&var.name);
+                    self.names.insert(*id, name.clone());
+                    self.reprs.insert(*id, Repr::Owned);
+                    self.statics.insert(*id, mutable);
+                    self.uses_lazy = true;
+                    self.fns.push(self.plain_ctx(*id, ty.clone(), None, false));
+                    let value = self.expr_to(init, &ty);
+                    self.fns.pop();
+                    let value = value?;
+                    let t = self.rust_ty(&ty, *span)?;
+                    let vis = if v.exported { "pub " } else { "" };
+                    for c in &s.comments {
+                        self.line(&format!("/// {c}"));
+                    }
+                    if mutable {
+                        self.uses_mutex = true;
+                        self.line(&format!(
+                            "{vis}static {name}: LazyLock<Mutex<{t}>> = LazyLock::new(|| Mutex::new({value}));"
+                        ));
+                    } else {
+                        self.line(&format!(
+                            "{vis}static {name}: LazyLock<{t}> = LazyLock::new(|| {value});"
+                        ));
+                    }
+                    written = true;
+                    continue;
+                }
                 if !var.const_literal {
                     continue;
                 }

@@ -163,7 +163,8 @@ impl<'m> Infer<'m> {
                 return self.err("`Function` is too vague: write `(x: T) => U`", span);
             }
             "Date" => return self.err("`Date` is not supported", span),
-            "RegExp" => return self.err("regular expressions are not supported", span),
+            "RegExp" => Ty::Named("RegExp".into()),
+            "RegExpMatchArray" | "RegExpExecArray" => Ty::Named("RegExpMatch".into()),
             "this" => match self.this_class_stack.last() {
                 Some(c) => Ty::Named(c.clone()),
                 None => return self.err("`this` type outside a class", span),
