@@ -74,6 +74,9 @@
 }
 
 html {
+  /* Nothing scrolls sideways: the page is the screen's width (see "No horizontal
+     scrolling" below for code, tables and the editor). */
+  overflow-x: clip;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   scroll-behavior: smooth;
@@ -149,6 +152,15 @@ em {
 code {
   font-family: var(--mono);
   font-size: 0.92em;
+  /* A long identifier or path breaks rather than pushing the page wider. */
+  overflow-wrap: anywhere;
+}
+
+/* No horizontal scrolling: code wraps at the edge of its block, on every screen. */
+pre {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
 }
 
 p code,
@@ -666,7 +678,6 @@ h3.sub {
   margin: 0;
   font-size: 13px;
   color: var(--muted);
-  white-space: nowrap;
 }
 
 .tag {
@@ -758,8 +769,11 @@ h3.sub {
   font-size: 13.5px;
   line-height: 1.55;
   tab-size: 2;
-  white-space: pre;
-  overflow: auto;
+  /* The editor wraps long lines like the code blocks: it only scrolls down. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  overflow-x: hidden;
+  overflow-y: auto;
 }
 
 .pane textarea:focus-visible {
@@ -771,7 +785,8 @@ h3.sub {
   flex: 1;
   margin: 0;
   padding: 14px 16px;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   font-family: var(--mono);
   font-size: 13.5px;
   line-height: 1.55;
@@ -896,7 +911,9 @@ pre .m {
   width: 100%;
   margin-top: 28px;
   border-collapse: collapse;
+  table-layout: fixed;
   font-size: 15px;
+  overflow-wrap: anywhere;
 }
 
 .mapping th,
@@ -940,7 +957,6 @@ pre .m {
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--panel);
-  overflow: auto;
   font-family: var(--mono);
   font-size: 13.5px;
   line-height: 1.55;
@@ -1762,10 +1778,10 @@ h1 em {
     place-items: center;
   }
 
-  /* Without scripts, the sections stay in a row that scrolls. */
+  /* Without the WebAssembly client there is no menu button: the sections are
+     reached from the footer's "Product" column. */
   html:not(.app) .menu {
-    overflow-x: auto;
-    scrollbar-width: none;
+    display: none;
   }
 
   .foot-grid {
@@ -1788,6 +1804,35 @@ h1 em {
 @media (max-width: 420px) {
   .install-app {
     display: none;
+  }
+}
+
+/* The table on small screens: each row a block, the TypeScript above its Rust. */
+@media (max-width: 640px) {
+  .mapping thead {
+    display: none;
+  }
+
+  .mapping,
+  .mapping tbody,
+  .mapping tr,
+  .mapping td {
+    display: block;
+    width: 100%;
+  }
+
+  .mapping tr {
+    padding: 12px 0;
+    border-bottom: 1px solid var(--line);
+  }
+
+  .mapping td {
+    padding: 2px 0;
+    border: 0;
+  }
+
+  .mapping td:first-child {
+    width: 100%;
   }
 }
 
