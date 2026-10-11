@@ -357,7 +357,7 @@ impl<'a> Gen<'a> {
                 // The executor always gets `resolve` and `reject`.
                 let code = match f.params.len() {
                     0 => c.code.replacen("||", "|_, _|", 1),
-                    1 => c.code.replacen("|", "|", 1).replacen("| ", ", _| ", 1),
+                    1 => c.code.replacen("| ", ", _| ", 1),
                     _ => c.code,
                 };
                 Ok(E::owned(
