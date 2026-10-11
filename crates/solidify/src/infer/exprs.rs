@@ -1033,6 +1033,7 @@ impl<'m> Infer<'m> {
             statics: Vec::new(),
             parent: None,
             is_abstract: false,
+            implements: Vec::new(),
         });
         self.literal_struct.insert(e.id, name.clone());
         Ok(Ty::Named(name))
