@@ -63,6 +63,8 @@ pub struct VarInfo {
     pub alias: bool,
     /// Initialized with an arrow function: its function id.
     pub closure_fn: Option<NodeId>,
+    /// Holds the result of a generator's `next()`: `.value` and `.done` read it.
+    pub iter_result: bool,
     /// The loop depth where it was declared (last-use analysis).
     pub loop_depth: usize,
     pub span: Span,
@@ -472,6 +474,8 @@ pub(super) struct FnCtx {
     /// The function (not arrow) this one takes `this` from.
     pub(super) this_fn: NodeId,
     pub(super) has_return_value: bool,
+    /// Inside a generator: the type of the values it yields.
+    pub(super) yield_ty: Option<Ty>,
 }
 
 pub(super) struct ActiveNarrow {
@@ -753,6 +757,7 @@ impl<'m> Infer<'m> {
                 used_in_fn: false,
                 alias: false,
                 closure_fn: None,
+                iter_result: false,
                 loop_depth: depth,
                 span,
             },
@@ -1025,6 +1030,24 @@ impl<'m> Infer<'m> {
         self.narrows
             .iter()
             .rposition(|n| n.root == path.root && n.path == path.fields)
+    }
+
+    /// Whether an expression is the result of a generator's `next()`, directly or through
+    /// a variable.
+    pub(super) fn is_iter_result(&self, e: &Expr) -> bool {
+        if matches!(
+            self.calls.get(&e.id),
+            Some(Callee::Builtin("generator.next"))
+        ) {
+            return true;
+        }
+        match &e.kind {
+            ExprKind::Ident(name) => self
+                .lookup(name)
+                .and_then(|id| self.vars.get(&id))
+                .is_some_and(|v| v.iter_result),
+            _ => false,
+        }
     }
 
     pub(super) fn root_binding(&self, e: &Expr) -> Option<NodeId> {

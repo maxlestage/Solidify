@@ -259,7 +259,7 @@ impl<'a> Gen<'a> {
             | ExprKind::Super
             | ExprKind::Class(_)
             | ExprKind::Delete(_)
-            | ExprKind::Yield(_) => self.err("this expression is not supported", e.span),
+            | ExprKind::Yield { .. } => self.err("this expression is not supported", e.span),
         }
     }
 
@@ -581,6 +581,7 @@ impl<'a> Gen<'a> {
                         let recv = Self::paren(&s, PREC_POSTFIX);
                         parts.push(match self.resolve(&xt) {
                             Ty::Set(_) => format!("{recv}.iter().cloned().collect::<Vec<_>>()"),
+                            Ty::Gen(_) => format!("{recv}.collect::<Vec<_>>()"),
                             Ty::Map(..) => format!(
                                 "{recv}.iter().map(|(k, v)| (k.clone(), v.clone())).collect::<Vec<_>>()"
                             ),
@@ -1516,6 +1517,20 @@ impl<'a> Gen<'a> {
         }
         let o = self.expr(obj)?;
         let base = Self::paren(&o, PREC_POSTFIX);
+        let iter_result = matches!(
+            self.p.calls.get(&obj.id),
+            Some(Callee::Builtin("generator.next"))
+        ) || self
+            .p
+            .refs
+            .get(&obj.id)
+            .is_some_and(|b| self.p.var(*b).iter_result);
+        if iter_result && matches!(self.resolve(&ot), Ty::Option(_)) {
+            return Ok(match prop {
+                "done" => E::owned(format!("{base}.is_none()"), PREC_POSTFIX),
+                _ => o,
+            });
+        }
         match self.resolve(&ot) {
             Ty::Named(n) if n == "Error" => Ok(match prop {
                 "message" => {
@@ -1740,6 +1755,7 @@ impl<'a> Gen<'a> {
             id: f.id,
             returns_result: false,
             ret_ty: ret_ty.clone(),
+            yield_ty: None,
             targets: Vec::new(),
             try_ctx: Vec::new(),
             in_ctor: self.fns.last().is_some_and(|c| c.in_ctor),

@@ -621,6 +621,7 @@ impl<'a> Gen<'a> {
             id,
             returns_result: false,
             ret_ty,
+            yield_ty: None,
             targets: Vec::new(),
             try_ctx: Vec::new(),
             in_ctor,
@@ -886,6 +887,10 @@ impl<'a> Gen<'a> {
             id: f.id,
             returns_result: info.throws,
             ret_ty: ret_ty.clone(),
+            yield_ty: match (f.is_generator, &ret_ty) {
+                (true, Ty::Gen(t)) => Some((**t).clone()),
+                _ => None,
+            },
             targets: Vec::new(),
             try_ctx: Vec::new(),
             in_ctor: false,
@@ -896,8 +901,26 @@ impl<'a> Gen<'a> {
             labels: 0,
         });
         let params = self.param_list(f, &info);
+        if f.is_generator {
+            // The body yields through `y`, on its own thread.
+            self.fn_ctx_mut().returns_result = false;
+            self.fn_ctx_mut().ret_ty = Ty::Void;
+        }
         let body = self.capture(|g| {
             g.indent += 1;
+            if f.is_generator {
+                let FnBody::Block(b) = &f.body else {
+                    unreachable!()
+                };
+                let gen_name = g.helper(Helper::Generator);
+                g.line(&format!("{gen_name}::new(move |y| {{"));
+                g.indent += 1;
+                g.block_body(&b.stmts, false)?;
+                g.indent -= 1;
+                g.line("})");
+                g.indent -= 1;
+                return Ok(());
+            }
             match &f.body {
                 FnBody::Block(b) => g.block_body(&b.stmts, true)?,
                 FnBody::Expr(e) => {
@@ -933,7 +956,7 @@ impl<'a> Gen<'a> {
             format!("<{}>", generics.join(", "))
         };
         let ret = self.fn_return_ty(&ret_ty, f.span)?;
-        let ret = if info.throws {
+        let ret = if info.throws && !f.is_generator {
             format!(" -> Result<{ret}, String>")
         } else if ret == "()" {
             String::new()
@@ -1235,6 +1258,7 @@ impl<'a> Gen<'a> {
             id: self.p.main_id,
             returns_result: info.throws,
             ret_ty: Ty::Void,
+            yield_ty: None,
             targets: Vec::new(),
             try_ctx: Vec::new(),
             in_ctor: false,

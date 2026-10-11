@@ -362,7 +362,7 @@ pub(super) fn collect_vars(types: &Types, t: &Ty, out: &mut Vec<usize>) {
                 out.push(v);
             }
         }
-        Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => collect_vars(types, &t, out),
+        Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => collect_vars(types, &t, out),
         Ty::Map(k, v, _) => {
             collect_vars(types, &k, out);
             collect_vars(types, &v, out);
@@ -383,6 +383,7 @@ pub(super) fn substitute(t: &Ty, subst: &HashMap<String, Ty>, types: &Types) -> 
         Ty::Option(t) => Ty::Option(Box::new(substitute(&t, subst, types))),
         Ty::Array(t) => Ty::Array(Box::new(substitute(&t, subst, types))),
         Ty::Set(t) => Ty::Set(Box::new(substitute(&t, subst, types))),
+        Ty::Gen(t) => Ty::Gen(Box::new(substitute(&t, subst, types))),
         Ty::Map(k, v, r) => Ty::Map(
             Box::new(substitute(&k, subst, types)),
             Box::new(substitute(&v, subst, types)),
@@ -408,7 +409,8 @@ pub fn same_shape_ty(a: &Ty, b: &Ty) -> bool {
         (Ty::Num(_), Ty::Num(_)) => true,
         (Ty::Option(x), Ty::Option(y))
         | (Ty::Array(x), Ty::Array(y))
-        | (Ty::Set(x), Ty::Set(y)) => same_shape_ty(x, y),
+        | (Ty::Set(x), Ty::Set(y))
+        | (Ty::Gen(x), Ty::Gen(y)) => same_shape_ty(x, y),
         (Ty::Map(k1, v1, _), Ty::Map(k2, v2, _)) => same_shape_ty(k1, k2) && same_shape_ty(v1, v2),
         (Ty::Tuple(xs), Ty::Tuple(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_shape_ty(x, y))

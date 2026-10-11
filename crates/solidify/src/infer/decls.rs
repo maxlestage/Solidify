@@ -27,6 +27,7 @@ impl<'m> Infer<'m> {
             captures: Vec::new(),
             this_fn: self.main_id,
             has_return_value: false,
+            yield_ty: None,
         });
         self.funcs.insert(
             self.main_id,
@@ -496,8 +497,14 @@ impl<'m> Infer<'m> {
         method_kind: Option<MethodKind>,
         is_static: bool,
     ) -> IResult<FnInfo> {
-        if f.is_generator {
-            return self.err("generators are not supported", f.span);
+        if f.is_generator && f.is_async {
+            return self.err("async generators are not supported", f.span);
+        }
+        if f.is_generator && method_of.is_some() {
+            return self.err(
+                "generator methods are not supported: use a function",
+                f.span,
+            );
         }
         let type_params: Vec<String> = f.type_params.iter().map(|t| t.name.clone()).collect();
         // Type parameters are visible while reading the annotations.
@@ -513,6 +520,7 @@ impl<'m> Infer<'m> {
             captures: Vec::new(),
             this_fn: f.id,
             has_return_value: false,
+            yield_ty: None,
         });
         let result = self.signature_inner(f, method_of, method_kind, is_static, type_params);
         self.fns.pop();
@@ -558,11 +566,16 @@ impl<'m> Infer<'m> {
             None => {
                 if matches!(method_kind, Some(MethodKind::Constructor | MethodKind::Set)) {
                     Ty::Void
+                } else if f.is_generator {
+                    Ty::Gen(Box::new(self.types.fresh()))
                 } else {
                     self.types.fresh()
                 }
             }
         };
+        if f.is_generator && !matches!(self.types.resolve(&ret), Ty::Gen(_)) {
+            return self.err("a generator returns `Generator<T>`", f.span);
+        }
         Ok(FnInfo {
             id: f.id,
             name: f.name.clone(),

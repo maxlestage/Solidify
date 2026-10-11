@@ -24,6 +24,8 @@ pub enum Ty {
     /// shown differently.
     Map(Box<Ty>, Box<Ty>, bool),
     Set(Box<Ty>),
+    /// A generator (`function*`): a lazy sequence of values.
+    Gen(Box<Ty>),
     /// A struct, an enum or a type parameter, by name.
     Named(String),
     Func(Rc<FuncTy>),
@@ -150,6 +152,7 @@ impl Types {
             Ty::Option(t) => Ty::Option(Box::new(self.zonk(&t))),
             Ty::Array(t) => Ty::Array(Box::new(self.zonk(&t))),
             Ty::Set(t) => Ty::Set(Box::new(self.zonk(&t))),
+            Ty::Gen(t) => Ty::Gen(Box::new(self.zonk(&t))),
             Ty::Map(k, v, r) => Ty::Map(Box::new(self.zonk(&k)), Box::new(self.zonk(&v)), r),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.zonk(t)).collect()),
             Ty::Func(f) => Ty::Func(Rc::new(FuncTy {
@@ -168,7 +171,7 @@ impl Types {
     fn occurs(&self, v: TyVar, ty: &Ty) -> bool {
         match self.resolve(ty) {
             Ty::Var(w) => w == v,
-            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.occurs(v, &t),
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => self.occurs(v, &t),
             Ty::Map(k, val, _) => self.occurs(v, &k) || self.occurs(v, &val),
             Ty::Tuple(ts) => ts.iter().any(|t| self.occurs(v, t)),
             Ty::Func(f) => f.params.iter().any(|t| self.occurs(v, t)) || self.occurs(v, &f.ret),
@@ -215,7 +218,9 @@ impl Types {
                 self.describe(if a == Ty::Null { &b } else { &a }),
                 self.describe(if a == Ty::Null { &b } else { &a })
             )),
-            (Ty::Array(x), Ty::Array(y)) | (Ty::Set(x), Ty::Set(y)) => self.unify(x, y),
+            (Ty::Array(x), Ty::Array(y)) | (Ty::Set(x), Ty::Set(y)) | (Ty::Gen(x), Ty::Gen(y)) => {
+                self.unify(x, y)
+            }
             (Ty::Map(k1, v1, _), Ty::Map(k2, v2, _)) => {
                 self.unify(k1, k2)?;
                 self.unify(v1, v2)
@@ -276,6 +281,7 @@ impl Types {
                 self.describe(&v)
             ),
             Ty::Set(t) => format!("Set<{}>", self.describe(&t)),
+            Ty::Gen(t) => format!("Generator<{}>", self.describe(&t)),
             Ty::Named(n) => n,
             Ty::Func(f) => format!(
                 "({}) => {}",

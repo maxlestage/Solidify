@@ -154,6 +154,9 @@ impl<'m> Infer<'m> {
                 Ty::Map(Box::new(k), Box::new(v), true)
             }
             "Promise" => arg(self, 0)?,
+            "Generator" | "Iterable" | "IterableIterator" | "Iterator" => {
+                Ty::Gen(Box::new(arg(self, 0)?))
+            }
             "Partial" | "Required" | "Readonly" | "NonNullable" | "Awaited" => arg(self, 0)?,
             "Error" => Ty::Named("Error".into()),
             "Function" => {

@@ -158,7 +158,7 @@ impl<'m> Infer<'m> {
                     }
                 } else {
                     match &it {
-                        Ty::Array(t) | Ty::Set(t) => (**t).clone(),
+                        Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => (**t).clone(),
                         Ty::Str => Ty::Str,
                         Ty::Map(k, v, _) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
                         Ty::Var(_) => {
@@ -358,9 +358,11 @@ impl<'m> Infer<'m> {
                     ExprKind::Arrow(f) | ExprKind::Func(f) => Some(f.id),
                     _ => None,
                 };
+                let iter_result = self.is_iter_result(init);
                 if let Some(v) = self.vars.get_mut(id) {
                     v.alias = alias;
                     v.closure_fn = closure_fn;
+                    v.iter_result = iter_result;
                 }
                 if alias && let Some(&(_, test)) = self.narrowed_uses.get(&init.id) {
                     self.alias_of_narrow.push((*id, test));
@@ -392,9 +394,14 @@ impl<'m> Infer<'m> {
         } else {
             in_ctor
         };
+        // A generator body yields values and returns nothing.
+        let (ret, yield_ty) = match (f.is_generator, self.types.resolve(&info.sig.ret)) {
+            (true, Ty::Gen(t)) => (Ty::Void, Some(*t)),
+            _ => (info.sig.ret.clone(), None),
+        };
         self.fns.push(FnCtx {
             id: f.id,
-            ret: info.sig.ret.clone(),
+            ret,
             this,
             in_ctor,
             is_static,
@@ -404,6 +411,7 @@ impl<'m> Infer<'m> {
             captures: Vec::new(),
             this_fn,
             has_return_value: false,
+            yield_ty,
         });
         self.push_scope();
         let mut info = info;
@@ -432,8 +440,9 @@ impl<'m> Infer<'m> {
             }
             if let Some(v) = self.vars.get_mut(&param_ids[i]) {
                 v.param_of = Some((f.id, i));
-                // A parameter property is kept in the instance.
-                if in_ctor && (p.access.is_some() || p.readonly) {
+                // A parameter property is kept in the instance; a generator keeps its
+                // parameters for as long as it runs.
+                if (in_ctor && (p.access.is_some() || p.readonly)) || f.is_generator {
                     v.stored = true;
                     self.param_stored.insert((f.id, i));
                 }
@@ -537,6 +546,7 @@ impl<'m> Infer<'m> {
                         captures: Vec::new(),
                         this_fn: c.id,
                         has_return_value: false,
+                        yield_ty: None,
                     });
                     self.hints.insert(init.id, format!("{} {}", c.name, f.name));
                     let t = self.expr(init, Some(&fty));

@@ -197,7 +197,7 @@ impl<'m> Infer<'m> {
                 }
                 let t = self.arg_typed(args, 0, None, &full, span)?;
                 let item = match self.types.resolve(&t) {
-                    Ty::Array(t) | Ty::Set(t) => *t,
+                    Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => *t,
                     Ty::Str => Ty::Str,
                     Ty::Map(k, v, _) => Ty::Tuple(vec![*k, *v]),
                     other => {
@@ -361,6 +361,20 @@ impl<'m> Infer<'m> {
                 format!("tuples have no method `{prop}`: use an array"),
                 span,
             ),
+            Ty::Gen(item) => {
+                let item = (**item).clone();
+                match prop {
+                    "next" => {
+                        self.no_more_than(args, 0, "next", span)?;
+                        self.mark_receiver_mutated(obj);
+                        self.done(e, "generator.next".into(), Ty::Option(Box::new(item)))
+                    }
+                    _ => self.err(
+                        format!("generators have no method `{prop}`: iterate with `for … of`"),
+                        span,
+                    ),
+                }
+            }
             Ty::Any => self.err(
                 format!(
                     "`{}` is `any`: give it a type to call `.{prop}()`",

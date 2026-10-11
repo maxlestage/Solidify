@@ -135,6 +135,8 @@ pub(super) struct FnGen {
     pub id: NodeId,
     pub returns_result: bool,
     pub ret_ty: Ty,
+    /// Inside a generator: the type of the values yielded.
+    pub yield_ty: Option<Ty>,
     pub targets: Vec<Target>,
     pub try_ctx: Vec<TryCtx>,
     pub in_ctor: bool,
@@ -421,7 +423,7 @@ pub(super) fn visit_expr_deep<'e>(
         | ExprKind::Void(x)
         | ExprKind::Delete(x)
         | ExprKind::Await(x) => visit!(x),
-        ExprKind::Yield(Some(x)) => visit!(x),
+        ExprKind::Yield { value: Some(x), .. } => visit!(x),
         ExprKind::Tagged { tag, exprs, .. } => {
             visit!(tag);
             exprs.iter().for_each(|x| visit!(x));
@@ -627,7 +629,7 @@ fn collect_expr<'a>(
         | ExprKind::Void(x)
         | ExprKind::Delete(x)
         | ExprKind::Await(x) => visit!(x),
-        ExprKind::Yield(Some(x)) => visit!(x),
+        ExprKind::Yield { value: Some(x), .. } => visit!(x),
         ExprKind::Tagged { tag, exprs, .. } => {
             visit!(tag);
             exprs.iter().for_each(|x| visit!(x));
@@ -783,6 +785,7 @@ impl<'a> Gen<'a> {
             Helper::Inspect => "js_inspect",
             Helper::JsMap => "JsMap",
             Helper::JsSet => "JsSet",
+            Helper::Generator => "JsGenerator",
         }
     }
 
@@ -1114,6 +1117,10 @@ impl<'a> Gen<'a> {
                 let name = self.set_name();
                 format!("{name}<{}>", self.rust_ty(&t, span)?)
             }
+            Ty::Gen(t) => {
+                let name = self.helper(Helper::Generator);
+                format!("{name}<{}>", self.rust_ty(&t, span)?)
+            }
             Ty::Named(n) => {
                 if n == "Error" {
                     "String".into()
@@ -1191,7 +1198,8 @@ impl<'a> Gen<'a> {
         if let Ty::Func(_) = ty {
             return if stored { Mode::Value } else { Mode::FnImpl };
         }
-        if self.is_copy(&ty) {
+        // A generator is consumed by whoever iterates it.
+        if self.is_copy(&ty) || matches!(ty, Ty::Gen(_)) {
             return Mode::Value;
         }
         if stored || reassigned {
