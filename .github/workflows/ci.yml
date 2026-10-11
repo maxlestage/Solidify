@@ -40,3 +40,25 @@ jobs:
         run: BASE_PATH=/Solidify cargo run --release -p solidify-site -- export dist
       - name: Package the crate
         run: cargo package -p solidify --allow-dirty
+
+  # Every branch is merged into master as soon as everything above is green (master is then
+  # published on GitHub Pages by pages.yml). Branches named wip/... are never merged.
+  merge:
+    if: >-
+      github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') &&
+      github.ref_name != 'master' && !startsWith(github.ref_name, 'wip/')
+    needs: [rust]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+      - name: Merge into master
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit "origin/${GITHUB_REF_NAME}"
+          git push origin master

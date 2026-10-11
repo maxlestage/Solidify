@@ -6,7 +6,7 @@ use solidify::types::Ty;
 
 fn program(src: &str) -> solidify::infer::Program {
     let module = parse(src).unwrap_or_else(|e| panic!("{}", e.pretty(src)));
-    infer(&module, src).unwrap_or_else(|e| panic!("{}", e.pretty(src)))
+    infer(&module, src, &[]).unwrap_or_else(|e| panic!("{}", e.pretty(src)))
 }
 
 fn var_ty(p: &solidify::infer::Program, name: &str) -> String {
@@ -114,13 +114,13 @@ fn unconstrained_parameters_are_generic() {
 fn errors_are_precise() {
     let src = "let x = 5;\nx = \"a\";";
     let module = parse(src).unwrap();
-    let Err(err) = infer(&module, src) else {
+    let Err(err) = infer(&module, src, &[]) else {
         panic!("expected an error")
     };
     assert_eq!(err.position(src), (2, 5));
     let src = "const p = { x: 1 };\nconsole.log(p.y);";
     let module = parse(src).unwrap();
-    let Err(err) = infer(&module, src) else {
+    let Err(err) = infer(&module, src, &[]) else {
         panic!("expected an error")
     };
     assert!(err.message.contains("no property `y`"), "{}", err.message);

@@ -27,6 +27,7 @@ impl<'m> Infer<'m> {
             captures: Vec::new(),
             this_fn: self.main_id,
             has_return_value: false,
+            yield_ty: None,
         });
         self.funcs.insert(
             self.main_id,
@@ -48,6 +49,7 @@ impl<'m> Infer<'m> {
                 method_of: None,
                 method_kind: None,
                 is_static: false,
+                is_abstract: false,
                 mutates_self: false,
                 captures: Vec::new(),
                 escapes: false,
@@ -59,8 +61,12 @@ impl<'m> Infer<'m> {
                 span: Span::default(),
             },
         );
+        self.check_cross_file_names(&module.body)?;
         self.collect_types(&module.body)?;
+        // Imported types first: annotations of top-level values may name them.
+        self.bind_imports(&module.body, true)?;
         self.collect_values(&module.body, true)?;
+        self.bind_imports(&module.body, false)?;
         for s in &module.body {
             self.stmt(s)?;
             if !matches!(
@@ -73,6 +79,7 @@ impl<'m> Infer<'m> {
                     | StmtKind::Empty
                     | StmtKind::Import(_)
                     | StmtKind::ExportNames(_)
+                    | StmtKind::ExportFrom { .. }
             ) {
                 self.has_main = true;
             }
@@ -80,6 +87,10 @@ impl<'m> Infer<'m> {
         let ctx = self.fns.pop().expect("main");
         let info = self.funcs.get_mut(&self.main_id).expect("main");
         info.captures = ctx.captures;
+        // Timers run after the script: `main` exists for them.
+        if self.uses_timers {
+            self.has_main = true;
+        }
         Ok(())
     }
 
@@ -99,6 +110,8 @@ impl<'m> Infer<'m> {
                         exported: i.exported,
                         span: i.span,
                         statics: Vec::new(),
+                        parent: None,
+                        is_abstract: false,
                     });
                 }
                 StmtKind::Class(c) => {
@@ -112,6 +125,8 @@ impl<'m> Infer<'m> {
                         exported: c.exported,
                         span: c.span,
                         statics: Vec::new(),
+                        parent: None,
+                        is_abstract: false,
                     });
                 }
                 StmtKind::Enum(e) => {
@@ -133,6 +148,8 @@ impl<'m> Infer<'m> {
                             exported: a.exported,
                             span: a.span,
                             statics: Vec::new(),
+                            parent: None,
+                            is_abstract: false,
                         }),
                         TypeAnn::Union(members, span)
                             if members.len() > 1
@@ -160,11 +177,29 @@ impl<'m> Infer<'m> {
             if let StmtKind::TypeAlias(a) = &s.kind
                 && !self.type_exists(&a.name)
             {
+                let before = self.unions.len();
                 let ty = self.ann(&a.ty, &a.name)?;
+                // A union made for this alias takes its name.
+                if let Ty::Named(n) = &ty
+                    && self.unions.len() > before
+                    && self.unions.last().is_some_and(|u| u.name == *n)
+                {
+                    let u = self.unions.last_mut().expect("union");
+                    u.name = a.name.clone();
+                    u.exported = a.exported;
+                    self.aliases
+                        .insert(a.name.clone(), Ty::Named(a.name.clone()));
+                    continue;
+                }
                 self.aliases.insert(a.name.clone(), ty);
             }
         }
         // Fields and signatures.
+        for s in stmts {
+            if let StmtKind::Class(c) = &s.kind {
+                self.class_asts.insert(c.name.clone(), c);
+            }
+        }
         for s in stmts {
             match &s.kind {
                 StmtKind::Interface(i) => {
@@ -271,11 +306,8 @@ impl<'m> Infer<'m> {
 
     /// Fields, methods and the constructor of a class (signatures only).
     fn collect_class(&mut self, c: &'m Class) -> IResult<()> {
-        if c.extends.is_some() {
-            return self.err(
-                "`extends` is not supported: Rust has no inheritance, prefer a field holding the base (composition)",
-                c.span,
-            );
+        if !self.collected_classes.insert(c.name.clone()) {
+            return Ok(());
         }
         if !c.type_params.is_empty() {
             return self.err("generic classes are not supported", c.span);
@@ -283,11 +315,39 @@ impl<'m> Infer<'m> {
         if c.name.is_empty() {
             return self.err("classes need a name", c.span);
         }
-        self.this_class_stack.push(c.name.clone());
+        // The base class first: its fields come first, its methods are inherited.
+        let mut parent = None;
         let mut fields = Vec::new();
+        if let Some(base) = &c.extends {
+            let ExprKind::Ident(base_name) = &base.kind else {
+                return self.err(
+                    "a class can only extend a class declared in the program",
+                    base.span,
+                );
+            };
+            if base_name == "Error" {
+                return self.err(
+                    "custom error classes are not supported: throw `new Error(message)`",
+                    base.span,
+                );
+            }
+            let Some(base_ast) = self.class_asts.get(base_name.as_str()).copied() else {
+                return self.err(format!("unknown base class `{base_name}`"), base.span);
+            };
+            if self.is_subclass(base_name, &c.name) && base_name != &c.name {
+                return self.err("classes cannot extend each other in a cycle", c.span);
+            }
+            self.collect_class(base_ast)?;
+            let base_info = self.struct_by_name(base_name).expect("base").clone();
+            fields.extend(base_info.fields.iter().cloned());
+            parent = Some(base_name.clone());
+        }
+        self.this_class_stack.push(c.name.clone());
         let mut methods = Vec::new();
         let mut statics = Vec::new();
         let mut ctor = None;
+        // Parameter properties are set before the field initializers run: they come first.
+        let mut declared: Vec<FieldInfo> = Vec::new();
         for m in &c.members {
             match m {
                 ClassMember::Field(f) => {
@@ -303,15 +363,28 @@ impl<'m> Infer<'m> {
                         statics.push((f.name.clone(), ty, None));
                         continue;
                     }
-                    fields.push(FieldInfo {
+                    let literal = match (&f.ty, &f.init) {
+                        (Some(TypeAnn::Lit(Lit::Str(s), _)), _) => Some(s.clone()),
+                        (
+                            None,
+                            Some(Expr {
+                                kind: ExprKind::Str(s),
+                                ..
+                            }),
+                        ) if f.readonly => Some(s.clone()),
+                        _ => None,
+                    };
+                    let field = FieldInfo {
                         name: f.name.clone(),
                         ty,
                         optional,
                         access: f.access,
                         readonly: f.readonly,
                         has_init: f.init.is_some(),
+                        literal,
                         span: f.span,
-                    });
+                    };
+                    declared.push(field);
                 }
                 ClassMember::Method(m) => {
                     if m.kind == MethodKind::Constructor {
@@ -337,13 +410,56 @@ impl<'m> Infer<'m> {
                                     access: p.access,
                                     readonly: p.readonly,
                                     has_init: true,
+                                    literal: None,
                                     span: *span,
                                 });
                             }
                         }
                         ctor = Some(m.func.id);
                     }
-                    let info = self.signature(&m.func, Some(&c.name), Some(m.kind), m.is_static)?;
+                    let mut info =
+                        self.signature(&m.func, Some(&c.name), Some(m.kind), m.is_static)?;
+                    info.is_abstract = m.is_abstract;
+                    // A parameter property has the type of its field.
+                    if m.kind == MethodKind::Constructor {
+                        for (i, p) in m.func.params.iter().enumerate() {
+                            if (p.access.is_some() || p.readonly)
+                                && let Pattern::Ident { name, .. } = &p.pat
+                                && let Some(f) = fields.iter().find(|f| f.name == *name)
+                            {
+                                let fty = if f.optional {
+                                    Ty::Option(Box::new(f.ty.clone()))
+                                } else {
+                                    f.ty.clone()
+                                };
+                                self.unify(&info.sig.params[i], &fty, p.span)?;
+                            }
+                        }
+                    }
+                    if m.is_abstract && !c.is_abstract {
+                        return self.err("abstract methods belong in an abstract class", m.span);
+                    }
+                    // An override: same signature as the base method.
+                    if let Some(p) = &parent
+                        && m.kind != MethodKind::Constructor
+                        && let Some((_, base_m)) = self.find_method(p, &m.name, m.kind)
+                    {
+                        let base_sig = self.funcs[&base_m.fn_id].sig.clone();
+                        if base_sig.params.len() != info.sig.params.len() {
+                            return self.err(
+                                format!("`{}` takes a different number of parameters than in the base class", m.name),
+                                m.span,
+                            );
+                        }
+                        for (a, b) in base_sig.params.iter().zip(&info.sig.params) {
+                            self.unify(a, b, m.span)?;
+                        }
+                        self.unify(&base_sig.ret, &info.sig.ret, m.span)?;
+                        self.overrides
+                            .entry(base_m.fn_id)
+                            .or_default()
+                            .push(m.func.id);
+                    }
                     self.funcs.insert(m.func.id, info);
                     if m.kind != MethodKind::Constructor {
                         methods.push(MethodInfo {
@@ -351,6 +467,8 @@ impl<'m> Infer<'m> {
                             fn_id: m.func.id,
                             kind: m.kind,
                             is_static: m.is_static,
+                            is_abstract: m.is_abstract,
+                            access: m.access,
                         });
                     }
                 }
@@ -359,12 +477,24 @@ impl<'m> Infer<'m> {
                 }
             }
         }
+        for field in declared {
+            // A field declared again in a subclass keeps its place.
+            match fields.iter().position(|g: &FieldInfo| g.name == field.name) {
+                Some(i) => {
+                    self.unify(&fields[i].ty, &field.ty, field.span)?;
+                    fields[i] = field;
+                }
+                None => fields.push(field),
+            }
+        }
         self.this_class_stack.pop();
         let s = self.struct_mut(&c.name).expect("class");
         s.fields = fields;
         s.methods = methods;
         s.ctor = ctor;
         s.statics = statics;
+        s.parent = parent;
+        s.is_abstract = c.is_abstract;
         Ok(())
     }
 
@@ -376,8 +506,14 @@ impl<'m> Infer<'m> {
         method_kind: Option<MethodKind>,
         is_static: bool,
     ) -> IResult<FnInfo> {
-        if f.is_generator {
-            return self.err("generators are not supported", f.span);
+        if f.is_generator && f.is_async {
+            return self.err("async generators are not supported", f.span);
+        }
+        if f.is_generator && method_of.is_some() {
+            return self.err(
+                "generator methods are not supported: use a function",
+                f.span,
+            );
         }
         let type_params: Vec<String> = f.type_params.iter().map(|t| t.name.clone()).collect();
         // Type parameters are visible while reading the annotations.
@@ -393,6 +529,7 @@ impl<'m> Infer<'m> {
             captures: Vec::new(),
             this_fn: f.id,
             has_return_value: false,
+            yield_ty: None,
         });
         let result = self.signature_inner(f, method_of, method_kind, is_static, type_params);
         self.fns.pop();
@@ -438,11 +575,16 @@ impl<'m> Infer<'m> {
             None => {
                 if matches!(method_kind, Some(MethodKind::Constructor | MethodKind::Set)) {
                     Ty::Void
+                } else if f.is_generator {
+                    Ty::Gen(Box::new(self.types.fresh()))
                 } else {
                     self.types.fresh()
                 }
             }
         };
+        if f.is_generator && !matches!(self.types.resolve(&ret), Ty::Gen(_)) {
+            return self.err("a generator returns `Generator<T>`", f.span);
+        }
         Ok(FnInfo {
             id: f.id,
             name: f.name.clone(),
@@ -453,11 +595,14 @@ impl<'m> Infer<'m> {
             type_params,
             throws: false,
             throw_direct: false,
-            is_async: f.is_async,
+            // A function giving a `Promise` is awaited by its callers: async in Rust.
+            is_async: f.is_async
+                || matches!(&f.ret, Some(TypeAnn::Named { name, .. }) if name == "Promise"),
             is_arrow: f.is_arrow,
             method_of: method_of.map(str::to_string),
             method_kind,
             is_static,
+            is_abstract: false,
             mutates_self: false,
             captures: Vec::new(),
             escapes: false,

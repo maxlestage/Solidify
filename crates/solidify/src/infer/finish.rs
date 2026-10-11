@@ -13,12 +13,29 @@ impl<'m> Infer<'m> {
     pub(super) fn finish(mut self) -> IResult<Program> {
         self.propagate_throws();
         self.propagate_mutation();
+        self.float_json_numbers();
         // A narrowed value whose alias is changed is bound mutably.
         for (binding, test) in self.alias_of_narrow.clone() {
             if self.vars.get(&binding).is_some_and(|v| v.mutated)
                 && let Some(t) = self.narrow_tests.get_mut(&test)
             {
                 t.mutated = true;
+            }
+        }
+        // A variable captured by a closure that is kept (returned, stored, given to a
+        // timer) and changed somewhere is shared between the closure and its scope.
+        let escaping: Vec<NodeId> = self
+            .funcs
+            .values()
+            .filter(|f| f.escapes)
+            .flat_map(|f| f.captures.iter().copied())
+            .collect();
+        for id in escaping {
+            if let Some(v) = self.vars.get_mut(&id)
+                && (v.reassigned || v.mutated || v.mutated_in_closure)
+                && !matches!(v.role, Role::Func | Role::Class | Role::Enum)
+            {
+                v.shared = true;
             }
         }
         let boxed = self.boxed_structs();
@@ -53,6 +70,12 @@ impl<'m> Infer<'m> {
         for n in narrow_tests.values_mut() {
             n.inner = zonk(&n.inner);
         }
+        let mut unions = self.unions;
+        for u in &mut unions {
+            for m in &mut u.members {
+                m.ty = zonk(&m.ty);
+            }
+        }
         Ok(Program {
             types,
             node_count: self.node_count,
@@ -63,6 +86,7 @@ impl<'m> Infer<'m> {
             fn_bindings: self.fn_bindings,
             structs,
             enums: self.enums,
+            unions,
             calls: self.calls,
             literal_struct: self.literal_struct,
             enum_literal: self.enum_literal,
@@ -74,6 +98,9 @@ impl<'m> Infer<'m> {
             main_id: self.main_id,
             has_main: self.has_main,
             boxed,
+            polymorphic: self.polymorphic,
+            overrides: self.overrides,
+            uses_timers: self.uses_timers,
         })
     }
 
@@ -118,6 +145,62 @@ impl<'m> Infer<'m> {
         out
     }
 
+    /// JSON numbers are doubles: a number read by `JSON.parse` that nothing in the program
+    /// constrains to an integer is a float.
+    fn float_json_numbers(&mut self) {
+        let targets = std::mem::take(&mut self.json_targets);
+        let mut seen = HashSet::new();
+        for t in &targets {
+            self.float_unknown_numbers(t, &mut seen);
+        }
+    }
+
+    fn float_unknown_numbers(&mut self, t: &Ty, seen: &mut HashSet<String>) {
+        match self.types.resolve(t) {
+            Ty::Num(f) => {
+                if self.types.flavor(f) == Flavor::Unknown || self.types.soft_int(f) {
+                    self.types.set_flavor(f, Flavor::Float);
+                }
+            }
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => {
+                self.float_unknown_numbers(&t, seen);
+            }
+            Ty::Map(k, v, _) => {
+                self.float_unknown_numbers(&k, seen);
+                self.float_unknown_numbers(&v, seen);
+            }
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.float_unknown_numbers(t, seen);
+                }
+            }
+            Ty::Named(n) => {
+                if !seen.insert(n.clone()) {
+                    return;
+                }
+                let fields: Vec<Ty> = self
+                    .structs
+                    .iter()
+                    .find(|s| s.name == n)
+                    .map(|s| s.fields.iter().map(|f| f.ty.clone()).collect())
+                    .unwrap_or_default();
+                for t in &fields {
+                    self.float_unknown_numbers(t, seen);
+                }
+                let members: Vec<Ty> = self
+                    .unions
+                    .iter()
+                    .find(|u| u.name == n)
+                    .map(|u| u.members.iter().map(|m| m.ty.clone()).collect())
+                    .unwrap_or_default();
+                for t in &members {
+                    self.float_unknown_numbers(t, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// A function throws if it throws itself or calls, outside a `try`, one that does.
     fn propagate_throws(&mut self) {
         for f in self.funcs.values_mut() {
@@ -151,9 +234,9 @@ impl<'m> Infer<'m> {
     fn propagate_mutation(&mut self) {
         loop {
             let mut changed = false;
-            // Methods calling `this.m()` where `m` mutates self.
+            // Methods calling `this.m()` where `m` (or an override of it) mutates self.
             for (callee, caller) in self.this_calls.clone() {
-                if self.funcs.get(&callee).is_some_and(|f| f.mutates_self)
+                if self.method_mutates(callee)
                     && let Some(c) = self.funcs.get_mut(&caller)
                     && !c.mutates_self
                 {
@@ -161,9 +244,22 @@ impl<'m> Infer<'m> {
                     changed = true;
                 }
             }
-            // `obj.m()` where `m` mutates self: `obj` is mutated.
+            // `obj.m()` where `m` (or an override of it) mutates self: `obj` is mutated.
             for (callee, root) in self.method_receivers.clone() {
-                if self.funcs.get(&callee).is_some_and(|f| f.mutates_self)
+                if self.method_mutates(callee)
+                    && let Some(v) = self.vars.get_mut(&root)
+                    && !v.mutated
+                {
+                    v.mutated = true;
+                    if let Some(p) = v.param_of {
+                        self.param_mutated.insert(p);
+                    }
+                    changed = true;
+                }
+            }
+            // A loop variable changed in place changes its collection.
+            for (var, root) in self.loop_sources.clone() {
+                if self.vars.get(&var).is_some_and(|v| v.mutated)
                     && let Some(v) = self.vars.get_mut(&root)
                     && !v.mutated
                 {
@@ -192,6 +288,15 @@ impl<'m> Infer<'m> {
                 break;
             }
         }
+    }
+
+    /// Whether a method, or an override of it, changes `this`.
+    fn method_mutates(&self, fn_id: NodeId) -> bool {
+        self.funcs.get(&fn_id).is_some_and(|f| f.mutates_self)
+            || self
+                .overrides
+                .get(&fn_id)
+                .is_some_and(|os| os.iter().any(|o| self.method_mutates(*o)))
     }
 
     /// Parameters whose type is still unknown become type parameters; numbers of unknown
@@ -331,8 +436,8 @@ pub(super) fn collect_vars(types: &Types, t: &Ty, out: &mut Vec<usize>) {
                 out.push(v);
             }
         }
-        Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => collect_vars(types, &t, out),
-        Ty::Map(k, v) => {
+        Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => collect_vars(types, &t, out),
+        Ty::Map(k, v, _) => {
             collect_vars(types, &k, out);
             collect_vars(types, &v, out);
         }
@@ -352,9 +457,11 @@ pub(super) fn substitute(t: &Ty, subst: &HashMap<String, Ty>, types: &Types) -> 
         Ty::Option(t) => Ty::Option(Box::new(substitute(&t, subst, types))),
         Ty::Array(t) => Ty::Array(Box::new(substitute(&t, subst, types))),
         Ty::Set(t) => Ty::Set(Box::new(substitute(&t, subst, types))),
-        Ty::Map(k, v) => Ty::Map(
+        Ty::Gen(t) => Ty::Gen(Box::new(substitute(&t, subst, types))),
+        Ty::Map(k, v, r) => Ty::Map(
             Box::new(substitute(&k, subst, types)),
             Box::new(substitute(&v, subst, types)),
+            r,
         ),
         Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| substitute(t, subst, types)).collect()),
         Ty::Func(f) => Ty::Func(Rc::new(FuncTy {
@@ -370,14 +477,15 @@ pub(super) fn substitute(t: &Ty, subst: &HashMap<String, Ty>, types: &Types) -> 
 }
 
 /// Whether two resolved types have the same shape (variables match anything).
-pub(super) fn same_shape_ty(a: &Ty, b: &Ty) -> bool {
+pub fn same_shape_ty(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Var(_), _) | (_, Ty::Var(_)) => true,
         (Ty::Num(_), Ty::Num(_)) => true,
         (Ty::Option(x), Ty::Option(y))
         | (Ty::Array(x), Ty::Array(y))
-        | (Ty::Set(x), Ty::Set(y)) => same_shape_ty(x, y),
-        (Ty::Map(k1, v1), Ty::Map(k2, v2)) => same_shape_ty(k1, k2) && same_shape_ty(v1, v2),
+        | (Ty::Set(x), Ty::Set(y))
+        | (Ty::Gen(x), Ty::Gen(y)) => same_shape_ty(x, y),
+        (Ty::Map(k1, v1, _), Ty::Map(k2, v2, _)) => same_shape_ty(k1, k2) && same_shape_ty(v1, v2),
         (Ty::Tuple(xs), Ty::Tuple(ys)) => {
             xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| same_shape_ty(x, y))
         }

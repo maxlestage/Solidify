@@ -10,6 +10,8 @@ pub struct Module {
     pub body: Vec<Stmt>,
     /// One more than the largest [`NodeId`] in the tree.
     pub node_count: usize,
+    /// The function or class exported with `export default`.
+    pub default_export: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +83,12 @@ pub enum StmtKind {
     Import(Import),
     /// `export { a, b as c }`.
     ExportNames(Vec<(String, Option<String>)>),
+    /// `export { a as b } from "./x"` or `export * from "./x"`.
+    ExportFrom {
+        names: Vec<(String, Option<String>)>,
+        all: bool,
+        from: String,
+    },
     ExportDefault(Expr),
     Labeled {
         label: String,
@@ -283,6 +291,8 @@ pub struct Method {
     pub func: Function,
     pub is_static: bool,
     pub access: Option<Access>,
+    /// `abstract m(): T;`: a signature the subclasses implement.
+    pub is_abstract: bool,
     pub span: Span,
 }
 
@@ -511,7 +521,11 @@ pub enum ExprKind {
     Void(Box<Expr>),
     Delete(Box<Expr>),
     Await(Box<Expr>),
-    Yield(Option<Box<Expr>>),
+    /// `yield value` / `yield* iterable` in a generator.
+    Yield {
+        value: Option<Box<Expr>>,
+        delegate: bool,
+    },
     Seq(Vec<Expr>),
     Regex {
         pattern: String,

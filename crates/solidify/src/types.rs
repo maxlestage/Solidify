@@ -20,8 +20,12 @@ pub enum Ty {
     Option(Box<Ty>),
     Array(Box<Ty>),
     Tuple(Vec<Ty>),
-    Map(Box<Ty>, Box<Ty>),
+    /// A `Map`, or (`true`) a `Record` / object used as a dictionary: the same in Rust,
+    /// shown differently.
+    Map(Box<Ty>, Box<Ty>, bool),
     Set(Box<Ty>),
+    /// A generator (`function*`): a lazy sequence of values.
+    Gen(Box<Ty>),
     /// A struct, an enum or a type parameter, by name.
     Named(String),
     Func(Rc<FuncTy>),
@@ -55,6 +59,9 @@ enum Slot<T> {
 pub struct Types {
     vars: Vec<Slot<Ty>>,
     flavors: Vec<Slot<Flavor>>,
+    /// Integer flavors that come from an integer-only use (an index, a length, `parseInt`…),
+    /// not only from integer literals.
+    hard: Vec<bool>,
 }
 
 impl Types {
@@ -69,6 +76,7 @@ impl Types {
         } else {
             Slot::Value(flavor)
         });
+        self.hard.push(flavor == Flavor::Int);
         Ty::Num(self.flavors.len() - 1)
     }
 
@@ -78,6 +86,22 @@ impl Types {
 
     pub fn float(&mut self) -> Ty {
         self.num(Flavor::Float)
+    }
+
+    /// The type of an integer literal: an integer unless something makes it a float.
+    pub fn int_literal(&mut self) -> Ty {
+        let t = self.num(Flavor::Int);
+        if let Ty::Num(v) = t {
+            self.hard[v] = false;
+        }
+        t
+    }
+
+    /// An integer only because of integer literals: data read at run time (JSON) may make
+    /// it a float.
+    pub fn soft_int(&self, v: TyVar) -> bool {
+        let root = self.find_flavor(v);
+        matches!(self.flavors[root], Slot::Value(Flavor::Int)) && !self.hard[root]
     }
 
     fn find_var(&self, mut v: TyVar) -> TyVar {
@@ -111,6 +135,9 @@ impl Types {
         if flavor > current {
             self.flavors[root] = Slot::Value(flavor);
         }
+        if flavor == Flavor::Int {
+            self.hard[root] = true;
+        }
     }
 
     fn union_flavors(&mut self, a: TyVar, b: TyVar) {
@@ -120,6 +147,7 @@ impl Types {
         }
         let fa = self.flavor(ra);
         let fb = self.flavor(rb);
+        self.hard[rb] = self.hard[ra] || self.hard[rb];
         self.flavors[ra] = Slot::Link(rb);
         self.flavors[rb] = Slot::Value(fa.max(fb));
         if fa.max(fb) == Flavor::Unknown {
@@ -148,7 +176,8 @@ impl Types {
             Ty::Option(t) => Ty::Option(Box::new(self.zonk(&t))),
             Ty::Array(t) => Ty::Array(Box::new(self.zonk(&t))),
             Ty::Set(t) => Ty::Set(Box::new(self.zonk(&t))),
-            Ty::Map(k, v) => Ty::Map(Box::new(self.zonk(&k)), Box::new(self.zonk(&v))),
+            Ty::Gen(t) => Ty::Gen(Box::new(self.zonk(&t))),
+            Ty::Map(k, v, r) => Ty::Map(Box::new(self.zonk(&k)), Box::new(self.zonk(&v)), r),
             Ty::Tuple(ts) => Ty::Tuple(ts.iter().map(|t| self.zonk(t)).collect()),
             Ty::Func(f) => Ty::Func(Rc::new(FuncTy {
                 params: f.params.iter().map(|t| self.zonk(t)).collect(),
@@ -166,8 +195,8 @@ impl Types {
     fn occurs(&self, v: TyVar, ty: &Ty) -> bool {
         match self.resolve(ty) {
             Ty::Var(w) => w == v,
-            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.occurs(v, &t),
-            Ty::Map(k, val) => self.occurs(v, &k) || self.occurs(v, &val),
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => self.occurs(v, &t),
+            Ty::Map(k, val, _) => self.occurs(v, &k) || self.occurs(v, &val),
             Ty::Tuple(ts) => ts.iter().any(|t| self.occurs(v, t)),
             Ty::Func(f) => f.params.iter().any(|t| self.occurs(v, t)) || self.occurs(v, &f.ret),
             _ => false,
@@ -213,8 +242,10 @@ impl Types {
                 self.describe(if a == Ty::Null { &b } else { &a }),
                 self.describe(if a == Ty::Null { &b } else { &a })
             )),
-            (Ty::Array(x), Ty::Array(y)) | (Ty::Set(x), Ty::Set(y)) => self.unify(x, y),
-            (Ty::Map(k1, v1), Ty::Map(k2, v2)) => {
+            (Ty::Array(x), Ty::Array(y)) | (Ty::Set(x), Ty::Set(y)) | (Ty::Gen(x), Ty::Gen(y)) => {
+                self.unify(x, y)
+            }
+            (Ty::Map(k1, v1, _), Ty::Map(k2, v2, _)) => {
                 self.unify(k1, k2)?;
                 self.unify(v1, v2)
             }
@@ -267,8 +298,14 @@ impl Types {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Ty::Map(k, v) => format!("Map<{}, {}>", self.describe(&k), self.describe(&v)),
+            Ty::Map(k, v, record) => format!(
+                "{}<{}, {}>",
+                if record { "Record" } else { "Map" },
+                self.describe(&k),
+                self.describe(&v)
+            ),
             Ty::Set(t) => format!("Set<{}>", self.describe(&t)),
+            Ty::Gen(t) => format!("Generator<{}>", self.describe(&t)),
             Ty::Named(n) => n,
             Ty::Func(f) => format!(
                 "({}) => {}",
