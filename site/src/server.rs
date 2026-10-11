@@ -247,6 +247,30 @@ mod tests {
         assert_eq!(status, "404 Not Found");
     }
 
+    /// Nothing scrolls sideways (site/README.md, "No horizontal scrolling"): no rule of
+    /// the stylesheet makes an element scroll horizontally, or keeps code from wrapping.
+    #[test]
+    fn nothing_scrolls_sideways() {
+        let css = std::fs::read_to_string(site_dir().join("static/app.css")).unwrap();
+        for (n, line) in css.lines().enumerate() {
+            let rule = line.trim();
+            for forbidden in [
+                "overflow: auto",
+                "overflow: scroll",
+                "overflow-x: auto",
+                "overflow-x: scroll",
+                "white-space: pre;",
+            ] {
+                assert!(
+                    !rule.starts_with(forbidden),
+                    "app.css:{}: `{rule}` can scroll sideways",
+                    n + 1
+                );
+            }
+        }
+        assert!(css.contains("overflow-wrap: anywhere"));
+    }
+
     #[test]
     fn export_writes_every_page() {
         let dir = std::env::temp_dir().join(format!("solidify-site-{}", std::process::id()));
