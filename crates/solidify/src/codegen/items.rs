@@ -1428,6 +1428,11 @@ impl<'a> Gen<'a> {
                 let FnBody::Block(b) = &f.body else {
                     unreachable!()
                 };
+                // A method: the body runs on the generator's thread, on a copy of `self`.
+                if method.is_some() && info.uses_this {
+                    g.line("let this = self.clone();");
+                    g.fn_ctx_mut().this_name = "this";
+                }
                 let gen_name = g.helper(Helper::Generator);
                 g.line(&format!("{gen_name}::new(move |y| {{"));
                 g.indent += 1;

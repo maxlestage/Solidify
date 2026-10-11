@@ -209,7 +209,7 @@ impl<'a> Gen<'a> {
                 let receiver_kind = name.split('.').next().unwrap_or("");
                 match receiver_kind {
                     "console" | "Math" | "Number" | "String" | "Object" | "Array" | "Date"
-                    | "performance" | "process" | "Promise" | "JSON" => {
+                    | "Symbol" | "performance" | "process" | "Promise" | "JSON" => {
                         self.namespace_call(e, name, args)
                     }
                     _ => self.method_builtin(e, obj, name, args),
@@ -721,6 +721,16 @@ impl<'a> Gen<'a> {
                     ),
                 }
             }
+            "global.Symbol" => {
+                let h = self.helper(Helper::Symbol);
+                match args.first() {
+                    Some(a) => {
+                        let d = self.expr_as(&a.expr, Want::StrRef)?;
+                        E::owned(format!("{h}::new(Some({d}))"), PREC_POSTFIX)
+                    }
+                    None => E::owned(format!("{h}::new(None)"), PREC_POSTFIX),
+                }
+            }
             "global.Boolean" => {
                 let c = self.cond(&args[0].expr)?;
                 E::owned(c, PREC_ATOM)
@@ -766,6 +776,9 @@ impl<'a> Gen<'a> {
                 }
                 let mut fmt = String::new();
                 let mut list = Vec::new();
+                // `console.log(xs[i++], i)`: every value in order, none read by name.
+                let before = self.inline_names;
+                self.inline_names = !args.iter().any(|a| super::changes_something(&a.expr));
                 for (i, a) in args.iter().enumerate() {
                     if i > 0 {
                         fmt.push(' ');
@@ -791,7 +804,9 @@ impl<'a> Gen<'a> {
                     fmt.push_str(&spec);
                     list.extend(arg);
                 }
-                E::owned(format_call(macro_name, &fmt, &list), PREC_ATOM)
+                let in_order = !self.inline_names;
+                self.inline_names = before;
+                E::owned(in_order_call(macro_name, &fmt, &list, in_order), PREC_ATOM)
             }
             "Math.floor" | "Math.ceil" | "Math.round" | "Math.trunc" => {
                 let at = self.ty_of(&args[0].expr);
@@ -998,6 +1013,11 @@ impl<'a> Gen<'a> {
                         format!("{m}.iter().map(|(k, v)| (k.clone(), v.clone()))")
                     }
                     Ty::Gen(_) => self.expr_as(&args[0].expr, Want::Owned)?,
+                    ref other if self.struct_iteration(other).is_some() => {
+                        let (_, generator) = self.struct_iteration(other).expect("iterable");
+                        let r = self.recv(&args[0].expr)?;
+                        self.iteration_source(&r, generator)
+                    }
                     _ => {
                         let x = self.expr(&args[0].expr)?;
                         if x.repr == Repr::Owned && x.var.is_none() {
@@ -1066,6 +1086,15 @@ impl<'a> Gen<'a> {
                     code.push_str(".unwrap()");
                 }
                 E::owned(code, PREC_POSTFIX)
+            }
+            "Symbol.for" => {
+                let h = self.helper(Helper::Symbol);
+                let k = self.expr_as(&args[0].expr, Want::StrRef)?;
+                E::owned(format!("{h}::for_key({k})"), PREC_POSTFIX)
+            }
+            "Symbol.keyFor" => {
+                let s = self.expr_as(&args[0].expr, Want::Owned)?;
+                E::owned(format!("{}.key_for()", paren_num(&s)), PREC_POSTFIX)
             }
             "Date.now" => E::owned(
                 "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)",
@@ -1303,6 +1332,10 @@ impl<'a> Gen<'a> {
             "date" => {
                 let r = self.recv(obj)?;
                 Ok(E::owned(format!("{r}.{}()", snake(method)), PREC_POSTFIX))
+            }
+            "symbol" => {
+                let r = self.recv(obj)?;
+                Ok(E::owned(format!("{r}.to_string()"), PREC_POSTFIX))
             }
             "regex" => {
                 let r = self.recv(obj)?;
@@ -2147,4 +2180,19 @@ fn literal_usize(code: &str) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// `println!(…)` whose arguments change variables (`xs[i++]`): each value computed first,
+/// in order, then printed.
+pub(super) fn in_order_call(name: &str, fmt: &str, args: &[String], in_order: bool) -> String {
+    if !in_order || args.len() < 2 {
+        return format_call(name, fmt, args);
+    }
+    let mut lets = String::new();
+    let mut names = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        lets.push_str(&format!("let a{i} = {a}; "));
+        names.push(format!("a{i}"));
+    }
+    format!("{{ {lets}{} }}", format_call(name, fmt, &names))
 }

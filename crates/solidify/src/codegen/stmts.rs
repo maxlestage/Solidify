@@ -68,6 +68,11 @@ impl<'a> Gen<'a> {
             && self.p.funcs.get(&id).is_some_and(|f| self.fluent(f))
         {
             "self".to_string()
+        } else if matches!(self.resolve(&ret), Ty::Func(_)) {
+            // A returned closure is `impl Fn`, not kept behind an `Rc`.
+            let x = self.expr(e)?;
+            let t = self.ty_of(e);
+            self.owned(x, &t)
         } else {
             self.expr_to(e, &ret)?
         };
@@ -2036,7 +2041,13 @@ impl<'a> Gen<'a> {
                     ),
                     _ => (format!("{base}.iter()"), Repr::Ref, false),
                 },
-                _ => return self.err("cannot iterate over this value", iter.span),
+                // `[Symbol.iterator]()`.
+                ref other => match self.struct_iteration(other) {
+                    Some((_, generator)) => {
+                        (self.iteration_source(&base, generator), Repr::Owned, false)
+                    }
+                    None => return self.err("cannot iterate over this value", iter.span),
+                },
             }
         };
         let item_ty = match self.resolve(&it) {
@@ -2044,7 +2055,7 @@ impl<'a> Gen<'a> {
             Ty::Array(t) => Ty::Tuple(vec![Ty::Any, *t]),
             Ty::Map(k, v, _) => Ty::Tuple(vec![*k, *v]),
             Ty::Str => Ty::Str,
-            _ => Ty::Any,
+            ref other => self.struct_iteration(other).map_or(Ty::Any, |(t, _)| t),
         };
         let pattern = self.loop_pattern(pat, &item_ty, elem_repr, enumerate)?;
         let head = format!("for {pattern} in {source}");

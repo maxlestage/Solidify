@@ -137,7 +137,7 @@ impl<'m> Infer<'m> {
             "const" => Ty::Any,
             "never" => Ty::Never,
             "bigint" => return self.err("bigint is not supported", span),
-            "symbol" => return self.err("symbols are not supported", span),
+            "symbol" => Ty::named("Symbol"),
             "Array" | "ReadonlyArray" => Ty::Array(Box::new(arg(self, 0)?)),
             "Map" | "ReadonlyMap" => {
                 Ty::Map(Box::new(arg(self, 0)?), Box::new(arg(self, 1)?), false)

@@ -472,6 +472,7 @@ impl Program {
                         | "array.pop"
                         | "array.shift"
                         | "array.at"
+                        | "Symbol.keyFor"
                 ),
                 _ => false,
             },
@@ -657,8 +658,9 @@ impl Program {
 
     /// Whether values of the type copy freely in Rust.
     pub fn is_copy(&self, ty: &Ty) -> bool {
-        self.types
-            .is_copy(ty, &|name| self.is_enum(name) || name == "Date")
+        self.types.is_copy(ty, &|name| {
+            self.is_enum(name) || name == "Date" || name == "Symbol"
+        })
     }
 }
 
@@ -830,6 +832,7 @@ pub(super) const GLOBALS: &[&str] = &[
     "Set",
     "Promise",
     "Date",
+    "Symbol",
     "process",
     "performance",
     "parseInt",
@@ -1420,6 +1423,31 @@ impl<'m> Infer<'m> {
                 .param_scope
                 .iter()
                 .any(|ps| ps.iter().any(|t| t == name))
+    }
+
+    /// The values an object with `[Symbol.iterator]()` gives to `for … of`: what its
+    /// generator yields, or the `value` of what its iterator's `next()` returns.
+    pub(super) fn struct_iteration(&self, ty: &Ty) -> Option<Ty> {
+        let Ty::Named(n, _) = self.types.resolve(ty) else {
+            return None;
+        };
+        let (_, m) = self.find_method(&n, "@@iterator", MethodKind::Method)?;
+        let subst = self.instance_subst(ty);
+        let ret = finish::substitute(&self.funcs[&m.fn_id].sig.ret, &subst, &self.types);
+        match self.types.resolve(&ret) {
+            Ty::Gen(t) => Some(*t),
+            Ty::Named(it, _) => {
+                let next = self.struct_by_name(&it)?.field("next")?.ty.clone();
+                let Ty::Func(f) = self.types.resolve(&next) else {
+                    return None;
+                };
+                let Ty::Named(r, _) = self.types.resolve(&f.ret) else {
+                    return None;
+                };
+                Some(self.struct_by_name(&r)?.field("value")?.ty.clone())
+            }
+            _ => None,
+        }
     }
 
     /// `T extends HasId`: the struct a type parameter in scope is constrained to.
