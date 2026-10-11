@@ -121,6 +121,8 @@ Trois passes, toutes déterministes :
 | `any`, `unknown` | déduits de l'usage |
 | paramètres `...rest`, `f(...xs)`, `{ ...base, z }`, `[a, ...rest] = xs`, `({ x, y }: Point) =>` | slices, `vec!`, littéraux de struct construits champ par champ, `let rest = xs[1..].to_vec()` |
 | `parseInt` | `Option<i64>` (`NaN` est `None`), affiné par `isNaN` |
+| `new Date(…)`, `getTime`, `getFullYear`…, `toISOString`, `plus_tard - plus_tôt`, `Date.now()` | `JsDate` (millisecondes, UTC), `PartialOrd`, différences de `get_time()` |
+| `f?.()`, `obj?.method()`, champs de type fonction, `onClick?: () => void` | `if let Some(f) = …`, `.map(\|o\| o.method())`, champs `Rc<dyn Fn(…)>` |
 
 Ce qui reste différent, parce que les valeurs Rust ne sont pas des références JavaScript : un objet rangé à deux endroits est copié, et modifier une copie ne touche pas l'autre (les variables modifiées dans des closures qui survivent à leur portée sont partagées via `Rc<RefCell<T>>`). Les nombres sont des `i64` tant qu'un flottant n'intervient pas : un entier qui déborde fait paniquer là où JavaScript perdrait de la précision. Les imports vont entre vos propres fichiers, pas vers des paquets. Les replacers et revivers de `JSON`, `Symbol`, `Proxy`, `eval`, la manipulation des prototypes et `arguments` n'ont pas d'équivalent Rust et sont refusés avec un message qui dit quoi écrire à la place.
 
@@ -138,7 +140,7 @@ Quatre règles à connaître :
 | Dossier | Contenu |
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | Le transpileur : lexeur, parseur, inférence de types, génération de code, ligne de commande |
-| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 28 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
+| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 30 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
 | [`site`](site) | Le site web : un bac à sable qui exécute Solidify en WebAssembly, écrit avec [active](https://github.com/maxlestage/Active) |
 
 ## Développement

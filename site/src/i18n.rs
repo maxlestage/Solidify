@@ -110,7 +110,7 @@ static EN: Dict = Dict {
         cta2: "Install the CLI",
         facts: [
             ("0", "dependencies"),
-            ("28", "programs checked against Node.js"),
+            ("30", "programs checked against Node.js"),
             ("1", "Rust file out, however many files in"),
         ],
     },
@@ -250,6 +250,14 @@ static EN: Dict = Dict {
                 "...rest, f(...xs), { ...base, z }, [a, ...rest], ({ x, y }) =>",
                 "slices, vec!, struct literals field by field, xs[1..].to_vec()",
             ),
+            (
+                "new Date(…), getFullYear, toISOString, later - earlier",
+                "JsDate in milliseconds (UTC), PartialOrd, get_time() differences",
+            ),
+            (
+                "f?.(), obj?.method(), fields of function type",
+                "if let Some(f) = …, .map(|o| o.method()), Rc<dyn Fn(…)> fields",
+            ),
         ],
         limits_title: "What stays different",
         limits: "Rust values are not JavaScript references: an object stored in two places is copied, and changing one copy leaves the other alone (variables changed inside closures that outlive them are shared). Numbers are `i64` until a float is involved, so an integer that overflows panics where JavaScript would lose precision. Imports go between your own files only, not to packages. `JSON` replacers and revivers, `Symbol`, `Proxy`, `eval`, prototypes and `arguments` have no Rust counterpart and are refused with a clear message.",
@@ -291,7 +299,7 @@ static FR: Dict = Dict {
         cta2: "Installer la ligne de commande",
         facts: [
             ("0", "dépendance"),
-            ("28", "programmes vérifiés contre Node.js"),
+            ("30", "programmes vérifiés contre Node.js"),
             (
                 "1",
                 "fichier Rust en sortie, autant de fichiers en entrée que voulu",
@@ -433,6 +441,14 @@ static FR: Dict = Dict {
             (
                 "...rest, f(...xs), { ...base, z }, [a, ...rest], ({ x, y }) =>",
                 "slices, vec!, littéraux de struct champ par champ, xs[1..].to_vec()",
+            ),
+            (
+                "new Date(…), getFullYear, toISOString, plus_tard - plus_tôt",
+                "JsDate en millisecondes (UTC), PartialOrd, différences de get_time()",
+            ),
+            (
+                "f?.(), obj?.method(), champs de type fonction",
+                "if let Some(f) = …, .map(|o| o.method()), champs Rc<dyn Fn(…)>",
             ),
         ],
         limits_title: "Ce qui reste différent",
