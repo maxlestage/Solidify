@@ -517,6 +517,21 @@ impl<'m> Infer<'m> {
                 format!("a match has no method `{prop}`: its groups are `m[i]`"),
                 span,
             ),
+            Ty::Named(n, ..) if n == "bigint" => {
+                let full = format!("bigint.{prop}");
+                match prop {
+                    "toString" | "toLocaleString" => {
+                        if !args.is_empty() {
+                            let i = self.types.int();
+                            self.arg_typed(args, 0, Some(i), &full, span)?;
+                        }
+                        self.no_more_than(args, 1, &full, span)?;
+                        self.done(e, full, Ty::Str)
+                    }
+                    "valueOf" => self.done(e, full, Ty::named("bigint")),
+                    _ => self.err(format!("a BigInt has no method `{prop}`"), span),
+                }
+            }
             Ty::Named(n, ..) if n == "Symbol" => {
                 let full = format!("symbol.{prop}");
                 self.no_more_than(args, 0, &full, span)?;

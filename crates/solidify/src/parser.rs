@@ -227,6 +227,7 @@ impl<'a> Parser<'a> {
             Tok::Private(w) => format!("`#{w}`"),
             Tok::Punct(p) => format!("`{p}`"),
             Tok::Num { raw, .. } => format!("number `{raw}`"),
+            Tok::BigInt(d) => format!("bigint `{d}n`"),
             Tok::Str(_) => "a string".into(),
             Tok::Template { .. } => "a template literal".into(),
             Tok::Regex { .. } => "a regular expression".into(),
@@ -2610,6 +2611,10 @@ impl<'a> Parser<'a> {
             Tok::Num { value, raw, int } => {
                 self.next();
                 Ok(self.expr(ExprKind::Num { value, raw, int }, start))
+            }
+            Tok::BigInt(digits) => {
+                self.next();
+                Ok(self.expr(ExprKind::BigInt(digits), start))
             }
             Tok::Str(s) => {
                 self.next();

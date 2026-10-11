@@ -896,6 +896,7 @@ pub(crate) const INTRINSICS: &[(&str, &str, char)] = &[
 pub(super) const GLOBALS: &[&str] = &[
     "console",
     "eval",
+    "BigInt",
     "Function",
     "Proxy",
     "Reflect",

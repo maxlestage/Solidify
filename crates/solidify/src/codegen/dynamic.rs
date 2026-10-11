@@ -35,6 +35,72 @@ impl<'a> Gen<'a> {
         }
     }
 
+    pub(super) fn is_big(&self, ty: &Ty) -> bool {
+        matches!(self.resolve(ty), Ty::Named(n, _) if n == "bigint")
+    }
+
+    /// `a op b` on big integers (or a big integer compared with a number).
+    pub(super) fn big_binary(&mut self, op: BinOp, left: &'a Expr, right: &'a Expr) -> GResult<E> {
+        let (lt, rt) = (self.ty_of(left), self.ty_of(right));
+        if !(self.is_big(&lt) && self.is_big(&rt)) {
+            // A comparison with a number: as numbers.
+            let side = |g: &mut Self, x: &'a Expr, t: &Ty| -> GResult<String> {
+                if g.is_big(t) {
+                    let v = g.expr(x)?;
+                    Ok(format!("{}.to_f64()", Self::paren(&v, PREC_POSTFIX)))
+                } else {
+                    g.float_operand(x)
+                }
+            };
+            let (a, b) = (side(self, left, &lt)?, side(self, right, &rt)?);
+            let sym = match op {
+                BinOp::Lt => "<",
+                BinOp::Gt => ">",
+                BinOp::LtEq => "<=",
+                BinOp::GtEq => ">=",
+                BinOp::Eq | BinOp::StrictEq => "==",
+                _ => "!=",
+            };
+            return Ok(E::owned(format!("{a} {sym} {b}"), super::PREC_CMP));
+        }
+        let a = self.expr(left)?;
+        let a = Self::paren(&a, PREC_POSTFIX);
+        let b = self.expr_as(right, Want::Ref)?;
+        let method = |m: &str| E::owned(format!("{a}.{m}({b})"), PREC_POSTFIX);
+        Ok(match op {
+            BinOp::Add => method("plus"),
+            BinOp::Sub => method("minus"),
+            BinOp::Mul => method("times"),
+            BinOp::Div => method("div"),
+            BinOp::Mod => method("rem"),
+            BinOp::Pow => method("pow"),
+            BinOp::BitAnd => E::owned(format!("{a}.bitwise({b}, '&')"), PREC_POSTFIX),
+            BinOp::BitOr => E::owned(format!("{a}.bitwise({b}, '|')"), PREC_POSTFIX),
+            BinOp::BitXor => E::owned(format!("{a}.bitwise({b}, '^')"), PREC_POSTFIX),
+            BinOp::Shl => E::owned(format!("{a}.shift_left(({b}).to_i64())"), PREC_POSTFIX),
+            BinOp::Shr => E::owned(format!("{a}.shift_left(-({b}).to_i64())"), PREC_POSTFIX),
+            BinOp::Lt
+            | BinOp::Gt
+            | BinOp::LtEq
+            | BinOp::GtEq
+            | BinOp::Eq
+            | BinOp::StrictEq
+            | BinOp::NotEq
+            | BinOp::StrictNotEq => {
+                let sym = match op {
+                    BinOp::Lt => "<",
+                    BinOp::Gt => ">",
+                    BinOp::LtEq => "<=",
+                    BinOp::GtEq => ">=",
+                    BinOp::Eq | BinOp::StrictEq => "==",
+                    _ => "!=",
+                };
+                E::owned(format!("&{a} {sym} {b}"), super::PREC_CMP)
+            }
+            _ => return self.err("this operator is not supported on a BigInt", left.span),
+        })
+    }
+
     pub(super) fn is_dynamic(&self, ty: &Ty) -> bool {
         self.resolve(ty).is_dynamic()
     }
