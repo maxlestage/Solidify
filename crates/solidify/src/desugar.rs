@@ -22,6 +22,7 @@ pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) -> Option<String> {
         }
     });
     literal_code(body, next_id);
+    error_classes(body, next_id);
     proxy_targets(body);
     let mut ids = Ids(next_id);
     constructor_functions(body, &mut ids);
@@ -616,7 +617,7 @@ fn for_each_class(stmts: &mut [Stmt], f: &mut dyn FnMut(&mut Class)) {
 }
 
 /// Calls `f` on every expression (read-only), entering what `f` allows.
-fn for_each_expr(stmts: &[Stmt], f: &mut dyn FnMut(&Expr) -> bool) {
+pub fn for_each_expr(stmts: &[Stmt], f: &mut dyn FnMut(&Expr) -> bool) {
     let mut copy = stmts.to_vec();
     for_each_expr_mut(&mut copy, &mut |e| f(e));
 }
@@ -1196,4 +1197,124 @@ fn export_const(name: &str, value: Expr, span: Span, next_id: &mut NodeId) -> St
         span,
         comments: Vec::new(),
     }
+}
+
+/// The name a class extending `Error` (or `TypeError`…) extends instead: such a class
+/// holds its `message` and `name` itself, and is thrown like an error.
+pub const ERROR_BASE: &str = "__JsErrorBase";
+
+/// `class NotFound extends Error { constructor(k) { super(`no ${k}`); … } }`: fields
+/// `message` and `name` of its own, `super(m)` setting the message.
+fn error_classes(body: &mut [Stmt], next_id: &mut NodeId) {
+    const BASES: [&str; 6] = [
+        "Error",
+        "TypeError",
+        "RangeError",
+        "SyntaxError",
+        "ReferenceError",
+        "EvalError",
+    ];
+    for_each_class(body, &mut |c| {
+        let Some(Expr {
+            kind: ExprKind::Ident(base),
+            span,
+            ..
+        }) = &c.extends
+        else {
+            return;
+        };
+        if !BASES.contains(&base.as_str()) {
+            return;
+        }
+        let (base, span) = (base.clone(), *span);
+        let has = |c: &Class, n: &str| {
+            c.members
+                .iter()
+                .any(|m| matches!(m, ClassMember::Field(f) if f.name == n))
+        };
+        let mut extra = String::new();
+        if !has(c, "message") {
+            extra.push_str("message: string = \"\";\n");
+        }
+        if !has(c, "name") {
+            extra.push_str(&format!("name: string = \"{base}\";\n"));
+        }
+        let has_ctor = c
+            .members
+            .iter()
+            .any(|m| matches!(m, ClassMember::Method(m) if m.kind == MethodKind::Constructor));
+        if !has_ctor {
+            extra.push_str("constructor(message: string = \"\") { this.message = message; }\n");
+        }
+        let code = format!("class Snippet {{\n{extra}}}");
+        let Ok(stmts) = crate::parser::parse_snippet(&code, span, next_id) else {
+            return;
+        };
+        let Some(StmtKind::Class(snippet)) = stmts.into_iter().next().map(|s| s.kind) else {
+            return;
+        };
+        // The fields first: the constructor sets them.
+        let mut members = snippet.members;
+        members.append(&mut c.members);
+        c.members = members;
+        // `super(m)`: the message.
+        for m in &mut c.members {
+            let ClassMember::Method(m) = m else { continue };
+            if m.kind != MethodKind::Constructor {
+                continue;
+            }
+            let FnBody::Block(b) = &mut m.func.body else {
+                continue;
+            };
+            for st in &mut b.stmts {
+                let StmtKind::Expr(e) = &st.kind else {
+                    continue;
+                };
+                let ExprKind::Call { callee, args, .. } = &e.kind else {
+                    continue;
+                };
+                if !matches!(callee.kind, ExprKind::Super) {
+                    continue;
+                }
+                let replacement = match args.first() {
+                    Some(a) => {
+                        let id = *next_id;
+                        *next_id += 3;
+                        let this = Expr {
+                            kind: ExprKind::This,
+                            span: e.span,
+                            id,
+                        };
+                        let target = Expr {
+                            kind: ExprKind::Member {
+                                obj: Box::new(this),
+                                prop: "message".into(),
+                                optional: false,
+                            },
+                            span: e.span,
+                            id: id + 1,
+                        };
+                        StmtKind::Expr(Expr {
+                            kind: ExprKind::Assign {
+                                op: AssignOp::Assign,
+                                target: AssignTarget::Expr(Box::new(target)),
+                                value: Box::new(a.expr.clone()),
+                            },
+                            span: e.span,
+                            id: id + 2,
+                        })
+                    }
+                    None => StmtKind::Empty,
+                };
+                st.kind = replacement;
+            }
+        }
+        if let Some(Expr {
+            kind: ExprKind::Ident(b),
+            ..
+        }) = &mut c.extends
+        {
+            *b = ERROR_BASE.to_string();
+        }
+    });
 }
