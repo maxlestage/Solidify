@@ -52,6 +52,14 @@ pub const EXAMPLES: &[Example] = &[
         "Arbres et tests de null"
     ),
     case!("plain", "Plain JavaScript", "JavaScript sans types"),
+    case!("unions", "Unions & typeof", "Unions et typeof"),
+    case!("inheritance", "Inheritance", "Héritage"),
+    case!("generators", "Generators", "Générateurs"),
+    case!("regex", "Regular expressions", "Expressions régulières"),
+    case!("json", "JSON", "JSON"),
+    case!("timers", "Timers & promises", "Minuteurs et promesses"),
+    case!("printing", "console.log", "console.log"),
+    case!("parsing", "Numbers & any", "Nombres et any"),
 ];
 
 pub fn example(id: &str) -> Option<&'static Example> {
