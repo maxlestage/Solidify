@@ -2808,6 +2808,20 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// The name a computed key stands for: `"@@iterator"` for `[Symbol.iterator]`.
+pub fn computed_name(key: &Expr) -> Option<String> {
+    match &key.kind {
+        ExprKind::Str(s) => Some(s.clone()),
+        ExprKind::Member { obj, prop, .. }
+            if matches!(&obj.kind, ExprKind::Ident(o) if o == "Symbol")
+                && matches!(prop.as_str(), "iterator" | "asyncIterator") =>
+        {
+            Some(format!("@@{prop}"))
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2887,19 +2901,5 @@ mod tests {
         let e = parse("let x = ;").unwrap_err();
         assert_eq!(e.span.start, 8);
         assert!(e.message.contains("expected an expression"));
-    }
-}
-
-/// The name a computed key stands for: `"@@iterator"` for `[Symbol.iterator]`.
-pub fn computed_name(key: &Expr) -> Option<String> {
-    match &key.kind {
-        ExprKind::Str(s) => Some(s.clone()),
-        ExprKind::Member { obj, prop, .. }
-            if matches!(&obj.kind, ExprKind::Ident(o) if o == "Symbol")
-                && matches!(prop.as_str(), "iterator" | "asyncIterator") =>
-        {
-            Some(format!("@@{prop}"))
-        }
-        _ => None,
     }
 }
