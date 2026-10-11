@@ -709,7 +709,11 @@ impl<'a> Gen<'a> {
             "global.String" => {
                 let (spec, arg) = self.format_arg(&args[0].expr)?;
                 match arg {
-                    Some(a) if a.starts_with("js_to_string(") => E::owned(a, PREC_POSTFIX),
+                    Some(a)
+                        if a.starts_with("js_to_string(") || a.starts_with("js_number_text(") =>
+                    {
+                        E::owned(a, PREC_POSTFIX)
+                    }
                     Some(a) if spec == "{}" => E::owned(format!("{a}.to_string()"), PREC_POSTFIX),
                     _ => E::owned(
                         format_call("format!", &spec, &arg.into_iter().collect::<Vec<_>>()),
@@ -871,17 +875,12 @@ impl<'a> Gen<'a> {
                 E::owned(format!("{x}.hypot({y})"), PREC_POSTFIX)
             }
             "Math.pow" => {
-                let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                let x = super::exprs::num_recv(&x, self.is_float(&ty));
-                let y = self.expr_as(&args[1].expr, Want::Owned)?;
-                if self.is_float(&ty) {
-                    E::owned(format!("{}.powf({y})", paren_num(&x)), PREC_POSTFIX)
-                } else {
-                    E::owned(
-                        format!("{}.pow({} as u32)", paren_num(&x), paren_num(&y)),
-                        PREC_POSTFIX,
-                    )
-                }
+                let x = self.float_operand(&args[0].expr)?;
+                let y = self.float_operand(&args[1].expr)?;
+                E::owned(
+                    format!("{}.powf({y})", super::exprs::num_recv(&paren_num(&x), true)),
+                    PREC_POSTFIX,
+                )
             }
             "Math.max" | "Math.min" => {
                 let method = &name[5..];
@@ -1254,24 +1253,33 @@ impl<'a> Gen<'a> {
                 let x = self.expr_as(obj, Want::Owned)?;
                 let x = paren_num(&x);
                 Ok(match method {
-                    "toFixed" => {
+                    "toFixed" | "toPrecision" => {
+                        // JavaScript's rounding: a tie goes up, `(2.5).toFixed(0)` is "3".
                         let d = match args.first() {
                             Some(a) => self.expr_as(&a.expr, Want::Owned)?,
-                            None => "0".into(),
+                            None if method == "toFixed" => "0".into(),
+                            None => {
+                                let h = self.helper(Helper::NumText);
+                                let x = if self.is_float(&ot) {
+                                    x
+                                } else {
+                                    format!("({x} as f64)")
+                                };
+                                return Ok(E::owned(format!("{h}({x})"), PREC_POSTFIX));
+                            }
                         };
                         let x = if self.is_float(&ot) {
                             x
                         } else {
-                            format!("({x} as f64)")
+                            format!("{x} as f64")
                         };
-                        if super::is_int_literal(&d) {
-                            E::owned(format!("format!(\"{{:.{d}}}\", {x})"), PREC_ATOM)
+                        self.helper(Helper::NumFormat);
+                        let f = if method == "toFixed" {
+                            "js_to_fixed"
                         } else {
-                            E::owned(
-                                format!("format!(\"{{:.*}}\", {d} as usize, {x})"),
-                                PREC_ATOM,
-                            )
-                        }
+                            "js_to_precision"
+                        };
+                        E::owned(format!("{f}({x}, {d})"), PREC_POSTFIX)
                     }
                     "toString" => match args.first() {
                         Some(a) if self.is_int(&ot) => {
@@ -1279,17 +1287,12 @@ impl<'a> Gen<'a> {
                             let h = self.helper(Helper::NumToString);
                             E::owned(format!("{h}({x}, {r})"), PREC_POSTFIX)
                         }
+                        _ if self.is_float(&ot) => {
+                            let h = self.helper(Helper::NumText);
+                            E::owned(format!("{h}({x})"), PREC_POSTFIX)
+                        }
                         _ => E::owned(format!("{x}.to_string()"), PREC_POSTFIX),
                     },
-                    "toPrecision" => {
-                        let d = self.expr_as(&args[0].expr, Want::Owned)?;
-                        E::owned(
-                            format!(
-                                "format!(\"{{:.*}}\", ({d} as usize).saturating_sub(1), {x} as f64)"
-                            ),
-                            PREC_ATOM,
-                        )
-                    }
                     _ => return self.err(format!("`{name}` is not supported"), e.span),
                 })
             }

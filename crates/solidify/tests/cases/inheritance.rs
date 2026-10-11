@@ -26,25 +26,25 @@ impl Circle {
     }
 
     pub fn describe(&self) -> String {
-        format!("{} with area {}", self.name, format!("{:.2}", self.area()))
+        format!("{} with area {}", self.name, js_to_fixed(self.area(), 2))
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct Rect {
     pub name: String,
-    pub width: f64,
-    pub height: f64,
+    pub width: i64,
+    pub height: i64,
 }
 
 impl Rect {
-    pub fn new(width: f64, height: f64) -> Self {
+    pub fn new(width: i64, height: i64) -> Self {
         let base = Shape::new("rect".to_string());
         Self { name: base.name, width, height }
     }
 
     pub fn area(&self) -> f64 {
-        self.width * self.height
+        (self.width * self.height) as f64
     }
 
     pub fn describe(&self) -> String {
@@ -52,25 +52,25 @@ impl Rect {
     }
 
     pub fn shape_describe(&self) -> String {
-        format!("{} with area {}", self.name, format!("{:.2}", self.area()))
+        format!("{} with area {}", self.name, js_to_fixed(self.area(), 2))
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct Square {
     pub name: String,
-    pub width: f64,
-    pub height: f64,
+    pub width: i64,
+    pub height: i64,
 }
 
 impl Square {
-    pub fn new(side: f64) -> Self {
+    pub fn new(side: i64) -> Self {
         let base = Rect::new(side, side);
         Self { name: "square".to_string(), width: base.width, height: base.height }
     }
 
     pub fn area(&self) -> f64 {
-        self.width * self.height
+        (self.width * self.height) as f64
     }
 
     pub fn describe(&self) -> String {
@@ -78,7 +78,7 @@ impl Square {
     }
 
     pub fn shape_describe(&self) -> String {
-        format!("{} with area {}", self.name, format!("{:.2}", self.area()))
+        format!("{} with area {}", self.name, js_to_fixed(self.area(), 2))
     }
 }
 
@@ -159,12 +159,12 @@ fn loudest(animals: &[Box<dyn AnimalLike>]) -> String {
 }
 
 fn main() {
-    let shapes = vec![Box::new(Circle::new(1.0)) as Box<dyn ShapeLike>, Box::new(Rect::new(2.0, 3.0)) as Box<dyn ShapeLike>, Box::new(Square::new(2.0)) as Box<dyn ShapeLike>];
+    let shapes = vec![Box::new(Circle::new(1.0)) as Box<dyn ShapeLike>, Box::new(Rect::new(2, 3)) as Box<dyn ShapeLike>, Box::new(Square::new(2)) as Box<dyn ShapeLike>];
     for s in &shapes {
         println!("{}", s.describe());
     }
     let total = shapes.iter().fold(0.0, |sum, s| sum + s.area());
-    println!("{} {}", format!("{:.3}", total), shapes.len());
+    println!("{} {}", js_to_fixed(total, 3), shapes.len());
     let mut rex = Box::new(Dog::new("Rex", Vec::new())) as Box<dyn DogLike>;
     rex.learn("sit".to_string());
     rex.learn("roll".to_string());
@@ -414,6 +414,156 @@ impl ShapeLike for Square {
     }
 }
 
+/// A number the way JavaScript prints it.
+#[allow(dead_code)]
+fn js_number_text(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return "0".into();
+    }
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        return format!("{}", x as i64);
+    }
+    // The shortest digits that read back as `x`, then JavaScript's placement of the point.
+    let sci = format!("{:e}", x.abs());
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let n: i64 = exp.parse::<i64>().unwrap_or(0) + 1;
+    let k = digits.len() as i64;
+    let body = if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let e = n - 1;
+        let sign = if e < 0 { "-" } else { "+" };
+        if k == 1 {
+            format!("{digits}e{sign}{}", e.abs())
+        } else {
+            format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
+        }
+    };
+    if x < 0.0 { format!("-{body}") } else { body }
+}
+
+
+/// The exact decimal digits of a finite double (no sign) and the position of the point:
+/// `digits[..point]` is the integer part (`point` may be negative or past the end).
+#[allow(dead_code)]
+fn js_exact_digits(x: f64) -> (Vec<u8>, i64) {
+    let text = format!("{:.1100}", x.abs());
+    let (int, frac) = text.split_once('.').unwrap_or((&text, ""));
+    let mut digits: Vec<u8> = int.bytes().chain(frac.bytes()).map(|b| b - b'0').collect();
+    let mut point = int.len() as i64;
+    while digits.len() > 1 && digits[0] == 0 {
+        digits.remove(0);
+        point -= 1;
+    }
+    while digits.len() > 1 && digits[digits.len() - 1] == 0 {
+        digits.pop();
+    }
+    (digits, point)
+}
+
+/// Rounds `digits` to `keep` digits, a tie going up as JavaScript does; returns the digits
+/// and whether a carry added one in front.
+#[allow(dead_code)]
+fn js_round_digits(digits: &[u8], keep: usize) -> (Vec<u8>, bool) {
+    let mut out: Vec<u8> = digits.iter().take(keep).copied().collect();
+    while out.len() < keep {
+        out.push(0);
+    }
+    if digits.get(keep).is_some_and(|d| *d >= 5) {
+        let mut i = out.len();
+        loop {
+            if i == 0 {
+                out.insert(0, 1);
+                return (out, true);
+            }
+            i -= 1;
+            if out[i] == 9 {
+                out[i] = 0;
+            } else {
+                out[i] += 1;
+                break;
+            }
+        }
+    }
+    (out, false)
+}
+
+/// `x.toFixed(digits)`, as JavaScript writes it.
+#[allow(dead_code)]
+fn js_to_fixed(x: f64, digits: i64) -> String {
+    if !x.is_finite() || x.abs() >= 1e21 {
+        return js_number_text(x);
+    }
+    let f = digits.clamp(0, 100) as usize;
+    let (all, point) = js_exact_digits(x);
+    // The digits from the units on: zeros in front when the number is below one.
+    let mut padded: Vec<u8> = Vec::new();
+    if point <= 0 {
+        padded.push(0);
+        padded.extend(std::iter::repeat_n(0, (-point) as usize));
+        padded.extend(&all);
+    } else {
+        padded.extend(&all);
+    }
+    let int_len = if point <= 0 { 1 } else { point as usize };
+    let (rounded, carry) = js_round_digits(&padded, int_len + f);
+    let int_len = int_len + carry as usize;
+    let int: String = rounded[..int_len].iter().map(|d| (d + b'0') as char).collect();
+    let frac: String = rounded[int_len..].iter().map(|d| (d + b'0') as char).collect();
+    let body = if f == 0 { int } else { format!("{int}.{frac}") };
+    if x < 0.0 { format!("-{body}") } else { body }
+}
+
+/// `x.toPrecision(p)`, as JavaScript writes it.
+#[allow(dead_code)]
+fn js_to_precision(x: f64, p: i64) -> String {
+    if !x.is_finite() {
+        return js_number_text(x);
+    }
+    let p = p.clamp(1, 100) as usize;
+    let sign = if x < 0.0 { "-" } else { "" };
+    if x == 0.0 {
+        let zeros = "0".repeat(p - 1);
+        return if p == 1 { "0".into() } else { format!("0.{zeros}") };
+    }
+    let (all, point) = js_exact_digits(x);
+    let (rounded, carry) = js_round_digits(&all, p);
+    let digits: String = rounded[..p].iter().map(|d| (d + b'0') as char).collect();
+    let e = point - 1 + carry as i64;
+    if e < -6 || e >= p as i64 {
+        let (first, rest) = digits.split_at(1);
+        let mantissa = if rest.is_empty() {
+            first.to_string()
+        } else {
+            format!("{first}.{rest}")
+        };
+        let es = if e < 0 { "-" } else { "+" };
+        return format!("{sign}{mantissa}e{es}{}", e.abs());
+    }
+    if e >= 0 {
+        let (int, frac) = digits.split_at(e as usize + 1);
+        if frac.is_empty() {
+            format!("{sign}{int}")
+        } else {
+            format!("{sign}{int}.{frac}")
+        }
+    } else {
+        format!("{sign}0.{}{digits}", "0".repeat((-e - 1) as usize))
+    }
+}
+
+
 /// A value as JavaScript sees it, for `console.log`, `String(…)` and `JSON.stringify`.
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq)]
@@ -550,45 +700,6 @@ impl<T: JsInspect> JsInspect for std::collections::HashSet<T> {
     fn js_value(&self) -> JsValue {
         JsValue::Set(self.iter().map(JsInspect::js_value).collect())
     }
-}
-
-/// A number the way JavaScript prints it.
-#[allow(dead_code)]
-fn js_number_text(x: f64) -> String {
-    if x.is_nan() {
-        return "NaN".into();
-    }
-    if x.is_infinite() {
-        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
-    }
-    if x == 0.0 {
-        return "0".into();
-    }
-    if x.fract() == 0.0 && x.abs() < 1e15 {
-        return format!("{}", x as i64);
-    }
-    // The shortest digits that read back as `x`, then JavaScript's placement of the point.
-    let sci = format!("{:e}", x.abs());
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let n: i64 = exp.parse::<i64>().unwrap_or(0) + 1;
-    let k = digits.len() as i64;
-    let body = if k <= n && n <= 21 {
-        format!("{digits}{}", "0".repeat((n - k) as usize))
-    } else if 0 < n && n <= 21 {
-        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
-    } else if -6 < n && n <= 0 {
-        format!("0.{}{digits}", "0".repeat((-n) as usize))
-    } else {
-        let e = n - 1;
-        let sign = if e < 0 { "-" } else { "+" };
-        if k == 1 {
-            format!("{digits}e{sign}{}", e.abs())
-        } else {
-            format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
-        }
-    };
-    if x < 0.0 { format!("-{body}") } else { body }
 }
 
 /// `String(value)`: what a value becomes in a string.

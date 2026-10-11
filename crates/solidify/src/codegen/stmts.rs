@@ -1058,16 +1058,20 @@ impl<'a> Gen<'a> {
                 self.line(&format!("{place} /= {v};"));
             }
             AssignOp::Pow => {
-                let v = self.expr_as(value, Want::Owned)?;
-                if self.is_float(&tt) {
-                    self.line(&format!("{place} = {place}.powf({v});"));
-                } else {
-                    self.line(&format!("{place} = {place}.pow({v} as u32);"));
-                }
+                let v = self.float_operand(value)?;
+                self.line(&format!("{place} = {place}.powf({v});"));
             }
-            AssignOp::UShr => {
-                let v = self.expr_as(value, Want::Owned)?;
-                self.line(&format!("{place} = (({place} as u32) >> {v}) as i64;"));
+            AssignOp::Shl
+            | AssignOp::Shr
+            | AssignOp::UShr
+            | AssignOp::BitAnd
+            | AssignOp::BitOr
+            | AssignOp::BitXor => {
+                // 32-bit integers, as in JavaScript.
+                let b = self.int32_operand(value)?;
+                let bin = op.binary().expect("bitwise");
+                let code = self.bitwise_code(bin, &format!("({place} as i32)"), &b);
+                self.line(&format!("{place} = {code};"));
             }
             other => {
                 let sym = match other {
@@ -1075,11 +1079,6 @@ impl<'a> Gen<'a> {
                     AssignOp::Sub => "-",
                     AssignOp::Mul => "*",
                     AssignOp::Mod => "%",
-                    AssignOp::Shl => "<<",
-                    AssignOp::Shr => ">>",
-                    AssignOp::BitAnd => "&",
-                    AssignOp::BitOr => "|",
-                    AssignOp::BitXor => "^",
                     _ => unreachable!(),
                 };
                 let v = self.expr_as(value, Want::Owned)?;

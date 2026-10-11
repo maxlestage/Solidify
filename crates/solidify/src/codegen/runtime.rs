@@ -24,6 +24,12 @@ pub enum Helper {
     ParseInt,
     ParseIntRadix,
     ParseFloat,
+    /// A double as JavaScript prints it (`1e+21`, `Infinity`).
+    NumText,
+    /// `toFixed` and `toPrecision`, rounded as JavaScript does.
+    NumFormat,
+    /// JavaScript's `ToInt32`, for bitwise operators on doubles.
+    ToInt32,
     ToNumber,
     Random,
     NumToString,
@@ -250,6 +256,17 @@ fn js_parse_int_radix(s: &str, radix: i64) -> Option<i64> {
         .unwrap_or(0);
     let n = i64::from_str_radix(&digits[..end], radix as u32).ok()?;
     Some(if negative { -n } else { n })
+}"#
+            }
+            Helper::NumText => include_str!("runtime/number.rs"),
+            Helper::NumFormat => include_str!("runtime/number_format.rs"),
+            Helper::ToInt32 => {
+                r#"/// A double as JavaScript's bitwise operators see it: a 32-bit integer.
+fn js_to_int32(x: f64) -> i32 {
+    if !x.is_finite() {
+        return 0;
+    }
+    (x.trunc().rem_euclid(4294967296.0) as u32) as i32
 }"#
             }
             Helper::ParseFloat => {
