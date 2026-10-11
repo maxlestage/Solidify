@@ -242,6 +242,29 @@ li code {
   letter-spacing: 0.04em;
 }
 
+/* Shown when the browser offers to install the site as an app. */
+.top nav .install-app {
+  margin-left: 4px;
+  padding: 6px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--bg);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.top nav .install-app[hidden] {
+  display: none;
+}
+
+.top nav .install-app:hover {
+  background: var(--accent-2);
+}
+
 /* Layout */
 
 main {
