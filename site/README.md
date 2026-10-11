@@ -101,6 +101,16 @@ The page never waits for the client:
 - Use `data-reveal="words"` (or `split()` in `pages.rs`) for a heading.
 - Use `data-reveal="scale"` for a block that should grow.
 
+## No horizontal scrolling
+
+Nothing on the site scrolls sideways, on any screen:
+- **The page:** `overflow-x: clip` on `<html>`, `<body>` and `<main>`, so the hero's light and the marquee never widen it.
+- **Code** (install snippets, the playground's editor and output, inline code) wraps at the edge of its block: `white-space: pre-wrap` and `overflow-wrap: anywhere`. Code blocks only grow down.
+- **The table** of what translates wraps its cells. Below 640 px each row becomes a block, the TypeScript above its Rust.
+- **The menu, without WebAssembly:** on small screens the sections are not shown in the header; the footer's "Product" column links them.
+
+The test `nothing_scrolls_sideways` (`src/server.rs`) fails if a rule of `app.css` makes an element scroll horizontally again. Checked in a browser at 320, 390, 768 and 1440 px wide, in the three languages, with the menu open and a very long line in the playground.
+
 ## Installable app
 
 `src/pwa.rs` writes two files.
