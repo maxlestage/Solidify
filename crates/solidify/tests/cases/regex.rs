@@ -34,7 +34,7 @@ fn main() {
     println!("{} {} {} {} {}", words.len(), words.iter().map(|w| w.chars().count() as i64).collect::<Vec<_>>().iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","), JsRegex::new("quick", "").source(), JsRegex::new("x", "gi").flags(), JsRegex::new("x", "g").flags().contains('g'));
     let re = JsRegex::new("c.t", "g");
     println!("{} {} {}", re.replace("cat cot cut", "-"), re.test("dog"), JsRegex::new("^a+$", "").test("aaa"));
-    println!("{} {} {}", JsRegex::new("\\s", "").split("tabs\tand\nnewlines").len(), JsRegex::new("s+", "g").replace("mississippi", "S"), JsRegex::new("(?<word>\\w+)", "").exec("hi there").as_ref().map(|v| v.get(1)).as_ref().map_or("null".to_string(), |v| v.to_string()));
+    println!("{} {} {}", JsRegex::new("\\s", "").split("tabs\tand\nnewlines").len(), JsRegex::new("s+", "g").replace("mississippi", "S"), JsRegex::new("(?<word>\\w+)", "").exec("hi there").as_ref().map(|v| v.get(1)).as_ref().map_or("undefined".to_string(), |v| v.to_string()));
     println!("{} {}", JsRegex::new("42", "").replace_with("price: 42 EUR", |m_| (|n: String| (js_parse_int(&n).unwrap() * 2).to_string())(m_.get(0))), JsRegex::new("a", "g").replace_with("aaa", |m_| (|x: String| x.to_uppercase())(m_.get(0))));
     println!("{} {} {} {re}", JsRegex::new("^\\p{L}+$", "u").test("été"), "é".chars().count(), JsRegex::new("colou?r", "").test("the colour"));
     // `exec` with the g flag walks the text through `lastIndex`.
@@ -82,6 +82,8 @@ enum JsValue {
     Func(&'static str),
     /// Text shown as it is (a regular expression).
     Raw(String),
+    /// A date: its ISO text, and its `toString()` text.
+    Date(String, String),
 }
 
 /// Implemented by every type that `console.log` can show.
@@ -261,6 +263,7 @@ fn js_to_string(v: &JsValue) -> String {
         JsValue::Set(_) => "[object Set]".into(),
         JsValue::Func(name) => format!("function {name}() {{ [native code] }}"),
         JsValue::Raw(text) => text.clone(),
+        JsValue::Date(_, text) => text.clone(),
     }
 }
 
@@ -348,6 +351,7 @@ fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> Strin
             };
         }
         JsValue::Raw(text) => return text.clone(),
+        JsValue::Date(iso, _) => return iso.clone(),
         JsValue::Array(items) => {
             if items.is_empty() {
                 return "[]".into();

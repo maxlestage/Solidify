@@ -526,7 +526,20 @@ impl<'m> Infer<'m> {
             }
             BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::Pow => {
                 let n = self.types.num(Flavor::Unknown);
-                let lt = self.expr(left, Some(&n))?;
+                let lt = if matches!(op, BinOp::Sub) {
+                    self.expr(left, None)?
+                } else {
+                    self.expr(left, Some(&n))?
+                };
+                // `later - earlier` on dates: the milliseconds between them.
+                if matches!(op, BinOp::Sub)
+                    && matches!(self.types.resolve(&lt), Ty::Named(ref d) if d == "Date")
+                {
+                    let date = Ty::Named("Date".into());
+                    let rt = self.expr(right, Some(&date))?;
+                    self.expect(&rt, &date, right.span)?;
+                    return Ok(self.types.int());
+                }
                 self.expect(&lt, &n, left.span)?;
                 let rt = self.expr(right, Some(&n))?;
                 self.expect(&rt, &n, right.span)?;
@@ -549,7 +562,7 @@ impl<'m> Infer<'m> {
                 }
                 match self.types.resolve(&lt) {
                     Ty::Num(_) | Ty::Str | Ty::Var(_) => Ok(Ty::Bool),
-                    Ty::Named(n) if self.is_type_param(&n) => Ok(Ty::Bool),
+                    Ty::Named(n) if self.is_type_param(&n) || n == "Date" => Ok(Ty::Bool),
                     other => {
                         let d = self.describe(&other);
                         self.err(format!("cannot order {d}"), span)
@@ -1438,7 +1451,38 @@ impl<'m> Infer<'m> {
                 self.calls.insert(e.id, Callee::Builtin("new Array"));
                 Ok(Ty::Array(Box::new(t)))
             }
-            "Date" => self.err("`Date` is not supported", e.span),
+            "Date" => {
+                // `new Date()`, `new Date(ms)`, `new Date(text)`, `new Date(y, m, d, …)`.
+                if args.len() == 1 {
+                    let t = self.expr(&args[0].expr, None)?;
+                    match self.types.resolve(&t) {
+                        Ty::Str => {}
+                        Ty::Num(_) => {
+                            let i = self.types.int();
+                            self.expect(&t, &i, args[0].expr.span)?;
+                        }
+                        Ty::Named(ref d) if d == "Date" => {}
+                        other => {
+                            let d = self.describe(&other);
+                            return self.err(
+                                format!("`new Date` takes milliseconds or text, not {d}"),
+                                args[0].expr.span,
+                            );
+                        }
+                    }
+                } else {
+                    if args.len() > 7 {
+                        return self.err("`new Date` takes at most 7 arguments", e.span);
+                    }
+                    for a in args {
+                        let i = self.types.int();
+                        let t = self.expr(&a.expr, Some(&i))?;
+                        self.expect(&t, &i, a.expr.span)?;
+                    }
+                }
+                self.calls.insert(e.id, Callee::Builtin("new Date"));
+                Ok(Ty::Named("Date".into()))
+            }
             "Promise" => {
                 // `new Promise((resolve, reject) => …)`, awaited where it is made.
                 let ExprKind::New { type_args, .. } = &e.kind else {
@@ -1607,7 +1651,18 @@ impl<'m> Infer<'m> {
         optional: bool,
     ) -> IResult<Ty> {
         if optional {
-            return self.err("optional calls `f?.()` are not supported", e.span);
+            // `f?.()`: nothing when `f` is null.
+            let ct = self.expr(callee, None)?;
+            let Ty::Option(inner) = self.types.resolve(&ct) else {
+                return self.err("`?.()` on a value that is never null", callee.span);
+            };
+            let Ty::Func(f) = self.types.resolve(&inner) else {
+                let d = self.describe(&inner);
+                return self.err(format!("cannot call {d}"), callee.span);
+            };
+            self.dynamic_args(args, &f, e.span)?;
+            self.calls.insert(e.id, Callee::OptionalCall);
+            return Ok(optional_result(self.types.resolve(&f.ret)));
         }
         if self.ctx().try_depth > 0 {
             self.calls_in_try.insert(e.id);
@@ -1630,12 +1685,9 @@ impl<'m> Infer<'m> {
                 optional,
             } => {
                 if *optional {
-                    return self.err(
-                        "optional method calls are not supported: test the value first",
-                        e.span,
-                    );
+                    return self.optional_method_call(e, obj, prop, args);
                 }
-                self.method_call(e, obj, prop, args)
+                self.method_call(e, callee.id, obj, prop, args)
             }
             _ => {
                 let ct = self.expr(callee, None)?;
@@ -1648,6 +1700,56 @@ impl<'m> Infer<'m> {
                 Ok(f.ret.clone())
             }
         }
+    }
+
+    /// `obj?.m(…)`: the method of the object when there is one, nothing otherwise.
+    fn optional_method_call(
+        &mut self,
+        e: &'m Expr,
+        obj: &'m Expr,
+        prop: &str,
+        args: &'m [Arg],
+    ) -> IResult<Ty> {
+        let ot = self.expr(obj, None)?;
+        let Ty::Option(inner) = self.types.resolve(&ot) else {
+            return self.err("`?.` on a value that is never null", obj.span);
+        };
+        let Ty::Named(n) = self.types.resolve(&inner) else {
+            return self.err(
+                "`?.` before a method call works on objects: test the value first",
+                e.span,
+            );
+        };
+        let Some((_, m)) = self.find_method(&n, prop, MethodKind::Method) else {
+            return self.err(format!("{n} has no method `{prop}`"), e.span);
+        };
+        if m.is_static {
+            return self.err(format!("`{prop}` is static: call `{n}.{prop}()`"), e.span);
+        }
+        let fn_id = m.fn_id;
+        let info = self.funcs[&fn_id].clone();
+        self.args(args, &info, fn_id, e.span)?;
+        if let Some(root) = self.root_binding(obj) {
+            self.method_receivers.push((fn_id, root));
+            if info.mutates_self {
+                self.mark_receiver_mutated(obj);
+            }
+        }
+        self.calls.insert(
+            e.id,
+            Callee::OptionalMethod {
+                class: n,
+                name: prop.to_string(),
+                fn_id,
+            },
+        );
+        let caller = self.ctx().id;
+        self.funcs
+            .get_mut(&caller)
+            .expect("fn")
+            .calls
+            .push((fn_id, e.id));
+        Ok(optional_result(self.types.resolve(&info.sig.ret)))
     }
 
     /// `super(args)`: the constructor of the base class runs first.
@@ -1984,6 +2086,7 @@ impl<'m> Infer<'m> {
     fn method_call(
         &mut self,
         e: &'m Expr,
+        callee_id: NodeId,
         obj: &'m Expr,
         prop: &str,
         args: &'m [Arg],
@@ -2040,6 +2143,7 @@ impl<'m> Infer<'m> {
                 if n != "Error"
                     && n != "RegExp"
                     && n != "RegExpMatch"
+                    && n != "Date"
                     && !self.is_type_param(n) =>
             {
                 let Some(s) = self.struct_by_name(n) else {
@@ -2062,6 +2166,7 @@ impl<'m> Infer<'m> {
                     };
                     self.dynamic_args(args, &fun, e.span)?;
                     self.calls.insert(e.id, Callee::Dynamic);
+                    self.set_ty(callee_id, Ty::Func(fun.clone()));
                     return Ok(fun.ret.clone());
                 }
                 let Some((_, m)) = self.find_method(n, prop, MethodKind::Method) else {
@@ -2213,5 +2318,14 @@ fn field_ty(f: &FieldInfo) -> Ty {
         Ty::Option(Box::new(f.ty.clone()))
     } else {
         f.ty.clone()
+    }
+}
+
+/// The type of `f?.()`: nothing when the call gives nothing, otherwise maybe its value.
+fn optional_result(ret: Ty) -> Ty {
+    match ret {
+        Ty::Void => Ty::Void,
+        Ty::Option(t) => Ty::Option(t),
+        other => Ty::Option(Box::new(other)),
     }
 }
