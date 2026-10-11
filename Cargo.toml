@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/solidify", "site"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+# Browser bundle: `cargo build -p solidify-site --lib --target wasm32-unknown-unknown --profile wasm-release`.
+[profile.wasm-release]
+inherits = "release"
+opt-level = "s"
+panic = "abort"
