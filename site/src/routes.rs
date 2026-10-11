@@ -31,15 +31,17 @@ pub fn link(path: &str) -> String {
 pub enum Lang {
     En,
     Fr,
+    Es,
 }
 
 impl Lang {
-    pub const ALL: [Lang; 2] = [Lang::En, Lang::Fr];
+    pub const ALL: [Lang; 3] = [Lang::En, Lang::Fr, Lang::Es];
 
     pub fn code(self) -> &'static str {
         match self {
             Lang::En => "en",
             Lang::Fr => "fr",
+            Lang::Es => "es",
         }
     }
 
@@ -52,6 +54,7 @@ impl Lang {
         match self {
             Lang::En => "/",
             Lang::Fr => "/fr/",
+            Lang::Es => "/es/",
         }
     }
 
@@ -61,6 +64,7 @@ impl Lang {
         match path.trim_end_matches('/') {
             "" | "/index.html" => Some(Lang::En),
             "/fr" | "/fr/index.html" => Some(Lang::Fr),
+            "/es" | "/es/index.html" => Some(Lang::Es),
             _ => None,
         }
     }
@@ -75,7 +79,8 @@ mod tests {
         assert_eq!(Lang::from_path("/"), Some(Lang::En));
         assert_eq!(Lang::from_path("/fr/"), Some(Lang::Fr));
         assert_eq!(Lang::from_path("/fr"), Some(Lang::Fr));
-        assert_eq!(Lang::from_path("/es/"), None);
+        assert_eq!(Lang::from_path("/es/"), Some(Lang::Es));
+        assert_eq!(Lang::from_path("/de/"), None);
         assert_eq!(link("/fr/"), "/fr/");
     }
 }
