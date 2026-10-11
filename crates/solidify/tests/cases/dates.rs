@@ -9,12 +9,52 @@ fn main() {
     let day = JsDate::from_parts(2024, 5, 1, 0, 0, 0, 0);
     println!("{} {} {} {} {} {} {} {} {}", epoch.get_full_year(), epoch.to_iso_string(), launch.get_month(), launch.get_date(), launch.get_day(), launch.get_hours(), launch.get_minutes(), launch.get_seconds(), launch.get_milliseconds());
     println!("{} {} {} {}", day.to_iso_string(), day.get_time(), JsDate::from_ms(1700000000000_i64).to_iso_string(), JsDate::parse("2000-02-29").get_day());
-    println!("{} {} {}", launch > day, launch.get_time() - day.get_time(), (launch.get_time() - day.get_time()) as f64 / 60000.0);
+    println!("{} {} {}", launch > day, launch.get_time() - day.get_time(), js_number_text((launch.get_time() - day.get_time()) as f64 / 60000.0));
     println!("{} {} {} {}", js_inspect(&launch.js_value()), js_to_string(&epoch.js_value()), js_to_string(&day.js_value()), js_json_stringify(&(Object { when: launch }).js_value(), ""));
     println!("{} {} {}", epoch.to_utc_string(), day.to_date_string(), JsDate::from_parts(2024, 13, 1, 0, 0, 0, 0).to_iso_string());
     let later = JsDate::from_ms(launch.get_time() + 86400000);
     println!("{} {} {}", later.to_iso_string(), later.value_of() > launch.value_of(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64) > 0);
 }
+
+/// A number the way JavaScript prints it.
+#[allow(dead_code)]
+fn js_number_text(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return "0".into();
+    }
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        return format!("{}", x as i64);
+    }
+    // The shortest digits that read back as `x`, then JavaScript's placement of the point.
+    let sci = format!("{:e}", x.abs());
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let n: i64 = exp.parse::<i64>().unwrap_or(0) + 1;
+    let k = digits.len() as i64;
+    let body = if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let e = n - 1;
+        let sign = if e < 0 { "-" } else { "+" };
+        if k == 1 {
+            format!("{digits}e{sign}{}", e.abs())
+        } else {
+            format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
+        }
+    };
+    if x < 0.0 { format!("-{body}") } else { body }
+}
+
 
 /// A value as JavaScript sees it, for `console.log`, `String(…)` and `JSON.stringify`.
 #[allow(dead_code)]
@@ -152,45 +192,6 @@ impl<T: JsInspect> JsInspect for std::collections::HashSet<T> {
     fn js_value(&self) -> JsValue {
         JsValue::Set(self.iter().map(JsInspect::js_value).collect())
     }
-}
-
-/// A number the way JavaScript prints it.
-#[allow(dead_code)]
-fn js_number_text(x: f64) -> String {
-    if x.is_nan() {
-        return "NaN".into();
-    }
-    if x.is_infinite() {
-        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
-    }
-    if x == 0.0 {
-        return "0".into();
-    }
-    if x.fract() == 0.0 && x.abs() < 1e15 {
-        return format!("{}", x as i64);
-    }
-    // The shortest digits that read back as `x`, then JavaScript's placement of the point.
-    let sci = format!("{:e}", x.abs());
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let n: i64 = exp.parse::<i64>().unwrap_or(0) + 1;
-    let k = digits.len() as i64;
-    let body = if k <= n && n <= 21 {
-        format!("{digits}{}", "0".repeat((n - k) as usize))
-    } else if 0 < n && n <= 21 {
-        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
-    } else if -6 < n && n <= 0 {
-        format!("0.{}{digits}", "0".repeat((-n) as usize))
-    } else {
-        let e = n - 1;
-        let sign = if e < 0 { "-" } else { "+" };
-        if k == 1 {
-            format!("{digits}e{sign}{}", e.abs())
-        } else {
-            format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
-        }
-    };
-    if x < 0.0 { format!("-{body}") } else { body }
 }
 
 /// `String(value)`: what a value becomes in a string.

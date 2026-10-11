@@ -67,7 +67,7 @@ impl<'m> Infer<'m> {
                     Some(e) => {
                         let t = self.expr(e, Some(&ret))?;
                         self.mark_stored(e);
-                        self.expect(&t, &ret, e.span)?;
+                        self.expect_flow(&t, &ret, e.span)?;
                         self.ctx_mut().has_return_value = true;
                     }
                     None => self.expect(&Ty::Void, &ret, s.span)?,
@@ -539,7 +539,7 @@ impl<'m> Infer<'m> {
                 } else {
                     let t = self.expr(e, Some(&ret))?;
                     self.mark_stored(e);
-                    self.expect(&t, &ret, e.span)?;
+                    self.expect_flow(&t, &ret, e.span)?;
                 }
             }
         }

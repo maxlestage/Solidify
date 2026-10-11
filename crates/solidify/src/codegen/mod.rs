@@ -102,10 +102,6 @@ pub(super) const PREC_ASSIGN: u8 = 0;
 pub(super) const PREC_OR: u8 = 2;
 pub(super) const PREC_AND: u8 = 3;
 pub(super) const PREC_CMP: u8 = 4;
-pub(super) const PREC_BITOR: u8 = 5;
-pub(super) const PREC_BITXOR: u8 = 6;
-pub(super) const PREC_BITAND: u8 = 7;
-pub(super) const PREC_SHIFT: u8 = 8;
 pub(super) const PREC_ADD: u8 = 9;
 pub(super) const PREC_MUL: u8 = 10;
 pub(super) const PREC_CAST: u8 = 11;
@@ -889,6 +885,9 @@ impl<'a> Gen<'a> {
         if h == Helper::Json {
             self.helpers.insert(Helper::Inspect);
         }
+        if matches!(h, Helper::Json | Helper::Inspect | Helper::NumFormat) {
+            self.helpers.insert(Helper::NumText);
+        }
         match h {
             Helper::StrSlice => "js_slice",
             Helper::StrSubstring => "js_substring",
@@ -910,6 +909,9 @@ impl<'a> Gen<'a> {
             Helper::ParseInt => "js_parse_int",
             Helper::ParseIntRadix => "js_parse_int_radix",
             Helper::ParseFloat => "js_parse_float",
+            Helper::ToInt32 => "js_to_int32",
+            Helper::NumText => "js_number_text",
+            Helper::NumFormat => "js_to_fixed",
             Helper::ToNumber => "js_number",
             Helper::Random => "js_random",
             Helper::NumToString => "js_num_to_string",
@@ -2161,6 +2163,30 @@ impl<'a> Gen<'a> {
         if matches!(from_r, Ty::Null) {
             return "None".into();
         }
+        // An integer going where a double is wanted (`fib(i)` returning a double).
+        let to_num = match &to_r {
+            Ty::Option(inner) if !matches!(from_r, Ty::Option(_)) => self.resolve(inner),
+            other => other.clone(),
+        };
+        if matches!(from_r, Ty::Num(_))
+            && !self.is_float(&from_r)
+            && matches!(to_num, Ty::Num(_))
+            && self.is_float(&to_num)
+        {
+            let code = if is_int_literal_code(&e.code) {
+                format!("{}.0", e.code.trim_end_matches("_i64"))
+            } else {
+                let prec = e.prec;
+                let owned = self.owned(e, &from_r);
+                let x = E::owned(owned, prec);
+                format!("{} as f64", Self::paren(&x, exprs::PREC_CAST_PLUS))
+            };
+            return if matches!(to_r, Ty::Option(_)) {
+                format!("Some({code})")
+            } else {
+                code
+            };
+        }
         // A function kept in a field or a collection is shared: behind an `Rc`.
         let fresh_fn = e.code.starts_with('|')
             || e.code.starts_with("move |")
@@ -2281,4 +2307,11 @@ pub(super) fn is_place_kind(e: &Expr) -> bool {
 
 pub(super) fn is_int_literal(code: &str) -> bool {
     !code.is_empty() && code.chars().all(|c| c.is_ascii_digit())
+}
+
+/// An integer literal: `3`, `-3`, `3_i64`.
+fn is_int_literal_code(code: &str) -> bool {
+    let c = code.trim_end_matches("_i64");
+    let c = c.strip_prefix('-').unwrap_or(c);
+    !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())
 }

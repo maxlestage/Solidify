@@ -9,19 +9,19 @@ fn range(start: i64, end: i64, step: i64) -> JsGenerator<i64> {
     })
 }
 
-fn naturals() -> JsGenerator<i64> {
+fn naturals() -> JsGenerator<f64> {
     JsGenerator::new(move |y| {
-        let mut n = 1;
+        let mut n: f64 = 1.0;
         loop {
             y.yield_(n);
-            n += 1;
+            n += 1.0;
         }
     })
 }
 
-fn fibonacci() -> JsGenerator<i64> {
+fn fibonacci() -> JsGenerator<f64> {
     JsGenerator::new(move |y| {
-        let (mut a, mut b) = (0, 1);
+        let (mut a, mut b) = (0.0, 1.0);
         loop {
             y.yield_(a);
             (a, b) = (b, a + b);
@@ -51,8 +51,8 @@ fn chained() -> JsGenerator<i64> {
     })
 }
 
-fn take(count: i64, r#gen: JsGenerator<i64>) -> Vec<i64> {
-    let mut out: Vec<i64> = Vec::new();
+fn take(count: i64, r#gen: JsGenerator<f64>) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
     for value in r#gen {
         if out.len() as i64 >= count {
             break;
@@ -71,15 +71,55 @@ fn main() {
     let mut it = range(5, 7, 1);
     let first = it.next();
     println!("{} {} {} {}", first.as_ref().map_or("null".to_string(), |v| v.to_string()), first.is_none(), it.next().as_ref().map_or("null".to_string(), |v| v.to_string()), it.next().is_none());
-    let mut sum = 0;
+    let mut sum: f64 = 0.0;
     for f in fibonacci() {
-        if f > 100 {
+        if f > 100.0 {
             break;
         }
         sum += f;
     }
-    println!("{sum}");
+    println!("{}", js_number_text(sum));
 }
+
+/// A number the way JavaScript prints it.
+#[allow(dead_code)]
+fn js_number_text(x: f64) -> String {
+    if x.is_nan() {
+        return "NaN".into();
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
+    }
+    if x == 0.0 {
+        return "0".into();
+    }
+    if x.fract() == 0.0 && x.abs() < 1e15 {
+        return format!("{}", x as i64);
+    }
+    // The shortest digits that read back as `x`, then JavaScript's placement of the point.
+    let sci = format!("{:e}", x.abs());
+    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    let n: i64 = exp.parse::<i64>().unwrap_or(0) + 1;
+    let k = digits.len() as i64;
+    let body = if k <= n && n <= 21 {
+        format!("{digits}{}", "0".repeat((n - k) as usize))
+    } else if 0 < n && n <= 21 {
+        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
+    } else if -6 < n && n <= 0 {
+        format!("0.{}{digits}", "0".repeat((-n) as usize))
+    } else {
+        let e = n - 1;
+        let sign = if e < 0 { "-" } else { "+" };
+        if k == 1 {
+            format!("{digits}e{sign}{}", e.abs())
+        } else {
+            format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
+        }
+    };
+    if x < 0.0 { format!("-{body}") } else { body }
+}
+
 
 /// A value as JavaScript sees it, for `console.log`, `String(…)` and `JSON.stringify`.
 #[allow(dead_code)]
@@ -217,45 +257,6 @@ impl<T: JsInspect> JsInspect for std::collections::HashSet<T> {
     fn js_value(&self) -> JsValue {
         JsValue::Set(self.iter().map(JsInspect::js_value).collect())
     }
-}
-
-/// A number the way JavaScript prints it.
-#[allow(dead_code)]
-fn js_number_text(x: f64) -> String {
-    if x.is_nan() {
-        return "NaN".into();
-    }
-    if x.is_infinite() {
-        return if x > 0.0 { "Infinity" } else { "-Infinity" }.into();
-    }
-    if x == 0.0 {
-        return "0".into();
-    }
-    if x.fract() == 0.0 && x.abs() < 1e15 {
-        return format!("{}", x as i64);
-    }
-    // The shortest digits that read back as `x`, then JavaScript's placement of the point.
-    let sci = format!("{:e}", x.abs());
-    let (mantissa, exp) = sci.split_once('e').unwrap_or((&sci, "0"));
-    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
-    let n: i64 = exp.parse::<i64>().unwrap_or(0) + 1;
-    let k = digits.len() as i64;
-    let body = if k <= n && n <= 21 {
-        format!("{digits}{}", "0".repeat((n - k) as usize))
-    } else if 0 < n && n <= 21 {
-        format!("{}.{}", &digits[..n as usize], &digits[n as usize..])
-    } else if -6 < n && n <= 0 {
-        format!("0.{}{digits}", "0".repeat((-n) as usize))
-    } else {
-        let e = n - 1;
-        let sign = if e < 0 { "-" } else { "+" };
-        if k == 1 {
-            format!("{digits}e{sign}{}", e.abs())
-        } else {
-            format!("{}.{}e{sign}{}", &digits[..1], &digits[1..], e.abs())
-        }
-    };
-    if x < 0.0 { format!("-{body}") } else { body }
 }
 
 /// `String(value)`: what a value becomes in a string.

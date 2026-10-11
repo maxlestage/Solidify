@@ -172,7 +172,12 @@ impl<'a> Gen<'a> {
     }
 
     fn helper_sources(&self, out: &mut String) {
-        for h in self.helpers.clone() {
+        let mut helpers = self.helpers.clone();
+        // Showing values prints numbers.
+        if helpers.contains(&Helper::Inspect) || helpers.contains(&Helper::Json) {
+            helpers.insert(Helper::NumText);
+        }
+        for h in helpers {
             out.push('\n');
             out.push_str(h.source());
             out.push('\n');
