@@ -104,6 +104,16 @@ impl<'m> Infer<'m> {
             match &s.kind {
                 StmtKind::Interface(i) => {
                     self.check_type_name(&i.name, i.span)?;
+                    // `interface Dict { [k: string]: number }`: a map.
+                    if i.extends.is_empty()
+                        && let Some((key, value)) = super::annotations::index_only(&i.members)
+                    {
+                        let k = self.ann(key, &i.name)?;
+                        let v = self.ann(value, &i.name)?;
+                        self.aliases
+                            .insert(i.name.clone(), Ty::Map(Box::new(k), Box::new(v), true));
+                        continue;
+                    }
                     self.structs.push(StructInfo {
                         name: i.name.clone(),
                         kind: StructKind::Interface,
@@ -149,23 +159,50 @@ impl<'m> Infer<'m> {
                 StmtKind::TypeAlias(a) => {
                     self.check_type_name(&a.name, a.span)?;
                     match &a.ty {
-                        TypeAnn::Object(_, _) => self.structs.push(StructInfo {
-                            name: a.name.clone(),
-                            kind: StructKind::Interface,
-                            fields: Vec::new(),
-                            methods: Vec::new(),
-                            ctor: None,
-                            exported: a.exported,
-                            span: a.span,
-                            statics: Vec::new(),
-                            parent: None,
-                            is_abstract: false,
-                            implements: Vec::new(),
-                            type_params: a.type_params.iter().map(|t| t.name.clone()).collect(),
-                            type_bounds: Vec::new(),
-                            parent_args: Vec::new(),
-                            implements_args: Vec::new(),
-                        }),
+                        TypeAnn::Object(members, _)
+                            if super::annotations::index_only(members).is_none() =>
+                        {
+                            self.structs.push(StructInfo {
+                                name: a.name.clone(),
+                                kind: StructKind::Interface,
+                                fields: Vec::new(),
+                                methods: Vec::new(),
+                                ctor: None,
+                                exported: a.exported,
+                                span: a.span,
+                                statics: Vec::new(),
+                                parent: None,
+                                is_abstract: false,
+                                implements: Vec::new(),
+                                type_params: a.type_params.iter().map(|t| t.name.clone()).collect(),
+                                type_bounds: Vec::new(),
+                                parent_args: Vec::new(),
+                                implements_args: Vec::new(),
+                            })
+                        }
+                        // `type AB = A & B`: one struct with the fields of both.
+                        TypeAnn::Intersection(members, _)
+                            if a.type_params.is_empty()
+                                && !members.iter().any(super::annotations::is_primitive_ann) =>
+                        {
+                            self.structs.push(StructInfo {
+                                name: a.name.clone(),
+                                kind: StructKind::Interface,
+                                fields: Vec::new(),
+                                methods: Vec::new(),
+                                ctor: None,
+                                exported: a.exported,
+                                span: a.span,
+                                statics: Vec::new(),
+                                parent: None,
+                                is_abstract: false,
+                                implements: Vec::new(),
+                                type_params: a.type_params.iter().map(|t| t.name.clone()).collect(),
+                                type_bounds: Vec::new(),
+                                parent_args: Vec::new(),
+                                implements_args: Vec::new(),
+                            })
+                        }
                         TypeAnn::Union(members, span)
                             if members.len() > 1
                                 && members
@@ -191,6 +228,7 @@ impl<'m> Infer<'m> {
         for s in stmts {
             if let StmtKind::TypeAlias(a) = &s.kind
                 && !self.type_exists(&a.name)
+                && !reads_fields(&a.ty)
             {
                 let before = self.unions.len();
                 if !a.type_params.is_empty() {
@@ -233,7 +271,7 @@ impl<'m> Infer<'m> {
         }
         for s in stmts {
             match &s.kind {
-                StmtKind::Interface(i) => {
+                StmtKind::Interface(i) if self.struct_by_name(&i.name).is_some() => {
                     self.param_scope
                         .push(i.type_params.iter().map(|t| t.name.clone()).collect());
                     let mut fields = Vec::new();
@@ -302,8 +340,14 @@ impl<'m> Infer<'m> {
                     s.fields = fields;
                     s.methods = methods;
                 }
+                StmtKind::TypeAlias(a) if self.intersection_alias(a) => {
+                    let fields = self.intersection_fields(&a.name, &a.ty)?;
+                    self.struct_mut(&a.name).expect("alias").fields = fields;
+                }
                 StmtKind::TypeAlias(a) => {
-                    if let TypeAnn::Object(members, _) = &a.ty {
+                    if let TypeAnn::Object(members, _) = &a.ty
+                        && self.struct_by_name(&a.name).is_some()
+                    {
                         self.param_scope
                             .push(a.type_params.iter().map(|t| t.name.clone()).collect());
                         let fields = self.fields_from_members(&a.name, members);
@@ -316,7 +360,32 @@ impl<'m> Infer<'m> {
                 _ => {}
             }
         }
+        // `Person["age"]`, `keyof Person`: once the fields are known.
+        for s in stmts {
+            if let StmtKind::TypeAlias(a) = &s.kind
+                && !self.type_exists(&a.name)
+            {
+                let ty = self.ann(&a.ty, &a.name)?;
+                self.aliases.insert(a.name.clone(), ty);
+            }
+        }
+        // Intersections may name types declared after them.
+        for s in stmts {
+            if let StmtKind::TypeAlias(a) = &s.kind
+                && self.intersection_alias(a)
+            {
+                let fields = self.intersection_fields(&a.name, &a.ty)?;
+                self.struct_mut(&a.name).expect("alias").fields = fields;
+            }
+        }
         Ok(())
+    }
+
+    fn intersection_alias(&self, a: &TypeAlias) -> bool {
+        matches!(&a.ty, TypeAnn::Intersection(..))
+            && self
+                .struct_by_name(&a.name)
+                .is_some_and(|s| s.span == a.span && s.kind == StructKind::Interface)
     }
 
     fn check_type_name(&self, name: &str, span: Span) -> IResult<()> {
@@ -954,5 +1023,16 @@ impl<'m> Infer<'m> {
             }
         }
         Ok(())
+    }
+}
+
+/// An alias reading the fields of other types, which can only be resolved after them.
+fn reads_fields(ann: &TypeAnn) -> bool {
+    match ann {
+        TypeAnn::Indexed(..) | TypeAnn::KeyOf(..) => true,
+        TypeAnn::Array(t, _) | TypeAnn::Readonly(t, _) => reads_fields(t),
+        TypeAnn::Tuple(ts, _) | TypeAnn::Union(ts, _) => ts.iter().any(reads_fields),
+        TypeAnn::Named { args, .. } => args.iter().any(reads_fields),
+        _ => false,
     }
 }
