@@ -1,4 +1,4 @@
-use std::sync::{LazyLock, Mutex};
+use std::sync::LazyLock;
 
 mod geometry {
     use super::*;
@@ -86,7 +86,7 @@ mod strings {
     use super::*;
 
     pub const SEPARATOR: &str = " | ";
-    pub(crate) static CALLS: LazyLock<Mutex<i64>> = LazyLock::new(|| Mutex::new(0));
+    pub(crate) static CALLS: LazyLock<JsStatic<i64>> = LazyLock::new(|| JsStatic::new(0));
 
     pub fn shout(s: &str) -> String {
         format!("{}!", s.to_uppercase())
@@ -101,8 +101,8 @@ mod strings {
     }
 
     pub fn counted(s: &str) -> String {
-        (*CALLS.lock().unwrap()) += 1;
-        format!("{s} ({})", (*CALLS.lock().unwrap()))
+        (*CALLS.write()) += 1;
+        format!("{s} ({})", (*CALLS.read()))
     }
 }
 
@@ -421,6 +421,11 @@ impl<T: JsInspect> JsInspect for Option<T> {
         }
     }
 }
+impl<T: JsInspect> JsInspect for std::rc::Rc<std::cell::RefCell<T>> {
+    fn js_value(&self) -> JsValue {
+        self.borrow().js_value()
+    }
+}
 impl<T: JsInspect> JsInspect for Vec<T> {
     fn js_value(&self) -> JsValue {
         JsValue::Array(self.iter().map(JsInspect::js_value).collect())
@@ -657,7 +662,9 @@ fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> Strin
         output = js_group_array(ctx, output, items);
     }
     if ctx.current_depth - recurse_times < 3 && entries == output.len() {
-        let start = output.len() + ctx.indentation + open.chars().count() + 10;
+        // Node counts a `<ref *1>` marker apart from the braces, without the space.
+        let marker = usize::from(open.starts_with("<ref *"));
+        let start = output.len() + ctx.indentation + open.chars().count() - marker + 10;
         let mut total = output.len() + start;
         let fits = total + output.len() <= 80 && output.iter().all(|s| {
             total += s.chars().count();
@@ -753,3 +760,24 @@ fn js_group_array(ctx: &JsInspectCtx, output: Vec<String>, items: &[JsValue]) ->
     output
 }
 
+
+/// A top-level variable that functions change. The program runs one piece at a
+/// time: read and written like a `RefCell`.
+struct JsStatic<T>(std::cell::RefCell<T>);
+
+unsafe impl<T> Sync for JsStatic<T> {}
+
+#[allow(dead_code)]
+impl<T> JsStatic<T> {
+    fn new(value: T) -> Self {
+        JsStatic(std::cell::RefCell::new(value))
+    }
+
+    fn read(&self) -> std::cell::Ref<'_, T> {
+        self.0.borrow()
+    }
+
+    fn write(&self) -> std::cell::RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+}

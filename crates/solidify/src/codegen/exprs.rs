@@ -107,7 +107,7 @@ impl<'a> Gen<'a> {
                 let name = self.fn_ctx().this_name;
                 Ok(E::atom(
                     name,
-                    if name == "self" {
+                    if name == "self" || self.this_is_handle() {
                         Repr::Ref
                     } else {
                         Repr::Owned
@@ -489,7 +489,7 @@ impl<'a> Gen<'a> {
                 if let Some(&changed) = self.statics.get(&binding) {
                     let name = self.name(binding);
                     let code = if changed {
-                        format!("(*{name}.lock().unwrap())")
+                        format!("(*{name}.{}())", if mutable { "write" } else { "read" })
                     } else {
                         format!("(*{name})")
                     };
@@ -933,6 +933,39 @@ impl<'a> Gen<'a> {
         if let Some(b) = base {
             fields.push(format!("..{b}"));
         }
+        // A field sharing its collection with a variable: the variable's cell.
+        let fields: Vec<String> = fields
+            .into_iter()
+            .map(|f| {
+                let (key, val) = match f.split_once(": ") {
+                    Some((k, v)) => (k.to_string(), v.to_string()),
+                    None => (f.clone(), f.clone()),
+                };
+                let Some(info_field) = info.fields.iter().find(|x| snake(&x.name) == key) else {
+                    return f;
+                };
+                if !self.p.is_shared_field(&struct_name, &info_field.name) {
+                    return f;
+                }
+                self.uses_rc = true;
+                let source = props.iter().find_map(|p| {
+                    if p.key.name().as_deref() != Some(info_field.name.as_str()) {
+                        return None;
+                    }
+                    match &p.value {
+                        PropValue::Expr(x) => self.p.refs.get(&x.id).copied(),
+                        PropValue::Shorthand(id) => self.p.refs.get(id).copied(),
+                        _ => None,
+                    }
+                });
+                match source {
+                    Some(b) if self.shared.contains(&b) => {
+                        format!("{key}: {}.clone()", self.name(b))
+                    }
+                    _ => format!("{key}: Rc::new(RefCell::new({val}))"),
+                }
+            })
+            .collect();
         let name = pascal(&struct_name);
         let literal = if fields.is_empty() {
             format!("{name} {{}}")
@@ -944,6 +977,10 @@ impl<'a> Gen<'a> {
         } else {
             literal
         };
+        if self.p.is_shared(&struct_name) {
+            let h = self.helper(super::Helper::Shared);
+            return Ok(E::owned(format!("{h}::new({literal})"), PREC_POSTFIX));
+        }
         // A shape held dynamically (classes stand in for it): boxed.
         if self.p.is_dyn(&struct_name) {
             let args = match self.ty_of(e) {
@@ -1311,6 +1348,22 @@ impl<'a> Gen<'a> {
             let lc = self.owned_as(l, &lt, rt);
             let rc = self.coerce(r, rt, Want::Ref);
             return (format!("&{lc}"), rc);
+        }
+        // A nullable value compared with a value: the value is `Some` of it.
+        let rt_r = self.resolve(rt);
+        match (&lt, &rt_r) {
+            (Ty::Option(_), Ty::Option(_) | Ty::Null) | (Ty::Null, _) | (_, Ty::Null) => {}
+            (Ty::Option(_), _) => {
+                let lc = self.coerce(l, &lt, Want::Ref);
+                let rc = self.coerce(r, &rt_r, Want::Ref);
+                return (format!("({lc}).as_ref()"), format!("Some({rc})"));
+            }
+            (_, Ty::Option(_)) => {
+                let lc = self.coerce(l, &lt, Want::Ref);
+                let rc = self.coerce(r, &rt_r, Want::Ref);
+                return (format!("Some({lc})"), format!("({rc}).as_ref()"));
+            }
+            _ => {}
         }
         if self.is_copy(&lt) {
             let lc = self.coerce(l, &lt, Want::Owned);
@@ -1768,6 +1821,7 @@ impl<'a> Gen<'a> {
     }
 
     fn member(&mut self, e: &'a Expr, obj: &'a Expr, prop: &str, optional: bool) -> GResult<E> {
+        let mutable = self.want_mut_root;
         // `ns.x` for `import * as ns`: the name itself.
         if self.p.refs.contains_key(&e.id) {
             return self.ident(e);
@@ -1932,6 +1986,37 @@ impl<'a> Gen<'a> {
                             Repr::Ref,
                         ));
                     }
+                    // A field sharing its collection with a variable: through the cell.
+                    if self.p.is_shared_field(&n, prop) {
+                        let holder = if self.through_handle(obj, &n) {
+                            format!("{base}.borrow()")
+                        } else {
+                            base.clone()
+                        };
+                        let borrow = if mutable { "borrow_mut" } else { "borrow" };
+                        return Ok(E::new(
+                            format!("(*{holder}.{}.{borrow}())", snake(prop)),
+                            PREC_ATOM,
+                            Repr::Place,
+                        ));
+                    }
+                    // A shared object: read through its cell (a copy), written in it.
+                    if self.through_handle(obj, &n) {
+                        let field = snake(prop);
+                        if mutable {
+                            return Ok(E::new(
+                                format!("{base}.borrow_mut().{field}"),
+                                PREC_POSTFIX,
+                                Repr::Place,
+                            ));
+                        }
+                        let code = if self.is_copy(&ty) {
+                            format!("{base}.borrow().{field}")
+                        } else {
+                            format!("{base}.borrow().{field}.clone()")
+                        };
+                        return Ok(E::owned(code, PREC_POSTFIX));
+                    }
                     let repr = if o.repr == Repr::Owned && o.var.is_none() {
                         Repr::Owned
                     } else {
@@ -2017,7 +2102,11 @@ impl<'a> Gen<'a> {
             _ => return self.err("`?.` is only supported on objects", obj.span),
         };
         let v = "v";
-        let access = format!("{v}.{}", snake(prop));
+        let access = if self.holds_shared(&inner) {
+            format!("{v}.borrow().{}", snake(prop))
+        } else {
+            format!("{v}.{}", snake(prop))
+        };
         let value = if self.is_copy(&field_ty) {
             access
         } else {
@@ -2203,6 +2292,7 @@ impl<'a> Gen<'a> {
             bounds: Default::default(),
             class: self.fns.last().and_then(|c| c.class.clone()),
             labels: 0,
+            handle_this: self.fns.last().is_some_and(|c| c.handle_this),
         });
         let body = match &f.body {
             FnBody::Expr(x) if matches!(self.resolve(&ret_ty), Ty::Void) => {

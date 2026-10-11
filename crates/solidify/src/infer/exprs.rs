@@ -17,6 +17,24 @@ use crate::types::{Flavor, FuncTy, Ty};
 impl<'m> Infer<'m> {
     pub(super) fn expr(&mut self, e: &'m Expr, expected: Option<&Ty>) -> IResult<Ty> {
         let ty = self.expr_inner(e, expected)?;
+        // `{ items: list }`: a field made from a variable (they may share the collection).
+        if let ExprKind::Object(props) = &e.kind
+            && let Ty::Named(n, _) = self.types.resolve(&ty)
+        {
+            for p in props {
+                let key = p.key.name().unwrap_or_default();
+                let source = match &p.value {
+                    PropValue::Expr(x) if matches!(x.kind, ExprKind::Ident(_)) => {
+                        self.refs.get(&x.id).copied()
+                    }
+                    PropValue::Shorthand(id) => self.refs.get(id).copied(),
+                    _ => None,
+                };
+                if let Some(b) = source {
+                    self.field_sources.push((n.clone(), key, b));
+                }
+            }
+        }
         Ok(self.set_ty(e.id, ty))
     }
 
@@ -690,6 +708,14 @@ impl<'m> Infer<'m> {
                 if self.dyn_operands(left, &lt, right, &rt) {
                     return Ok(Ty::Bool);
                 }
+                // Two objects: the same one or not.
+                if let (Ty::Named(a, _), Ty::Named(b, _)) =
+                    (self.types.resolve(&lt), self.types.resolve(&rt))
+                    && a == b
+                    && self.struct_by_name(&a).is_some()
+                {
+                    self.identity_types.insert(a);
+                }
                 if self.types.unify(&lt, &rt).is_err()
                     && !self.union_accepts(&lt, &rt)
                     && !self.union_accepts(&rt, &lt)
@@ -818,6 +844,9 @@ impl<'m> Infer<'m> {
                     AssignOp::Assign => {
                         let vt = self.expr(value, Some(&tt))?;
                         self.expect_flow(&vt, &tt, value)?;
+                        if matches!(value.kind, ExprKind::Ident(_)) {
+                            self.copied_types.push(vt.clone());
+                        }
                         if !matches!(t.kind, ExprKind::Ident(_)) {
                             self.mark_stored(value);
                         } else if !super::stmts::is_place(value)
@@ -2494,6 +2523,9 @@ impl<'m> Infer<'m> {
                     return self.err(format!("`{prop}` is static: call `{n}.{prop}()`"), e.span);
                 }
                 let (fn_id, class) = (m.fn_id, n.clone());
+                if !matches!(obj.kind, ExprKind::This) {
+                    self.instance_calls.push((fn_id, class.clone()));
+                }
                 let info = self.funcs[&fn_id].clone();
                 let used = self.args_in(args, &info, fn_id, e.span, &subst)?;
                 // Whether the method mutates `self` is settled at the end: remember the

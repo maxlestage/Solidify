@@ -67,12 +67,62 @@ impl<'m> Infer<'m> {
                 f.returns_this = true;
             }
         }
+        let shared_types = self.shared_types();
         // A narrowed value whose alias is changed is bound mutably.
         for (binding, test) in self.alias_of_narrow.clone() {
             if self.vars.get(&binding).is_some_and(|v| v.mutated)
                 && let Some(t) = self.narrow_tests.get_mut(&test)
             {
                 t.mutated = true;
+            }
+        }
+        // `const b = list; b.push(x)`: one array (map, set) for both variables.
+        loop {
+            let mut changed = false;
+            for (b, a) in self.var_aliases.clone() {
+                let (Some(vb), Some(va)) = (self.vars.get(&b), self.vars.get(&a)) else {
+                    continue;
+                };
+                let collection = matches!(
+                    self.types.resolve(&va.ty),
+                    Ty::Array(_) | Ty::Map(..) | Ty::Set(_)
+                ) || matches!(self.types.resolve(&va.ty), Ty::Named(n, _) if self.struct_by_name(&n).is_some() && !shared_types.contains(&n));
+                let changed_somewhere = va.mutated || vb.mutated || va.shared || vb.shared;
+                if collection
+                    && changed_somewhere
+                    && !va.reassigned
+                    && !vb.reassigned
+                    && !(va.role == Role::TopLevel && va.used_in_fn)
+                    && !(vb.role == Role::TopLevel && vb.used_in_fn)
+                    && !(va.shared && vb.shared && vb.shares_with == Some(a))
+                {
+                    self.vars.get_mut(&a).expect("var").shared = true;
+                    let vb = self.vars.get_mut(&b).expect("var");
+                    vb.shared = true;
+                    vb.shares_with = Some(a);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // `{ items: list }` with the list or the field changed afterwards: one collection.
+        let mut shared_fields = HashSet::new();
+        for (s, f, b) in self.field_sources.clone() {
+            let Some(v) = self.vars.get(&b) else { continue };
+            let collection = matches!(
+                self.types.resolve(&v.ty),
+                Ty::Array(_) | Ty::Map(..) | Ty::Set(_)
+            );
+            if collection
+                && (v.mutated || v.shared || self.changed_fields.contains(&(s.clone(), f.clone())))
+                && !v.reassigned
+                && !(v.role == Role::TopLevel && v.used_in_fn)
+                && !matches!(v.role, Role::Param)
+            {
+                self.vars.get_mut(&b).expect("var").shared = true;
+                shared_fields.insert((s, f));
             }
         }
         // A variable captured by a closure that is kept (returned, stored, given to a
@@ -91,7 +141,9 @@ impl<'m> Infer<'m> {
                 v.shared = true;
             }
         }
-        let boxed = self.boxed_structs();
+        let mut boxed = self.boxed_structs();
+        // A shared object is already behind a pointer.
+        boxed.retain(|n| !shared_types.contains(n));
         let drop_decl = self.assign_narrowed_decls()?;
         self.generalize()?;
         self.check_locals()?;
@@ -151,6 +203,8 @@ impl<'m> Infer<'m> {
             enum_literal: self.enum_literal,
             dyn_casts,
             dyn_literals: self.dyn_literals,
+            shared_types,
+            shared_fields,
             eval_scopes: self.eval_scopes,
             narrow_tests,
             narrowed_uses: self.narrowed_uses,
@@ -272,6 +326,77 @@ impl<'m> Infer<'m> {
 
     /// JSON numbers are doubles: a number read by `JSON.parse` that nothing in the program
     /// constrains to an integer is a float.
+    /// The structs whose instances are held in several places and changed, or compared
+    /// with `===`: shared between the places, like JavaScript objects.
+    fn shared_types(&self) -> HashSet<String> {
+        let mut changed = self.changed_types.clone();
+        for (fn_id, class) in &self.instance_calls {
+            if self.method_mutates(*fn_id) {
+                changed.insert(class.clone());
+            }
+        }
+        // Copies: variables made from a place or kept by something else, and values
+        // copied out of a place.
+        let mut copied: HashSet<String> = HashSet::new();
+        let mut seen = HashSet::new();
+        for v in self.vars.values() {
+            if (v.alias || v.stored || v.captured)
+                && !matches!(v.role, Role::Func | Role::Class | Role::Enum)
+            {
+                self.structs_in(&v.ty, &mut copied, &mut seen);
+            }
+        }
+        for t in &self.copied_types {
+            self.structs_in(t, &mut copied, &mut seen);
+        }
+        let mut shared: HashSet<String> = changed.intersection(&copied).cloned().collect();
+        shared.extend(self.identity_types.iter().cloned());
+        // Classes in a hierarchy are held through traits: kept as they are.
+        shared.retain(|n| {
+            !self.polymorphic.contains(n)
+                && self.struct_by_name(n).is_some_and(|s| {
+                    s.parent.is_none()
+                        && !self
+                            .structs
+                            .iter()
+                            .any(|o| o.parent.as_deref() == Some(n.as_str()))
+                })
+        });
+        shared
+    }
+
+    /// The structs a type holds, directly or through fields.
+    fn structs_in(&self, t: &Ty, out: &mut HashSet<String>, seen: &mut HashSet<String>) {
+        match self.types.resolve(t) {
+            Ty::Named(n, args) => {
+                for a in &args {
+                    self.structs_in(a, out, seen);
+                }
+                if let Some(s) = self.struct_by_name(&n)
+                    && seen.insert(n.clone())
+                {
+                    out.insert(n);
+                    for f in &s.fields {
+                        self.structs_in(&f.ty, out, seen);
+                    }
+                }
+            }
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => {
+                self.structs_in(&t, out, seen)
+            }
+            Ty::Map(k, v, _) => {
+                self.structs_in(&k, out, seen);
+                self.structs_in(&v, out, seen);
+            }
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.structs_in(t, out, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn float_json_numbers(&mut self) {
         let targets = std::mem::take(&mut self.json_targets);
         let mut seen = HashSet::new();

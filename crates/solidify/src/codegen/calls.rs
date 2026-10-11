@@ -93,6 +93,12 @@ impl<'a> Gen<'a> {
                     } else {
                         self.expr(obj)?
                     };
+                    // A shared object: its methods take the handle.
+                    if self.p.is_shared(&class) {
+                        let base = Self::paren(&o, PREC_POSTFIX);
+                        let code = format!("{base}.{method}({list})");
+                        return self.finish_call(code, &info, e);
+                    }
                     let base = if info.mutates_self && o.repr == Repr::Ref {
                         return self.err(
                             format!("`{name}` changes the object, but it is only borrowed here"),
@@ -510,6 +516,10 @@ impl<'a> Gen<'a> {
                     }
                     None => E::owned(format!("{name}::new()"), PREC_POSTFIX),
                 };
+                if self.p.is_shared(&class) && !self.ctor_gives_handle.contains(&class) {
+                    let h = self.helper(Helper::Shared);
+                    return Ok(E::owned(format!("{h}::new({})", built.code), PREC_POSTFIX));
+                }
                 // A class held dynamically: every value of it is boxed.
                 if self.p.is_dyn(&class) {
                     let args = match self.resolve(&built_ty) {
@@ -1990,8 +2000,8 @@ impl<'a> Gen<'a> {
             "reduce" | "reduceRight" => {
                 let ty = self.ty_of(e);
                 let init = match args.get(1) {
-                    Some(a) => self.expr_to(&a.expr, &ty)?,
-                    None => return self.err("`reduce` needs an initial value here", e.span),
+                    Some(a) => Some(self.expr_to(&a.expr, &ty)?),
+                    None => None,
                 };
                 let c = cb(self, 0, &[Repr::Owned, elem_repr])?;
                 let it = if method == "reduceRight" {
@@ -1999,7 +2009,16 @@ impl<'a> Gen<'a> {
                 } else {
                     iter
                 };
-                E::owned(format!("{it}.fold({init}, {c})"), PREC_POSTFIX)
+                match init {
+                    Some(init) => E::owned(format!("{it}.fold({init}, {c})"), PREC_POSTFIX),
+                    // Without an initial value: the first element starts.
+                    None => E::owned(
+                        format!(
+                            "{{ let mut it = {it}; let first = it.next().expect(\"TypeError: Reduce of empty array with no initial value\").clone(); it.fold(first, {c}) }}"
+                        ),
+                        PREC_ATOM,
+                    ),
+                }
             }
             "join" => {
                 let sep = match args.first() {
@@ -2157,6 +2176,7 @@ impl<'a> Gen<'a> {
             bounds: Default::default(),
             class: None,
             labels: 0,
+            handle_this: false,
         });
         let body: &Expr = match &f.body {
             FnBody::Expr(x) => x,

@@ -1,0 +1,10 @@
+1 1 true false
+2 0 false
+5
+[ 1, 2, 3, 4 ] 4 4 1
+root/docs/README README true
+111 0
+3 false
+xyz true
+renamed 1
+true <ref *1> Ring { value: 1, next: Ring { value: 2, next: [Circular *1] } }

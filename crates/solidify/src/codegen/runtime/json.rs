@@ -239,6 +239,11 @@ impl<T: JsFromJson> JsFromJson for Box<T> {
         T::from_json(v).map(Box::new)
     }
 }
+impl<T: JsFromJson> JsFromJson for std::rc::Rc<std::cell::RefCell<T>> {
+    fn from_json(v: &JsonValue) -> Result<Self, String> {
+        T::from_json(v).map(|x| std::rc::Rc::new(std::cell::RefCell::new(x)))
+    }
+}
 impl<T: JsFromJson> JsFromJson for Vec<T> {
     fn from_json(v: &JsonValue) -> Result<Self, String> {
         match v {

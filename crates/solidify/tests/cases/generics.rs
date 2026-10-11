@@ -99,7 +99,7 @@ impl Box_<()> {
 #[derive(Debug, Clone, PartialEq)]
 struct ListNode<T> {
     pub value: T,
-    pub next: Option<Box<ListNode<T>>>,
+    pub next: Option<Shared<ListNode<T>>>,
 }
 
 impl<T: Clone> ListNode<T> {
@@ -110,7 +110,7 @@ impl<T: Clone> ListNode<T> {
 
 #[derive(Debug, Clone, PartialEq)]
 struct LinkedList<T> {
-    head: Option<Box<ListNode<T>>>,
+    head: Option<Shared<ListNode<T>>>,
     count: i64,
 }
 
@@ -120,19 +120,20 @@ impl<T: Clone> LinkedList<T> {
     }
 
     pub fn add(&mut self, value: T) -> &mut Self {
-        let mut node: ListNode<T> = ListNode::new(value);
-        node.next = self.head.clone();
-        self.head = Some(Box::new(node));
+        let mut node: Shared<ListNode<T>> = Shared::new(ListNode::new(value));
+        node.borrow_mut().next = self.head.clone();
+        self.head = Some(node);
         self.count += 1;
         self
     }
 
     pub fn to_array(&self) -> Vec<T> {
         let mut out: Vec<T> = Vec::new();
-        let mut current = &self.head;
+        let mut current = self.head.clone();
         while current.is_some() {
-            out.push(current.as_ref().unwrap().value.clone());
-            current = &current.as_ref().unwrap().next;
+            out.push(current.as_ref().unwrap().borrow().value.clone());
+            let value_ = current.as_ref().unwrap().borrow().next.clone();
+            current = value_;
         }
         out
     }
@@ -448,6 +449,11 @@ impl<T: JsInspect> JsInspect for Option<T> {
         }
     }
 }
+impl<T: JsInspect> JsInspect for std::rc::Rc<std::cell::RefCell<T>> {
+    fn js_value(&self) -> JsValue {
+        self.borrow().js_value()
+    }
+}
 impl<T: JsInspect> JsInspect for Vec<T> {
     fn js_value(&self) -> JsValue {
         JsValue::Array(self.iter().map(JsInspect::js_value).collect())
@@ -684,7 +690,9 @@ fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> Strin
         output = js_group_array(ctx, output, items);
     }
     if ctx.current_depth - recurse_times < 3 && entries == output.len() {
-        let start = output.len() + ctx.indentation + open.chars().count() + 10;
+        // Node counts a `<ref *1>` marker apart from the braces, without the space.
+        let marker = usize::from(open.starts_with("<ref *"));
+        let start = output.len() + ctx.indentation + open.chars().count() - marker + 10;
         let mut total = output.len() + start;
         let fits = total + output.len() <= 80 && output.iter().all(|s| {
             total += s.chars().count();
@@ -1022,6 +1030,11 @@ impl<T: JsFromJson> JsFromJson for Box<T> {
         T::from_json(v).map(Box::new)
     }
 }
+impl<T: JsFromJson> JsFromJson for std::rc::Rc<std::cell::RefCell<T>> {
+    fn from_json(v: &JsonValue) -> Result<Self, String> {
+        T::from_json(v).map(|x| std::rc::Rc::new(std::cell::RefCell::new(x)))
+    }
+}
 impl<T: JsFromJson> JsFromJson for Vec<T> {
     fn from_json(v: &JsonValue) -> Result<Self, String> {
         match v {
@@ -1353,6 +1366,115 @@ impl JsonParser<'_> {
     }
 }
 
+
+/// An object held in several places, like every JavaScript object: changed through one,
+/// changed for all; equal only to itself.
+struct Shared<T>(std::rc::Rc<std::cell::RefCell<T>>);
+
+#[allow(dead_code)]
+impl<T> Shared<T> {
+    fn new(value: T) -> Self {
+        Shared(std::rc::Rc::new(std::cell::RefCell::new(value)))
+    }
+
+    fn borrow(&self) -> std::cell::Ref<'_, T> {
+        self.0.borrow()
+    }
+
+    fn borrow_mut(&self) -> std::cell::RefMut<'_, T> {
+        self.0.borrow_mut()
+    }
+}
+
+// The program runs one piece at a time (a generator's thread waits while the caller
+// runs, and the other way round): its objects are never used by two threads at once.
+unsafe impl<T> Send for Shared<T> {}
+unsafe impl<T> Sync for Shared<T> {}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Shared(self.0.clone())
+    }
+}
+
+impl<T> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        std::rc::Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T> Eq for Shared<T> {}
+
+impl<T> std::hash::Hash for Shared<T> {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::rc::Rc::as_ptr(&self.0).hash(state);
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0.try_borrow() {
+            Ok(v) => v.fmt(f),
+            Err(_) => f.write_str("[Circular]"),
+        }
+    }
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for Shared<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.borrow().fmt(f)
+    }
+}
+
+thread_local! {
+    /// The objects being shown, and whether one of them was met again inside itself.
+    static JS_SHOWING: std::cell::RefCell<Vec<(usize, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+impl<T: JsInspect> JsInspect for Shared<T> {
+    fn js_value(&self) -> JsValue {
+        let ptr = std::rc::Rc::as_ptr(&self.0) as *const () as usize;
+        let cycle = JS_SHOWING.with(|s| {
+            let mut s = s.borrow_mut();
+            match s.iter_mut().find(|(p, _)| *p == ptr) {
+                Some(entry) => {
+                    entry.1 = true;
+                    true
+                }
+                None => {
+                    s.push((ptr, false));
+                    false
+                }
+            }
+        });
+        if cycle {
+            return JsValue::Raw("[Circular *1]".into());
+        }
+        let v = self.0.borrow().js_value();
+        let referenced = JS_SHOWING.with(|s| s.borrow_mut().pop().is_some_and(|(_, r)| r));
+        match v {
+            // Node marks the object a cycle comes back to.
+            JsValue::Object(name, props) if referenced => {
+                let marked: &'static str = Box::leak(
+                    match name {
+                        Some(n) => format!("<ref *1> {n}"),
+                        None => "<ref *1>".to_string(),
+                    }
+                    .into_boxed_str(),
+                );
+                JsValue::Object(Some(marked), props)
+            }
+            other => other,
+        }
+    }
+}
+
+
+impl<T: JsFromJson> JsFromJson for Shared<T> {
+    fn from_json(v: &JsonValue) -> Result<Self, String> {
+        T::from_json(v).map(Shared::new)
+    }
+}
 
 impl<T: JsInspect> JsInspect for Box_<T> {
     fn js_value(&self) -> JsValue {
