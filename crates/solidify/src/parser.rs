@@ -81,6 +81,7 @@ pub fn parse_at(
     while !p.at_eof() {
         body.push(p.statement()?);
     }
+    crate::desugar::desugar(&mut body, &mut p.next_id);
     Ok(Module {
         body,
         node_count: p.next_id,
