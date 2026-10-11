@@ -1308,8 +1308,47 @@ impl<'m> Infer<'m> {
                     }
                     self.bind_pattern(&p.value, &fty, role)?;
                 }
-                if rest.is_some() {
-                    return self.err("rest properties are not supported", *span);
+                // `{ a, ...rest }`: the other properties.
+                if let Some(r) = rest {
+                    let rest_ty = match &ty {
+                        Ty::Map(..) => ty.clone(),
+                        Ty::Named(n, _) => {
+                            let s = self.struct_by_name(n).expect("struct").clone();
+                            let remaining: Vec<FieldInfo> = s
+                                .fields
+                                .iter()
+                                .filter(|f| !props.iter().any(|p| p.key == f.name))
+                                .cloned()
+                                .collect();
+                            let name = match self.same_shape_named(&remaining) {
+                                Some(existing) => existing,
+                                None => {
+                                    let name = self.synth_name("rest");
+                                    self.structs.push(StructInfo {
+                                        name: name.clone(),
+                                        kind: StructKind::Synth,
+                                        fields: remaining,
+                                        methods: Vec::new(),
+                                        ctor: None,
+                                        exported: false,
+                                        span: *span,
+                                        statics: Vec::new(),
+                                        parent: None,
+                                        is_abstract: false,
+                                        implements: Vec::new(),
+                                        type_params: Vec::new(),
+                                        type_bounds: Vec::new(),
+                                        parent_args: Vec::new(),
+                                        implements_args: Vec::new(),
+                                    });
+                                    name
+                                }
+                            };
+                            Ty::named(name)
+                        }
+                        _ => return self.err("rest properties need an object", *span),
+                    };
+                    self.bind_pattern(r, &rest_ty, role)?;
                 }
                 Ok(())
             }
