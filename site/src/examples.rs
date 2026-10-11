@@ -151,6 +151,43 @@ pub const EXAMPLES: &[Example] = &[
         "Nombres et any",
         "Números y any"
     ),
+    case!(
+        "references",
+        "Shared objects",
+        "Objets partagés",
+        "Objetos compartidos"
+    ),
+    case!(
+        "promise_chains",
+        "then, catch, race",
+        "then, catch, race",
+        "then, catch, race"
+    ),
+    case!(
+        "async_methods",
+        "Async classes",
+        "Classes asynchrones",
+        "Clases asíncronas"
+    ),
+    case!(
+        "destructuring",
+        "Destructuring",
+        "Déstructuration",
+        "Desestructuración"
+    ),
+    case!(
+        "type_operators",
+        "Intersections & keyof",
+        "Intersections et keyof",
+        "Intersecciones y keyof"
+    ),
+    case!("bigint", "BigInt", "BigInt", "BigInt"),
+    case!(
+        "modern_syntax",
+        "Static state & tags",
+        "État statique et tags",
+        "Estado estático y tags"
+    ),
 ];
 
 pub fn example(id: &str) -> Option<&'static Example> {
