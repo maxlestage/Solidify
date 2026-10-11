@@ -20,6 +20,13 @@ impl<'m> Infer<'m> {
 
     fn expr_inner(&mut self, e: &'m Expr, expected: Option<&Ty>) -> IResult<Ty> {
         let expected_res = expected.map(|t| self.types.resolve(t));
+        let expected_res = match (&e.kind, expected_res) {
+            (
+                ExprKind::Array(_) | ExprKind::Object(_) | ExprKind::Str(_),
+                Some(Ty::Option(inner)),
+            ) => Some(self.types.resolve(&inner)),
+            (_, other) => other,
+        };
         match &e.kind {
             ExprKind::Num { int, .. } => Ok(if *int {
                 self.types.int()
@@ -443,6 +450,7 @@ impl<'m> Infer<'m> {
                 }
                 match self.types.resolve(&lt) {
                     Ty::Num(_) | Ty::Str | Ty::Var(_) => Ok(Ty::Bool),
+                    Ty::Named(n) if self.is_type_param(&n) => Ok(Ty::Bool),
                     other => {
                         let d = self.describe(&other);
                         self.err(format!("cannot order {d}"), span)
@@ -1492,7 +1500,7 @@ impl<'m> Infer<'m> {
                 } else if let Some(root) = self.root_binding(obj) {
                     self.method_receivers.push((fn_id, root));
                     if info.mutates_self {
-                        self.mark_mutated(obj);
+                        self.mark_receiver_mutated(obj);
                     }
                 }
                 self.calls.insert(

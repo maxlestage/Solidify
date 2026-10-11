@@ -15,7 +15,7 @@ fn first<T: Clone>(items: &[T]) -> T {
 }
 
 fn same<T: PartialEq>(a: T, b: T) -> bool {
-    a == b
+    &a == &b
 }
 
 fn main() {

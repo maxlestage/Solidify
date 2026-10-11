@@ -429,6 +429,22 @@ impl<'m> Infer<'m> {
         let info = self.funcs.get_mut(&f.id).expect("fn");
         info.captures = ctx.captures;
         info.is_closure = !info.captures.is_empty() || f.is_arrow || f.name.is_none();
+        // A declared function whose parameters nothing in its body pins down is generic:
+        // each call instantiates it (`function largest(items)` works on numbers and strings).
+        if !info.is_closure && info.method_of.is_none() {
+            let params = info.sig.params.clone();
+            let mut type_params = info.type_params.clone();
+            let mut vars = Vec::new();
+            for p in &params {
+                super::finish::collect_vars(&self.types, p, &mut vars);
+            }
+            for v in vars {
+                let name = super::finish::fresh_type_param(&type_params);
+                self.types.bind(v, Ty::Named(name.clone()));
+                type_params.push(name);
+            }
+            self.funcs.get_mut(&f.id).expect("fn").type_params = type_params;
+        }
         Ok(())
     }
 
@@ -695,6 +711,36 @@ impl<'m> Infer<'m> {
                 if let Some(p) = v.param_of
                     && in_place
                 {
+                    self.param_mutated.insert(p);
+                }
+            }
+        }
+    }
+
+    /// The receiver of a method that changes it (`list.push(x)`, `map.set(k, v)`).
+    pub(super) fn mark_receiver_mutated(&mut self, obj: &Expr) {
+        if let Some(path) = self.path_of(obj) {
+            for n in self.narrows.iter().rev() {
+                if n.root == path.root && path.fields.starts_with(&n.path) {
+                    if let Some(t) = self.narrow_tests.get_mut(&n.test_id) {
+                        t.mutated = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if uses_this(obj) {
+            self.mark_this_mutated();
+            return;
+        }
+        if let Some(id) = self.root_binding(obj) {
+            let current = self.ctx().id;
+            if let Some(v) = self.vars.get_mut(&id) {
+                v.mutated = true;
+                if v.func != Some(current) && v.role != Role::TopLevel {
+                    v.mutated_in_closure = true;
+                }
+                if let Some(p) = v.param_of {
                     self.param_mutated.insert(p);
                 }
             }

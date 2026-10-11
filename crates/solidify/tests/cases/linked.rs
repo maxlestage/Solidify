@@ -19,7 +19,7 @@ struct List {
 impl List {
     pub fn push(&mut self, value: i64) {
         let node = Node::new(value);
-        if let Some(head) = &mut self.head {
+        if let Some(head) = self.head.as_deref_mut() {
             let mut current = head;
             while current.next.is_some() {
                 current = current.next.as_mut().unwrap();
@@ -42,7 +42,7 @@ impl List {
     }
 
     pub fn first(&self) -> Option<i64> {
-        let Some(head) = &self.head else {
+        let Some(head) = self.head.as_deref() else {
             return None;
         };
         Some(head.value)

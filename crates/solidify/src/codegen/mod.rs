@@ -45,6 +45,8 @@ pub(super) enum Repr {
     Char,
     /// A `usize` standing for an integer number (a length, an index).
     Usize,
+    /// An `Option<&T>` (or `Option<&str>`): a nullable value borrowed from elsewhere.
+    OptRef,
 }
 
 /// What a context needs.
@@ -752,7 +754,8 @@ impl<'a> Gen<'a> {
     /// The representation of a variable bound as a parameter in `mode`.
     pub(super) fn mode_repr(mode: Mode) -> Repr {
         match mode {
-            Mode::Value | Mode::FnImpl | Mode::OptRef => Repr::Owned,
+            Mode::Value | Mode::FnImpl => Repr::Owned,
+            Mode::OptRef => Repr::OptRef,
             Mode::Ref | Mode::Slice => Repr::Ref,
             Mode::RefMut => Repr::RefMut,
             Mode::StrRef => Repr::Str,
@@ -765,6 +768,7 @@ impl<'a> Gen<'a> {
             Ty::Num(_) | Ty::Str | Ty::Bool => "{}",
             Ty::Named(n) => {
                 let prints = n == "Error"
+                    || self.is_type_param(&n)
                     || self.p.is_enum(&n)
                     || self
                         .p
@@ -863,6 +867,29 @@ impl<'a> Gen<'a> {
     pub(super) fn coerce(&mut self, e: E, ty: &Ty, want: Want) -> String {
         let ty = self.resolve(ty);
         let copy = self.is_copy(&ty);
+        if e.repr == Repr::OptRef {
+            return match want {
+                Want::Owned => {
+                    let inner = match &ty {
+                        Ty::Option(inner) => self.resolve(inner),
+                        other => other.clone(),
+                    };
+                    if self.is_boxed(&inner) {
+                        format!(
+                            "{}.map(|v| Box::new(v.clone()))",
+                            Self::paren(&e, PREC_POSTFIX)
+                        )
+                    } else if self.is_copy(&inner) {
+                        format!("{}.copied()", Self::paren(&e, PREC_POSTFIX))
+                    } else if self.is_str(&inner) {
+                        format!("{}.map(|v| v.to_string())", Self::paren(&e, PREC_POSTFIX))
+                    } else {
+                        format!("{}.cloned()", Self::paren(&e, PREC_POSTFIX))
+                    }
+                }
+                _ => e.code,
+            };
+        }
         match want {
             Want::Owned => match e.repr {
                 Repr::Owned => e.code,
@@ -890,12 +917,13 @@ impl<'a> Gen<'a> {
                         format!("{} as i64", Self::paren(&e, PREC_CAST))
                     }
                 }
+                Repr::OptRef => e.code,
             },
             Want::Ref => match e.repr {
                 Repr::Owned | Repr::Place | Repr::Usize => {
                     format!("&{}", Self::paren(&e, PREC_UNARY))
                 }
-                Repr::Ref | Repr::RefMut => e.code,
+                Repr::Ref | Repr::RefMut | Repr::OptRef => e.code,
                 Repr::Str => e.code,
                 Repr::Char => format!("&{}.to_string()", Self::paren(&e, PREC_POSTFIX)),
             },
@@ -903,7 +931,7 @@ impl<'a> Gen<'a> {
                 Repr::Owned | Repr::Place => format!("&mut {}", Self::paren(&e, PREC_UNARY)),
                 Repr::RefMut => e.code,
                 Repr::Ref => format!("&mut {}", Self::paren(&e, PREC_UNARY)),
-                Repr::Str | Repr::Char | Repr::Usize => {
+                Repr::Str | Repr::Char | Repr::Usize | Repr::OptRef => {
                     format!("&mut {}", Self::paren(&e, PREC_UNARY))
                 }
             },
@@ -924,7 +952,7 @@ impl<'a> Gen<'a> {
                 }
                 Repr::Str => e.code,
                 Repr::Char => format!("&{}.to_string()", Self::paren(&e, PREC_POSTFIX)),
-                Repr::Usize => e.code,
+                Repr::Usize | Repr::OptRef => e.code,
             },
             Want::Slice => match e.repr {
                 Repr::Owned | Repr::Place => format!("&{}", Self::paren(&e, PREC_UNARY)),
@@ -957,7 +985,8 @@ impl<'a> Gen<'a> {
 
     /// Whether a binding holds a reference that is rebound by assignments.
     pub(super) fn is_alias(&self, id: NodeId) -> bool {
-        matches!(self.repr_of(id), Repr::Ref | Repr::RefMut) && self.p.var(id).role != Role::Param
+        matches!(self.repr_of(id), Repr::Ref | Repr::RefMut | Repr::OptRef)
+            && self.p.var(id).role != Role::Param
     }
 
     /// `e`, moved when this is its last use, cloned otherwise.
