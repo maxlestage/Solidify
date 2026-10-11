@@ -12,6 +12,7 @@ mod decls;
 mod exprs;
 mod finish;
 mod stmts;
+mod unions;
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +20,7 @@ use crate::ast::*;
 use crate::error::{Error, Span};
 use crate::types::{FuncTy, Ty, Types};
 
-pub use finish::pascal;
+pub use finish::{pascal, same_shape_ty};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -119,7 +120,57 @@ pub struct FieldInfo {
     pub access: Option<Access>,
     pub readonly: bool,
     pub has_init: bool,
+    /// Declared with a string literal type (`kind: "circle"`): the tag of a union member.
+    pub literal: Option<String>,
     pub span: Span,
+}
+
+/// One member of a union of different types: a variant of the Rust enum.
+#[derive(Clone, Debug)]
+pub struct UnionMember {
+    /// The variant name.
+    pub name: String,
+    pub ty: Ty,
+    /// The value of the discriminant field for this member.
+    pub tag: Option<String>,
+}
+
+/// `A | B`: an enum with one variant per member type.
+#[derive(Clone, Debug)]
+pub struct UnionInfo {
+    pub name: String,
+    pub members: Vec<UnionMember>,
+    /// A field every member has, with a different string literal type each: the tag.
+    pub discriminant: Option<String>,
+    pub exported: bool,
+    pub span: Span,
+}
+
+/// The other side of a union member test.
+#[derive(Clone, Debug)]
+pub enum Complement {
+    /// The only other member: its variant and type.
+    Variant(String, Ty),
+    /// The union of the remaining members.
+    Union(Ty),
+}
+
+impl Complement {
+    pub fn ty(&self) -> &Ty {
+        match self {
+            Complement::Variant(_, t) | Complement::Union(t) => t,
+        }
+    }
+}
+
+impl UnionInfo {
+    pub fn member_with_tag(&self, tag: &str) -> Option<&UnionMember> {
+        self.members.iter().find(|m| m.tag.as_deref() == Some(tag))
+    }
+
+    pub fn variant(&self, name: &str) -> Option<&UnionMember> {
+        self.members.iter().find(|m| m.name == name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -225,6 +276,12 @@ pub struct NarrowTest {
     pub name: String,
     /// `x !== null` / `x`: the content exists when the test is true.
     pub positive: bool,
+    /// A test of a union member (`typeof x === "string"`, `x.kind === "circle"`): the enum
+    /// and the variant bound; `None` for a nullable value (`Some`).
+    pub union: Option<(String, String)>,
+    /// What the value is on the other side of the test: the other variant of a union of
+    /// two, or the union of the remaining members.
+    pub complement: Option<Complement>,
     /// The content is changed in the narrowed region: bind it mutably.
     pub mutated: bool,
     pub inner: Ty,
@@ -253,6 +310,7 @@ pub struct Program {
     pub fn_bindings: HashMap<NodeId, NodeId>,
     pub structs: Vec<StructInfo>,
     pub enums: Vec<EnumInfo>,
+    pub unions: Vec<UnionInfo>,
     pub calls: HashMap<NodeId, Callee>,
     /// Object literal → struct it builds.
     pub literal_struct: HashMap<NodeId, String>,
@@ -295,6 +353,18 @@ impl Program {
 
     pub fn is_enum(&self, name: &str) -> bool {
         self.enum_info(name).is_some()
+    }
+
+    pub fn union_info(&self, name: &str) -> Option<&UnionInfo> {
+        self.unions.iter().find(|u| u.name == name)
+    }
+
+    /// The union a type names, if any.
+    pub fn union_of(&self, ty: &Ty) -> Option<&UnionInfo> {
+        match self.types.resolve(ty) {
+            Ty::Named(n) => self.union_info(&n),
+            _ => None,
+        }
     }
 
     /// Whether values of the type copy freely in Rust.
@@ -363,6 +433,7 @@ pub(super) struct Infer<'m> {
     pub(super) funcs: HashMap<NodeId, FnInfo>,
     pub(super) structs: Vec<StructInfo>,
     pub(super) enums: Vec<EnumInfo>,
+    pub(super) unions: Vec<UnionInfo>,
     pub(super) aliases: HashMap<String, Ty>,
     pub(super) calls: HashMap<NodeId, Callee>,
     pub(super) literal_struct: HashMap<NodeId, String>,
@@ -388,6 +459,9 @@ pub(super) struct Infer<'m> {
     pub(super) method_receivers: Vec<(NodeId, NodeId)>,
     /// Method calls on `this`: (method fn id, calling method fn id).
     pub(super) this_calls: Vec<(NodeId, NodeId)>,
+    /// `for (const x of xs)`: (loop variable, collection): a changed element changes the
+    /// collection.
+    pub(super) loop_sources: Vec<(NodeId, NodeId)>,
     pub(super) synth_names: HashSet<String>,
     pub(super) main_id: NodeId,
     pub(super) has_main: bool,
@@ -455,6 +529,7 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         funcs: HashMap::new(),
         structs: Vec::new(),
         enums: Vec::new(),
+        unions: Vec::new(),
         aliases: HashMap::new(),
         calls: HashMap::new(),
         literal_struct: HashMap::new(),
@@ -475,6 +550,7 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         arg_bindings: Vec::new(),
         method_receivers: Vec::new(),
         this_calls: Vec::new(),
+        loop_sources: Vec::new(),
         synth_names: HashSet::new(),
         main_id,
         has_main: false,
@@ -514,9 +590,13 @@ impl<'m> Infer<'m> {
         self.types.unify(a, b).map_err(|msg| Error::new(msg, span))
     }
 
-    /// Unifies the type of a value with what is expected of it.
+    /// Unifies the type of a value with what is expected of it. A value of a member type
+    /// is accepted where a union is expected (the generator wraps it in the variant).
     pub(super) fn expect(&mut self, found: &Ty, expected: &Ty, span: Span) -> IResult<()> {
         if self.types.unify(found, expected).is_err() {
+            if self.union_accepts(expected, found) {
+                return Ok(());
+            }
             return self.err(
                 format!(
                     "expected {}, found {}",
@@ -707,7 +787,20 @@ impl<'m> Infer<'m> {
     pub(super) fn type_exists(&self, name: &str) -> bool {
         self.struct_by_name(name).is_some()
             || self.enum_by_name(name).is_some()
+            || self.union_by_name(name).is_some()
             || self.aliases.contains_key(name)
+    }
+
+    pub(super) fn union_by_name(&self, name: &str) -> Option<&UnionInfo> {
+        self.unions.iter().find(|u| u.name == name)
+    }
+
+    /// The union a type names, if any.
+    pub(super) fn union_of_ty(&self, ty: &Ty) -> Option<&UnionInfo> {
+        match self.types.resolve(ty) {
+            Ty::Named(n) => self.union_by_name(&n),
+            _ => None,
+        }
     }
 
     pub(super) fn is_type_param(&self, name: &str) -> bool {

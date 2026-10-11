@@ -11,6 +11,47 @@ use crate::error::Span;
 use crate::infer::pascal;
 use crate::types::{Flavor, FuncTy, Ty};
 
+/// The field of inline object types that holds a different string literal in each: the
+/// discriminant of a union written in place.
+fn inline_discriminant(members: &[&TypeAnn]) -> Option<String> {
+    let objects: Vec<&Vec<TypeMember>> = members
+        .iter()
+        .filter_map(|m| match m {
+            TypeAnn::Object(props, _) => Some(props),
+            _ => None,
+        })
+        .collect();
+    if objects.len() < 2 {
+        return None;
+    }
+    let first = objects[0];
+    for m in first {
+        let TypeMember::Prop {
+            name,
+            ty: TypeAnn::Lit(Lit::Str(_), _),
+            ..
+        } = m
+        else {
+            continue;
+        };
+        let mut tags = HashSet::new();
+        let all = objects.iter().all(|props| {
+            props.iter().any(|p| match p {
+                TypeMember::Prop {
+                    name: n,
+                    ty: TypeAnn::Lit(Lit::Str(s), _),
+                    ..
+                } if n == name => tags.insert(s.clone()),
+                _ => false,
+            })
+        });
+        if all && tags.len() == objects.len() {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
 impl<'m> Infer<'m> {
     /// The type an annotation denotes. `hint` names the structs made for inline object types.
     pub(super) fn ann(&mut self, ann: &TypeAnn, hint: &str) -> IResult<Ty> {
@@ -58,9 +99,9 @@ impl<'m> Infer<'m> {
                 Ok(Ty::Func(Rc::new(FuncTy { params: ps, ret })))
             }
             TypeAnn::Lit(lit, span) => match lit {
-                Lit::Str(s) => {
-                    let span = *span;
-                    self.union_ann(&[TypeAnn::Lit(Lit::Str(s.clone()), span)], span, hint)
+                Lit::Str(_) => {
+                    let _ = span;
+                    Ok(Ty::Str)
                 }
                 Lit::Num(v) => Ok(if v.fract() == 0.0 {
                     self.types.int()
@@ -185,17 +226,27 @@ impl<'m> Infer<'m> {
         {
             Ty::Bool
         } else {
-            let first = self.ann(rest[0], hint)?;
-            for t in &rest[1..] {
-                let other = self.ann(t, hint)?;
-                if self.types.unify(&first, &other).is_err() {
-                    return self.err(
-                        "unions of different types are not supported: only `T | null`, unions of string literals and the same type repeated",
-                        span,
-                    );
-                }
+            // Different types: an enum with one variant per member.
+            let mut members = Vec::new();
+            let discriminant = inline_discriminant(&rest);
+            for t in &rest {
+                let member_hint = match (t, &discriminant) {
+                    (TypeAnn::Object(props, _), Some(d)) => props
+                        .iter()
+                        .find_map(|m| match m {
+                            TypeMember::Prop {
+                                name,
+                                ty: TypeAnn::Lit(Lit::Str(s), _),
+                                ..
+                            } if name == d => Some(s.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| hint.to_string()),
+                    _ => hint.to_string(),
+                };
+                members.push(self.ann(t, &member_hint)?);
             }
-            first
+            self.union_of(members, span)?
         };
         Ok(if nullable {
             match inner {
@@ -211,6 +262,12 @@ impl<'m> Infer<'m> {
     /// A fresh type name made from a hint (`user profile` → `UserProfile`).
     pub(super) fn synth_name(&mut self, hint: &str) -> String {
         let base = pascal(hint);
+        self.synth_name_exact(&base)
+    }
+
+    /// A fresh type name from a Rust name.
+    pub(super) fn synth_name_exact(&mut self, hint: &str) -> String {
+        let base = hint.to_string();
         let base = if base.is_empty() {
             "Object".to_string()
         } else {
@@ -306,6 +363,10 @@ impl<'m> Infer<'m> {
                         (Ty::Option(inner), true) => (*inner, true),
                         (_, o) => (fty, o),
                     };
+                    let literal = match ty {
+                        TypeAnn::Lit(Lit::Str(s), _) => Some(s.clone()),
+                        _ => None,
+                    };
                     fields.push(FieldInfo {
                         name: name.clone(),
                         ty: fty,
@@ -313,6 +374,7 @@ impl<'m> Infer<'m> {
                         access: None,
                         readonly: *readonly,
                         has_init: false,
+                        literal,
                         span: *span,
                     });
                 }

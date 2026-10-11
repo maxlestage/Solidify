@@ -173,24 +173,65 @@ impl<'m> Infer<'m> {
                 self.push_scope();
                 self.ctx_mut().loop_depth += 1;
                 self.bind_pattern(pat, &item, Role::Loop)?;
+                if let Some(root) = self.root_binding(iter) {
+                    for (_, id) in pat.names() {
+                        self.loop_sources.push((id, root));
+                    }
+                }
                 self.stmt(body)?;
                 self.ctx_mut().loop_depth -= 1;
                 self.pop_scope();
                 Ok(())
             }
             StmtKind::Switch { disc, cases } => {
+                // `switch (shape.kind)`: each case sees its member of the union.
+                let tagged = if self.member_is_tag(disc) {
+                    let ExprKind::Member { obj, .. } = &disc.kind else {
+                        unreachable!()
+                    };
+                    let ot = self.expr(obj, None)?;
+                    self.union_of_ty(&ot).cloned().map(|u| (&**obj, u))
+                } else {
+                    None
+                };
                 let dt = self.expr(disc, None)?;
                 for (i, c) in cases.iter().enumerate() {
+                    let mut narrow = None;
                     if let Some(t) = &c.test {
                         let tt = self.expr(t, Some(&dt))?;
                         self.expect(&tt, &dt, t.span)?;
+                        if let Some((obj, u)) = &tagged
+                            && let ExprKind::Str(s) = &t.kind
+                        {
+                            let Some(m) = u.member_with_tag(s) else {
+                                return self.err(
+                                    format!(
+                                        "`{s}` is not a `{}` of {}",
+                                        u.discriminant.clone().unwrap_or_default(),
+                                        u.name
+                                    ),
+                                    t.span,
+                                );
+                            };
+                            let test = super::unions::UnionTest {
+                                value: obj,
+                                union: u.name.clone(),
+                                variant: m.name.clone(),
+                                inner: m.ty.clone(),
+                                positive: true,
+                            };
+                            narrow = Some(self.narrow_union(&test, t.id)?.0);
+                        }
                     }
                     self.push_scope();
+                    let before = self.narrows.len();
+                    self.narrows.extend(narrow);
                     self.branch.push((disc.id, i.min(254) as u8));
                     let r = self
                         .collect_values(&c.body, false)
                         .and_then(|()| self.stmts(&c.body));
                     self.branch.pop();
+                    self.narrows.truncate(before);
                     self.pop_scope();
                     r?;
                 }
@@ -562,6 +603,21 @@ impl<'m> Infer<'m> {
                 self.set_ty(e.id, Ty::Bool);
                 Ok((Vec::new(), neg))
             }
+            // Tests of a union member: `typeof x === "string"`, `x.kind === "circle"`,
+            // `x instanceof C`, `"field" in x`, `Array.isArray(x)`.
+            _ if self.is_union_test_shape(e) => {
+                if let Some(t) = self.union_test(e)? {
+                    let (n, other) = self.narrow_union(&t, e.id)?;
+                    let other: Vec<ActiveNarrow> = other.into_iter().collect();
+                    return Ok(if t.positive {
+                        (vec![n], other)
+                    } else {
+                        (other, vec![n])
+                    });
+                }
+                self.truthy(e)?;
+                Ok((Vec::new(), Vec::new()))
+            }
             ExprKind::Binary { op, left, right } if op.is_equality() => {
                 let null_right = matches!(right.kind, ExprKind::Null | ExprKind::Undefined);
                 let null_left = matches!(left.kind, ExprKind::Null | ExprKind::Undefined);
@@ -624,6 +680,68 @@ impl<'m> Infer<'m> {
         }
     }
 
+    /// Whether an expression has the shape of a union member test (the union itself is
+    /// checked by `union_test`).
+    fn is_union_test_shape(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Binary { op, left, right } if op.is_equality() => {
+                matches!(left.kind, ExprKind::TypeOf(_))
+                    || matches!(right.kind, ExprKind::TypeOf(_))
+                    || (matches!(left.kind, ExprKind::Member { .. })
+                        && matches!(right.kind, ExprKind::Str(_))
+                        && self.member_is_tag(left))
+                    || (matches!(right.kind, ExprKind::Member { .. })
+                        && matches!(left.kind, ExprKind::Str(_))
+                        && self.member_is_tag(right))
+            }
+            ExprKind::Binary {
+                op: BinOp::InstanceOf | BinOp::In,
+                ..
+            } => true,
+            ExprKind::Call { callee, .. } => {
+                matches!(&callee.kind, ExprKind::Member { obj, prop, .. }
+                if prop == "isArray" && matches!(&obj.kind, ExprKind::Ident(n) if n == "Array"))
+            }
+            _ => false,
+        }
+    }
+
+    /// `x.kind` where `x` is a union with the discriminant `kind`.
+    fn member_is_tag(&self, e: &Expr) -> bool {
+        let ExprKind::Member { obj, prop, .. } = &e.kind else {
+            return false;
+        };
+        let Some(path) = self.path_of(obj) else {
+            return false;
+        };
+        if let Some(i) = self.active_narrow(&path) {
+            let inner = self.narrows[i].inner.clone();
+            return self
+                .union_of_ty(&inner)
+                .is_some_and(|u| u.discriminant.as_deref() == Some(prop.as_str()));
+        }
+        let ty = match &path.root {
+            Root::Var(id) => self.vars[id].ty.clone(),
+            Root::This => match self.ctx().this.clone() {
+                Some(c) => Ty::Named(c),
+                None => return false,
+            },
+        };
+        let mut ty = self.types.resolve(&ty);
+        for f in &path.fields {
+            let Ty::Named(n) = &ty else { return false };
+            let Some(s) = self.struct_by_name(n) else {
+                return false;
+            };
+            let Some(field) = s.field(f) else {
+                return false;
+            };
+            ty = self.types.resolve(&field.ty);
+        }
+        self.union_of_ty(&ty)
+            .is_some_and(|u| u.discriminant.as_deref() == Some(prop.as_str()))
+    }
+
     /// A value used as a condition: boolean, number, string, list or nullable.
     pub(super) fn truthy(&mut self, e: &'m Expr) -> IResult<Ty> {
         let t = self.expr(e, None)?;
@@ -662,6 +780,8 @@ impl<'m> Infer<'m> {
                 path: path.fields.clone(),
                 name: name.clone(),
                 positive,
+                union: None,
+                complement: None,
                 mutated: false,
                 inner: (*inner).clone(),
                 let_else: false,

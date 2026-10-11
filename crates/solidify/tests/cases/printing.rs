@@ -297,16 +297,13 @@ fn js_to_string(v: &JsValue) -> String {
     }
 }
 
-/// `console.log(args…)`: strings as they are, the rest inspected, separated by spaces.
+/// One argument of `console.log`: a string as it is, anything else inspected.
 #[allow(dead_code)]
-fn js_log(args: &[JsValue]) -> String {
-    args.iter()
-        .map(|a| match a {
-            JsValue::Str(s) => s.clone(),
-            other => js_inspect(other),
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+fn js_show(v: &JsValue) -> String {
+    match v {
+        JsValue::Str(s) => s.clone(),
+        other => js_inspect(other),
+    }
 }
 
 /// A string literal as Node's `util.inspect` quotes it.

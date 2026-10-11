@@ -159,6 +159,10 @@ pub(super) struct Gen<'a> {
     /// Structs and enums shown by `console.log` or converted to strings: they get a
     /// `JsInspect` implementation.
     pub inspected: BTreeSet<String>,
+    /// Fields read (or written: `true`) on union values: accessors on the enum.
+    pub union_accessors: BTreeSet<(String, String, bool)>,
+    /// Unions whose `typeof` is taken.
+    pub union_typeof: BTreeSet<String>,
     /// Binding → Rust name.
     pub names: HashMap<NodeId, String>,
     /// Binding → how the variable holds its value.
@@ -187,6 +191,8 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         uses_hashset: false,
         ordered: false,
         inspected: BTreeSet::new(),
+        union_accessors: BTreeSet::new(),
+        union_typeof: BTreeSet::new(),
         names: HashMap::new(),
         reprs: HashMap::new(),
         fn_asts: HashMap::new(),
@@ -862,10 +868,33 @@ impl<'a> Gen<'a> {
             Ty::Array(_) | Ty::Tuple(_) | Ty::Map(..) | Ty::Set(_) => true,
             Ty::Option(inner) => self.is_inspect_ty(&inner),
             Ty::Named(n) => {
-                n != "Error" && !self.is_type_param(&n) && self.p.struct_info(&n).is_some()
+                n != "Error"
+                    && !self.is_type_param(&n)
+                    && (self.p.struct_info(&n).is_some() || self.p.union_info(&n).is_some())
             }
             _ => false,
         }
+    }
+
+    /// The union a type names, if any.
+    pub(super) fn union_of(&self, ty: &Ty) -> Option<&crate::infer::UnionInfo> {
+        self.p.union_of(ty)
+    }
+
+    /// The variant of union `to` that a value of type `from` fills, if `to` is a union
+    /// and `from` one of its members.
+    pub(super) fn union_variant(&self, from: &Ty, to: &Ty) -> Option<(String, String)> {
+        let u = self.union_of(to)?;
+        let from = self.resolve(from);
+        if matches!(&from, Ty::Named(n) if *n == u.name) {
+            return None;
+        }
+        let zf = self.p.types.zonk(&from);
+        let m = u
+            .members
+            .iter()
+            .find(|m| crate::infer::same_shape_ty(&self.p.types.zonk(&m.ty), &zf))?;
+        Some((pascal(&u.name), m.name.clone()))
     }
 
     /// Records that the structs and enums reachable from this type are shown.
@@ -883,16 +912,21 @@ impl<'a> Gen<'a> {
                 }
             }
             Ty::Named(n)
-                if (self.p.struct_info(&n).is_some() || self.p.is_enum(&n))
+                if (self.p.struct_info(&n).is_some()
+                    || self.p.is_enum(&n)
+                    || self.p.union_info(&n).is_some())
                     && self.inspected.insert(n.clone()) =>
             {
-                let fields: Vec<Ty> = self
+                let mut inner: Vec<Ty> = self
                     .p
                     .struct_info(&n)
                     .map(|s| s.fields.iter().map(|f| f.ty.clone()).collect())
                     .unwrap_or_default();
-                for f in &fields {
-                    self.mark_inspected(f);
+                if let Some(u) = self.p.union_info(&n) {
+                    inner.extend(u.members.iter().map(|m| m.ty.clone()));
+                }
+                for t in &inner {
+                    self.mark_inspected(t);
                 }
             }
             _ => {}
@@ -1435,7 +1469,15 @@ impl<'a> Gen<'a> {
         if matches!(from_r, Ty::Null) {
             return "None".into();
         }
-        let code = self.owned(e, &from_r);
+        let mut code = self.owned(e, &from_r);
+        // A member of a union goes into its variant.
+        let target = match &to_r {
+            Ty::Option(inner) if !matches!(from_r, Ty::Option(_)) => self.resolve(inner),
+            other => other.clone(),
+        };
+        if let Some((en, variant)) = self.union_variant(&from_r, &target) {
+            code = format!("{en}::{variant}({code})");
+        }
         if let Ty::Option(inner) = &to_r
             && !matches!(from_r, Ty::Option(_))
         {
