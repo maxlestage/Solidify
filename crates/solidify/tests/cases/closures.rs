@@ -23,7 +23,7 @@ fn main() {
     let mut next = make_counter();
     next();
     next();
-    println!("{} {} {}", next(), apply(double.clone(), 21), apply(|x| x + 1, 1));
+    println!("{} {} {}", next(), apply(double, 21), apply(|x| x + 1, 1));
     let greet = |name: String, excited: bool| {
         let base = format!("Hello, {name}");
         if excited { format!("{base}!") } else { base }
