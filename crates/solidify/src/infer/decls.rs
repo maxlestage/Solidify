@@ -119,6 +119,7 @@ impl<'m> Infer<'m> {
                         type_params: i.type_params.iter().map(|t| t.name.clone()).collect(),
                         type_bounds: Vec::new(),
                         parent_args: Vec::new(),
+                        implements_args: Vec::new(),
                     });
                 }
                 StmtKind::Class(c) => {
@@ -138,6 +139,7 @@ impl<'m> Infer<'m> {
                         type_params: c.type_params.iter().map(|t| t.name.clone()).collect(),
                         type_bounds: Vec::new(),
                         parent_args: Vec::new(),
+                        implements_args: Vec::new(),
                     });
                 }
                 StmtKind::Enum(e) => {
@@ -162,6 +164,7 @@ impl<'m> Infer<'m> {
                             type_params: a.type_params.iter().map(|t| t.name.clone()).collect(),
                             type_bounds: Vec::new(),
                             parent_args: Vec::new(),
+                            implements_args: Vec::new(),
                         }),
                         TypeAnn::Union(members, span)
                             if members.len() > 1
@@ -236,20 +239,60 @@ impl<'m> Infer<'m> {
                     let mut fields = Vec::new();
                     let mut methods = Vec::new();
                     for base in &i.extends {
-                        let TypeAnn::Named { name, .. } = base else {
+                        let TypeAnn::Named { name, args, .. } = base else {
                             return self.err(
                                 "an interface can only extend a named interface",
                                 base.span(),
                             );
                         };
-                        let Some(parent) = self.struct_by_name(name) else {
+                        let Some(parent) = self.struct_by_name(name).cloned() else {
                             return self.err(format!("unknown interface `{name}`"), base.span());
                         };
                         if parent.kind == StructKind::Class {
                             return self.err("an interface cannot extend a class", base.span());
                         }
-                        fields.extend(parent.fields.iter().cloned());
-                        methods.extend(parent.methods.iter().cloned());
+                        // `interface Tagged extends Named<number>`: the parent's
+                        // parameters given.
+                        let mut given = std::collections::HashMap::new();
+                        for (k, p) in parent.type_params.iter().enumerate() {
+                            let t = match args.get(k) {
+                                Some(a) => self.ann(a, &i.name)?,
+                                None => self.types.fresh(),
+                            };
+                            given.insert(p.clone(), t);
+                        }
+                        if given.is_empty() {
+                            fields.extend(parent.fields.iter().cloned());
+                            methods.extend(parent.methods.iter().cloned());
+                            continue;
+                        }
+                        for f in &parent.fields {
+                            fields.push(FieldInfo {
+                                ty: super::finish::substitute(&f.ty, &given, &self.types),
+                                ..f.clone()
+                            });
+                        }
+                        for m in &parent.methods {
+                            // A method of its own, with the parameters given.
+                            let mut info = self.funcs[&m.fn_id].clone();
+                            let id = self.synth_id();
+                            info.id = id;
+                            info.method_of = Some(i.name.clone());
+                            info.sig = FuncTy {
+                                params: info
+                                    .sig
+                                    .params
+                                    .iter()
+                                    .map(|t| super::finish::substitute(t, &given, &self.types))
+                                    .collect(),
+                                ret: super::finish::substitute(&info.sig.ret, &given, &self.types),
+                            };
+                            self.funcs.insert(id, info);
+                            methods.push(MethodInfo {
+                                fn_id: id,
+                                ..m.clone()
+                            });
+                        }
                     }
                     let (own_fields, own_methods) = self.members_of(&i.name, &i.members)?;
                     fields.extend(own_fields);
@@ -598,8 +641,14 @@ impl<'m> Infer<'m> {
         s.is_abstract = c.is_abstract;
         // `implements I`: every field and method of `I` is here, with the same type.
         let mut implements = Vec::new();
+        let mut implements_args = Vec::new();
         for ann in &c.implements {
-            let TypeAnn::Named { name: iname, .. } = ann else {
+            let TypeAnn::Named {
+                name: iname,
+                args: iargs,
+                ..
+            } = ann
+            else {
                 return self.err("`implements` needs the name of an interface", ann.span());
             };
             let Some(iface) = self.struct_by_name(iname).cloned() else {
@@ -611,6 +660,21 @@ impl<'m> Infer<'m> {
                     ann.span(),
                 );
             }
+            // `implements Container<number>`: the interface's parameters given.
+            let mut args = Vec::new();
+            for (i, _) in iface.type_params.iter().enumerate() {
+                args.push(match iargs.get(i) {
+                    Some(a) => self.ann(a, &c.name)?,
+                    None => self.types.fresh(),
+                });
+            }
+            let given: std::collections::HashMap<String, Ty> = iface
+                .type_params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect();
+            let sub = |this: &Self, t: &Ty| super::finish::substitute(t, &given, &this.types);
             for f in &iface.fields {
                 let Some(cf) = self
                     .struct_by_name(&c.name)
@@ -624,7 +688,8 @@ impl<'m> Infer<'m> {
                         c.span,
                     );
                 };
-                self.unify(&cf.ty, &f.ty, cf.span)?;
+                let ft = sub(self, &f.ty);
+                self.unify(&cf.ty, &ft, cf.span)?;
             }
             for m in &iface.methods {
                 let Some((_, cm)) = self.find_method(&c.name, &m.name, m.kind) else {
@@ -650,14 +715,21 @@ impl<'m> Infer<'m> {
                     );
                 }
                 for (x, y) in a.params.iter().zip(&b.params) {
-                    self.unify(x, y, c.span)?;
+                    let x = sub(self, x);
+                    self.unify(&x, y, c.span)?;
                 }
-                self.unify(&a.ret, &b.ret, c.span)?;
+                let ret = sub(self, &a.ret);
+                self.unify(&ret, &b.ret, c.span)?;
                 self.link_implementation(m.fn_id, cm.fn_id);
             }
             implements.push(iname.clone());
+            if !args.is_empty() {
+                implements_args.push((iname.clone(), args));
+            }
         }
-        self.struct_mut(&c.name).expect("class").implements = implements;
+        let s = self.struct_mut(&c.name).expect("class");
+        s.implements = implements;
+        s.implements_args = implements_args;
         Ok(())
     }
 
