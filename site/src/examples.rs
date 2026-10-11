@@ -55,6 +55,13 @@ pub const EXAMPLES: &[Example] = &[
     case!("unions", "Unions & typeof", "Unions et typeof"),
     case!("inheritance", "Inheritance", "Héritage"),
     case!("interfaces", "Interfaces as traits", "Interfaces en traits"),
+    case!("generics", "Generic classes", "Classes génériques"),
+    case!(
+        "generic_traits",
+        "Generic interfaces",
+        "Interfaces génériques"
+    ),
+    case!("missing", "undefined & null", "undefined et null"),
     case!("spreads", "Spreads & rest", "Spreads et rest"),
     case!("generators", "Generators", "Générateurs"),
     case!("regex", "Regular expressions", "Expressions régulières"),
