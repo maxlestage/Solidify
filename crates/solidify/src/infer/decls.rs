@@ -930,6 +930,12 @@ impl<'m> Infer<'m> {
                 }
             }
         };
+        // An async function gives a promise of what its body returns.
+        let ret = match self.types.resolve(&ret) {
+            Ty::Named(n, _) if f.is_async && n == crate::types::PROMISE => ret,
+            _ if f.is_async => Ty::promise(ret),
+            _ => ret,
+        };
         if f.is_generator && !matches!(self.types.resolve(&ret), Ty::Gen(_)) {
             return self.err("a generator returns `Generator<T>`", f.span);
         }
@@ -944,9 +950,7 @@ impl<'m> Infer<'m> {
             type_bounds: Vec::new(),
             throws: false,
             throw_direct: false,
-            // A function giving a `Promise` is awaited by its callers: async in Rust.
-            is_async: f.is_async
-                || matches!(&f.ret, Some(TypeAnn::Named { name, .. }) if name == "Promise"),
+            is_async: f.is_async,
             is_arrow: f.is_arrow,
             method_of: method_of.map(str::to_string),
             method_kind,

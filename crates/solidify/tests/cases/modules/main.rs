@@ -766,6 +766,7 @@ fn js_group_array(ctx: &JsInspectCtx, output: Vec<String>, items: &[JsValue]) ->
 struct JsStatic<T>(std::cell::RefCell<T>);
 
 unsafe impl<T> Sync for JsStatic<T> {}
+unsafe impl<T> Send for JsStatic<T> {}
 
 #[allow(dead_code)]
 impl<T> JsStatic<T> {

@@ -256,11 +256,18 @@ impl<'m> Infer<'m> {
                 }
                 Ty::Map(Box::new(k), Box::new(v), true)
             }
-            "Promise" => arg(self, 0)?,
+            "Promise" => Ty::promise(arg(self, 0)?),
             "Generator" | "Iterable" | "IterableIterator" | "Iterator" => {
                 Ty::Gen(Box::new(arg(self, 0)?))
             }
-            "Partial" | "Required" | "Readonly" | "NonNullable" | "Awaited" => arg(self, 0)?,
+            "Awaited" => {
+                let t = arg(self, 0)?;
+                match self.types.resolve(&t) {
+                    Ty::Named(n, args) if n == crate::types::PROMISE => args[0].clone(),
+                    _ => t,
+                }
+            }
+            "Partial" | "Required" | "Readonly" | "NonNullable" => arg(self, 0)?,
             "Error" => Ty::named("Error"),
             "Function" => {
                 return self.err("`Function` is too vague: write `(x: T) => U`", span);
@@ -662,7 +669,7 @@ impl<'m> Infer<'m> {
                 type_bounds: Vec::new(),
                 throws: false,
                 throw_direct: false,
-                is_async: matches!(ret, Some(TypeAnn::Named { name, .. }) if name == "Promise"),
+                is_async: false,
                 is_arrow: false,
                 method_of: Some(owner.to_string()),
                 method_kind: Some(MethodKind::Method),

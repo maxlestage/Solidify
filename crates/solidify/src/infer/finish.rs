@@ -36,19 +36,6 @@ impl<'m> Infer<'m> {
                 }
             }
         }
-        // The top level calling an async function waits for it: it runs async itself.
-        let main_calls: Vec<NodeId> = self
-            .funcs
-            .get(&self.main_id)
-            .map(|f| f.calls.iter().map(|(callee, _)| *callee).collect())
-            .unwrap_or_default();
-        if main_calls
-            .iter()
-            .any(|c| self.funcs.get(c).is_some_and(|f| f.is_async))
-            && let Some(m) = self.funcs.get_mut(&self.main_id)
-        {
-            m.is_async = true;
-        }
         self.propagate_throws();
         // A method is mutating when any implementation or override of it is: known
         // before what calls it is settled, and again after.
@@ -80,6 +67,7 @@ impl<'m> Infer<'m> {
                 f.returns_this = true;
             }
         }
+        let promise_rejects = self.promise_rejects();
         let shared_types = self.shared_types();
         // A narrowed value whose alias is changed is bound mutably.
         for (binding, test) in self.alias_of_narrow.clone() {
@@ -143,7 +131,7 @@ impl<'m> Infer<'m> {
         let escaping: Vec<NodeId> = self
             .funcs
             .values()
-            .filter(|f| f.escapes)
+            .filter(|f| f.escapes || (f.is_async && f.is_closure))
             .flat_map(|f| f.captures.iter().copied())
             .collect();
         for id in escaping {
@@ -256,6 +244,8 @@ impl<'m> Infer<'m> {
             polymorphic: self.polymorphic,
             overrides: self.overrides,
             uses_timers: self.uses_timers,
+            promise_rejects,
+            auto_awaits: std::mem::take(&mut self.auto_awaits),
             bound_impls,
             undef_vars,
             undef_fns,
@@ -388,6 +378,15 @@ impl<'m> Infer<'m> {
             self.structs_in(t, &mut copied, &mut seen);
         }
         let mut shared: HashSet<String> = changed.intersection(&copied).cloned().collect();
+        // An async method that changes `this` runs later, on the object itself.
+        for f in self.funcs.values() {
+            if f.is_async
+                && f.mutates_self
+                && let Some(c) = &f.method_of
+            {
+                shared.insert(c.clone());
+            }
+        }
         shared.extend(self.identity_types.iter().cloned());
         // A class hierarchy (and the interfaces it implements) is shared as a whole: a
         // value of one class may be held as another.
@@ -533,6 +532,11 @@ impl<'m> Infer<'m> {
         Ok(out)
     }
 
+    /// Whether some promise may be rejected, and awaiting one may throw.
+    pub(super) fn promise_rejects(&self) -> bool {
+        self.rejects || self.funcs.values().any(|f| f.is_async && f.throws)
+    }
+
     /// A function throws if it throws itself or calls, outside a `try`, one that does.
     fn propagate_throws(&mut self) {
         for f in self.funcs.values_mut() {
@@ -546,10 +550,17 @@ impl<'m> Infer<'m> {
                 if f.throws {
                     continue;
                 }
+                // An async callee rejects its promise: only waiting for it throws.
                 let throws = f.calls.iter().any(|(callee, call)| {
                     !self.calls_in_try.contains(call)
-                        && self.funcs.get(callee).is_some_and(|c| c.throws)
-                });
+                        && self.funcs.get(callee).is_some_and(|c| {
+                            c.throws && (!c.is_async || self.awaited_calls.contains(call))
+                        })
+                }) || (self.promise_rejects()
+                    && self
+                        .promise_awaits
+                        .iter()
+                        .any(|(f, a)| *f == id && !self.calls_in_try.contains(a)));
                 if throws {
                     self.funcs.get_mut(&id).expect("fn").throws = true;
                     changed = true;
