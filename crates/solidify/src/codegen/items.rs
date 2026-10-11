@@ -63,10 +63,8 @@ impl<'a> Gen<'a> {
         if self.uses_rc {
             uses.push("use std::rc::Rc;");
         }
-        match (self.uses_lazy, self.uses_mutex) {
-            (true, true) => uses.push("use std::sync::{LazyLock, Mutex};"),
-            (true, false) => uses.push("use std::sync::LazyLock;"),
-            _ => {}
+        if self.uses_lazy {
+            uses.push("use std::sync::LazyLock;");
         }
         if !uses.is_empty() {
             out.push_str(&uses.join("\n"));
@@ -177,10 +175,17 @@ impl<'a> Gen<'a> {
         if helpers.contains(&Helper::Inspect) || helpers.contains(&Helper::Json) {
             helpers.insert(Helper::NumText);
         }
+        let shared_json = helpers.contains(&Helper::Shared) && helpers.contains(&Helper::Json);
         for h in helpers {
             out.push('\n');
             out.push_str(h.source());
             out.push('\n');
+        }
+        if self.uses_mutex {
+            out.push_str("\n/// A top-level variable that functions change. The program runs one piece at a\n/// time: read and written like a `RefCell`.\nstruct JsStatic<T>(std::cell::RefCell<T>);\n\nunsafe impl<T> Sync for JsStatic<T> {}\n\n#[allow(dead_code)]\nimpl<T> JsStatic<T> {\n    fn new(value: T) -> Self {\n        JsStatic(std::cell::RefCell::new(value))\n    }\n\n    fn read(&self) -> std::cell::Ref<'_, T> {\n        self.0.borrow()\n    }\n\n    fn write(&self) -> std::cell::RefMut<'_, T> {\n        self.0.borrow_mut()\n    }\n}\n");
+        }
+        if shared_json {
+            out.push_str("\nimpl<T: JsFromJson> JsFromJson for Shared<T> {\n    fn from_json(v: &JsonValue) -> Result<Self, String> {\n        T::from_json(v).map(Shared::new)\n    }\n}\n");
         }
     }
 
@@ -537,7 +542,7 @@ impl<'a> Gen<'a> {
                     if mutable {
                         self.uses_mutex = true;
                         self.line(&format!(
-                            "{vis}static {name}: LazyLock<Mutex<{t}>> = LazyLock::new(|| Mutex::new({value}));"
+                            "{vis}static {name}: LazyLock<JsStatic<{t}>> = LazyLock::new(|| JsStatic::new({value}));"
                         ));
                     } else {
                         self.line(&format!(
@@ -837,7 +842,11 @@ impl<'a> Gen<'a> {
             } else {
                 f.ty.clone()
             };
-            let t = self.rust_ty(&ty, f.span)?;
+            let mut t = self.rust_ty(&ty, f.span)?;
+            if self.p.is_shared_field(&s.name, &f.name) {
+                self.uses_rc = true;
+                t = format!("Rc<RefCell<{t}>>");
+            }
             let fvis = match f.access {
                 Some(Access::Private) | Some(Access::Protected) => "",
                 _ => "pub ",
@@ -954,9 +963,15 @@ impl<'a> Gen<'a> {
             self.line("}");
         }
         let mut statics = Vec::new();
+        // A shared class: its methods are the handle's (`impl Shared<Name>`).
+        let mut on_handle = Vec::new();
         for (_, m) in methods {
             if generic && m.is_static {
                 statics.push(m);
+                continue;
+            }
+            if self.p.is_shared(&s.name) && !m.is_static {
+                on_handle.push(m);
                 continue;
             }
             self.blank();
@@ -998,6 +1013,26 @@ impl<'a> Gen<'a> {
         }
         self.indent -= 1;
         self.line("}");
+        if !on_handle.is_empty() {
+            let h = self.helper(super::Helper::Shared);
+            self.blank();
+            let handle_at = self.out.len();
+            self.line(&format!("impl {h}<{name}{generics}> {{"));
+            self.indent += 1;
+            for (i, m) in on_handle.into_iter().enumerate() {
+                if i > 0 {
+                    self.blank();
+                }
+                self.function_item(&m.func, Some(m), None)?;
+            }
+            self.indent -= 1;
+            self.line("}");
+            if !s.type_params.is_empty() {
+                let header = self.generic_header(&s.type_params, &["Clone"]);
+                let at = handle_at + self.out[handle_at..].find("impl ").expect("impl header");
+                self.out.replace_range(at..at + 4, &format!("impl{header}"));
+            }
+        }
         self.current_class = None;
         if !s.type_params.is_empty() {
             self.found_bounds
@@ -1128,6 +1163,7 @@ impl<'a> Gen<'a> {
             bounds: Default::default(),
             class,
             labels: 0,
+            handle_this: false,
         }
     }
 
@@ -1297,6 +1333,7 @@ impl<'a> Gen<'a> {
             }
         }
         let fields = self.initial_fields(class, s, &assigned);
+        let shared = self.p.is_shared(&s.name);
         let text = self.capture(|g| {
             g.indent += 1;
             for st in lead {
@@ -1306,7 +1343,17 @@ impl<'a> Gen<'a> {
                 g.line(p);
             }
             let fields = fields?;
-            if rest.is_empty() {
+            if shared && !rest.is_empty() {
+                // A shared object: the rest of the constructor sees its handle.
+                let h = g.helper(super::Helper::Shared);
+                g.line(&format!(
+                    "let this = {h}::new(Self {{ {} }});",
+                    fields.join(", ")
+                ));
+                g.fn_ctx_mut().handle_this = true;
+                g.block_body(rest, false)?;
+                g.line(if info.throws { "Ok(this)" } else { "this" });
+            } else if rest.is_empty() {
                 g.line(&format!(
                     "{}Self {{ {} }}{}",
                     if info.throws { "Ok(" } else { "" },
@@ -1324,6 +1371,18 @@ impl<'a> Gen<'a> {
         self.fns.pop();
         self.pop_scope();
         let text = text?;
+        // A shared object whose constructor uses `this`: it builds the handle itself.
+        let ret = if shared && !rest.is_empty() {
+            let h = self.helper(super::Helper::Shared);
+            self.ctor_gives_handle.insert(s.name.clone());
+            if info.throws {
+                format!("Result<{h}<Self>, String>")
+            } else {
+                format!("{h}<Self>")
+            }
+        } else {
+            ret.to_string()
+        };
         self.line(&format!("pub fn new({params}) -> {ret} {{"));
         self.out.push_str(&text);
         self.line("}");
@@ -1411,6 +1470,7 @@ impl<'a> Gen<'a> {
             bounds: Default::default(),
             class: class.clone(),
             labels: 0,
+            handle_this: false,
         });
         let params = self.param_list(f, &info);
         if f.is_generator {
@@ -1522,8 +1582,11 @@ impl<'a> Gen<'a> {
                     (None, MethodKind::Set) => format!("set_{base}"),
                     _ => base,
                 };
+                let on_handle = class.as_ref().is_some_and(|c| self.p.is_shared(c));
                 let self_param = if m.is_static {
                     String::new()
+                } else if on_handle {
+                    "&self".to_string()
                 } else if info.mutates_self {
                     "&mut self".to_string()
                 } else {
@@ -2212,6 +2275,7 @@ impl<'a> Gen<'a> {
             bounds: Default::default(),
             class: None,
             labels: 0,
+            handle_this: false,
         });
         let stmts: Vec<&'a Stmt> = self
             .m

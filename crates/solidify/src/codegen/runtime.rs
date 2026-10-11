@@ -58,6 +58,8 @@ pub enum Helper {
     Dynamic,
     /// `eval` of code known only at run time.
     Eval,
+    /// `Shared<T>`: objects held in several places.
+    Shared,
 }
 
 /// The regular expression engine, compiled into Solidify too: patterns are checked when
@@ -376,6 +378,7 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Symbol => include_str!("runtime/symbol.rs"),
             Helper::Dynamic => include_str!("runtime/dynamic.rs"),
             Helper::Eval => include_str!("runtime/eval.rs"),
+            Helper::Shared => include_str!("runtime/shared.rs"),
             Helper::BlockOn => {
                 r#"/// Runs a future to completion, running the timers it waits on.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
