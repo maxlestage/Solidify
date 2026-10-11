@@ -66,7 +66,13 @@ fn main() -> ExitCode {
         }),
         no_header,
     };
-    match solidify::transpile(&source, &options) {
+    // A file on disk may import others: they are translated with it.
+    let result = match name.as_deref() {
+        Some(path) => solidify::transpile_file(std::path::Path::new(path), &options),
+        None => solidify::transpile(&source, &options)
+            .map_err(|e| e.pretty(&source).replacen("  --> ", "  --> <stdin>:", 1)),
+    };
+    match result {
         Ok(rust) => {
             if check {
                 return ExitCode::SUCCESS;
@@ -84,13 +90,8 @@ fn main() -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            let where_ = name.as_deref().unwrap_or("<stdin>");
-            eprintln!(
-                "{}",
-                e.pretty(&source)
-                    .replacen("  --> ", &format!("  --> {where_}:"), 1)
-            );
+        Err(message) => {
+            eprintln!("{message}");
             ExitCode::FAILURE
         }
     }
@@ -98,5 +99,6 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "usage: solidify [input.ts] [-o output.rs] [--check] [--no-header]
 
-Translates one TypeScript or JavaScript file to Rust. Reads the standard input
-when no file is given, writes to the standard output when -o is not given.";
+Translates a TypeScript or JavaScript file, and the files it imports, to one
+Rust file. Reads the standard input when no file is given, writes to the
+standard output when -o is not given.";

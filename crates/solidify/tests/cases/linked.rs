@@ -1,12 +1,12 @@
 #[derive(Debug, Clone, PartialEq)]
 struct Node {
-    pub next: Option<Box<Node>>,
     pub value: i64,
+    pub next: Option<Box<Node>>,
 }
 
 impl Node {
     pub fn new(value: i64) -> Self {
-        Self { next: None, value }
+        Self { value, next: None }
     }
 }
 
@@ -17,6 +17,10 @@ struct List {
 }
 
 impl List {
+    pub fn new() -> Self {
+        Self { head: None, size: 0 }
+    }
+
     pub fn push(&mut self, value: i64) {
         let node = Node::new(value);
         if let Some(head) = self.head.as_deref_mut() {
@@ -46,10 +50,6 @@ impl List {
             return None;
         };
         Some(head.value)
-    }
-
-    pub fn new() -> Self {
-        Self { head: None, size: 0 }
     }
 }
 

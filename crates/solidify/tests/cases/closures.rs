@@ -1,9 +1,12 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 fn make_counter() -> impl FnMut() -> i64 {
-    let mut count = 0;
-    move || {
-        count += 1;
-        count
-    }
+    let count = Rc::new(RefCell::new(0));
+    { let count = count.clone(); move || {
+        (*count.borrow_mut()) += 1;
+        (*count.borrow())
+    } }
 }
 
 fn apply(f: impl Fn(i64) -> i64, value: i64) -> i64 {

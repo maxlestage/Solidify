@@ -1,6 +1,8 @@
 //! Statements, function bodies, conditions and narrowing, mutation marks.
 
-use super::{ActiveNarrow, FnCtx, FnInfo, IResult, Infer, NarrowTest, Path, Role, Root};
+use super::{
+    ActiveNarrow, FnCtx, FnInfo, IResult, Infer, NarrowTest, Path, Role, Root, StructKind,
+};
 use crate::ast::*;
 use crate::types::Ty;
 
@@ -37,7 +39,9 @@ impl<'m> Infer<'m> {
             | StmtKind::TypeAlias(_)
             | StmtKind::Enum(_)
             | StmtKind::Empty
-            | StmtKind::ExportNames(_) => Ok(()),
+            | StmtKind::ExportNames(_)
+            | StmtKind::ExportFrom { .. }
+            | StmtKind::Import(_) => Ok(()),
             StmtKind::Return(value) => {
                 let ret = self.ctx().ret.clone();
                 match value {
@@ -144,7 +148,7 @@ impl<'m> Infer<'m> {
                 let it = self.types.resolve(&it);
                 let item = if *is_in {
                     match &it {
-                        Ty::Map(k, _) => (**k).clone(),
+                        Ty::Map(k, _, _) => (**k).clone(),
                         Ty::Array(_) => self.types.int(),
                         other => {
                             let d = self.describe(other);
@@ -156,9 +160,9 @@ impl<'m> Infer<'m> {
                     }
                 } else {
                     match &it {
-                        Ty::Array(t) | Ty::Set(t) => (**t).clone(),
+                        Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => (**t).clone(),
                         Ty::Str => Ty::Str,
-                        Ty::Map(k, v) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
+                        Ty::Map(k, v, _) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
                         Ty::Var(_) => {
                             let t = self.types.fresh();
                             self.unify(&it, &Ty::Array(Box::new(t.clone())), iter.span)?;
@@ -173,24 +177,65 @@ impl<'m> Infer<'m> {
                 self.push_scope();
                 self.ctx_mut().loop_depth += 1;
                 self.bind_pattern(pat, &item, Role::Loop)?;
+                if let Some(root) = self.root_binding(iter) {
+                    for (_, id) in pat.names() {
+                        self.loop_sources.push((id, root));
+                    }
+                }
                 self.stmt(body)?;
                 self.ctx_mut().loop_depth -= 1;
                 self.pop_scope();
                 Ok(())
             }
             StmtKind::Switch { disc, cases } => {
+                // `switch (shape.kind)`: each case sees its member of the union.
+                let tagged = if self.member_is_tag(disc) {
+                    let ExprKind::Member { obj, .. } = &disc.kind else {
+                        unreachable!()
+                    };
+                    let ot = self.expr(obj, None)?;
+                    self.union_of_ty(&ot).cloned().map(|u| (&**obj, u))
+                } else {
+                    None
+                };
                 let dt = self.expr(disc, None)?;
                 for (i, c) in cases.iter().enumerate() {
+                    let mut narrow = None;
                     if let Some(t) = &c.test {
                         let tt = self.expr(t, Some(&dt))?;
                         self.expect(&tt, &dt, t.span)?;
+                        if let Some((obj, u)) = &tagged
+                            && let ExprKind::Str(s) = &t.kind
+                        {
+                            let Some(m) = u.member_with_tag(s) else {
+                                return self.err(
+                                    format!(
+                                        "`{s}` is not a `{}` of {}",
+                                        u.discriminant.clone().unwrap_or_default(),
+                                        u.name
+                                    ),
+                                    t.span,
+                                );
+                            };
+                            let test = super::unions::UnionTest {
+                                value: obj,
+                                union: u.name.clone(),
+                                variant: m.name.clone(),
+                                inner: m.ty.clone(),
+                                positive: true,
+                            };
+                            narrow = Some(self.narrow_union(&test, t.id)?.0);
+                        }
                     }
                     self.push_scope();
+                    let before = self.narrows.len();
+                    self.narrows.extend(narrow);
                     self.branch.push((disc.id, i.min(254) as u8));
                     let r = self
                         .collect_values(&c.body, false)
                         .and_then(|()| self.stmts(&c.body));
                     self.branch.pop();
+                    self.narrows.truncate(before);
                     self.pop_scope();
                     r?;
                 }
@@ -243,15 +288,6 @@ impl<'m> Infer<'m> {
             StmtKind::Expr(e) => {
                 self.expr(e, None)?;
                 Ok(())
-            }
-            StmtKind::Import(i) => {
-                if i.type_only {
-                    return Ok(());
-                }
-                self.err(
-                    "imports are not supported yet: Solidify translates one file at a time",
-                    s.span,
-                )
             }
             StmtKind::ExportDefault(e) => {
                 self.err("`export default` of a value is not supported", e.span)
@@ -315,9 +351,13 @@ impl<'m> Infer<'m> {
                     ExprKind::Arrow(f) | ExprKind::Func(f) => Some(f.id),
                     _ => None,
                 };
+                let iter_result = self.is_iter_result(init);
+                let regex_flags = self.regex_flags(init);
                 if let Some(v) = self.vars.get_mut(id) {
                     v.alias = alias;
                     v.closure_fn = closure_fn;
+                    v.iter_result = iter_result;
+                    v.regex_flags = regex_flags;
                 }
                 if alias && let Some(&(_, test)) = self.narrowed_uses.get(&init.id) {
                     self.alias_of_narrow.push((*id, test));
@@ -349,9 +389,14 @@ impl<'m> Infer<'m> {
         } else {
             in_ctor
         };
+        // A generator body yields values and returns nothing.
+        let (ret, yield_ty) = match (f.is_generator, self.types.resolve(&info.sig.ret)) {
+            (true, Ty::Gen(t)) => (Ty::Void, Some(*t)),
+            _ => (info.sig.ret.clone(), None),
+        };
         self.fns.push(FnCtx {
             id: f.id,
-            ret: info.sig.ret.clone(),
+            ret,
             this,
             in_ctor,
             is_static,
@@ -361,6 +406,7 @@ impl<'m> Infer<'m> {
             captures: Vec::new(),
             this_fn,
             has_return_value: false,
+            yield_ty,
         });
         self.push_scope();
         let mut info = info;
@@ -389,6 +435,12 @@ impl<'m> Infer<'m> {
             }
             if let Some(v) = self.vars.get_mut(&param_ids[i]) {
                 v.param_of = Some((f.id, i));
+                // A parameter property is kept in the instance; a generator keeps its
+                // parameters for as long as it runs.
+                if (in_ctor && (p.access.is_some() || p.readonly)) || f.is_generator {
+                    v.stored = true;
+                    self.param_stored.insert((f.id, i));
+                }
             }
             if let Some(d) = &p.default {
                 let inner = match self.types.resolve(&ty) {
@@ -400,6 +452,12 @@ impl<'m> Infer<'m> {
             }
         }
         self.funcs.get_mut(&f.id).expect("fn").params = param_ids;
+        if info.is_abstract {
+            // A signature only.
+            self.pop_scope();
+            self.fns.pop();
+            return Ok(());
+        }
         match &f.body {
             FnBody::Block(b) => {
                 self.collect_values(&b.stmts, false)?;
@@ -419,9 +477,14 @@ impl<'m> Infer<'m> {
             }
             FnBody::Expr(e) => {
                 let ret = self.ctx().ret.clone();
-                let t = self.expr(e, Some(&ret))?;
-                self.mark_stored(e);
-                self.expect(&t, &ret, e.span)?;
+                if matches!(self.types.resolve(&ret), Ty::Void) {
+                    // A callback whose result nobody wants: the value is dropped.
+                    self.expr(e, None)?;
+                } else {
+                    let t = self.expr(e, Some(&ret))?;
+                    self.mark_stored(e);
+                    self.expect(&t, &ret, e.span)?;
+                }
             }
         }
         self.pop_scope();
@@ -483,6 +546,7 @@ impl<'m> Infer<'m> {
                         captures: Vec::new(),
                         this_fn: c.id,
                         has_return_value: false,
+                        yield_ty: None,
                     });
                     self.hints.insert(init.id, format!("{} {}", c.name, f.name));
                     let t = self.expr(init, Some(&fty));
@@ -562,6 +626,63 @@ impl<'m> Infer<'m> {
                 self.set_ty(e.id, Ty::Bool);
                 Ok((Vec::new(), neg))
             }
+            // `x instanceof C` on a value of a base class: `x` is a `C` when true.
+            ExprKind::Binary {
+                op: BinOp::InstanceOf,
+                left,
+                right,
+            } if self.path_of(left).is_some() && self.instance_test(left, right)?.is_some() => {
+                let Some((class, sub)) = self.instance_test(left, right)? else {
+                    unreachable!()
+                };
+                let _ = class;
+                let path = self.path_of(left).expect("path");
+                let name = match (&path.root, path.fields.last()) {
+                    (Root::Var(id), None) => self.vars[id].name.clone(),
+                    (_, Some(last)) => last.clone(),
+                    (Root::This, None) => "this".into(),
+                };
+                self.set_ty(e.id, Ty::Bool);
+                self.narrow_tests.insert(
+                    e.id,
+                    NarrowTest {
+                        root: path.root.clone(),
+                        path: path.fields.clone(),
+                        name: name.clone(),
+                        positive: true,
+                        union: None,
+                        complement: None,
+                        instance_of: Some(sub.clone()),
+                        mutated: false,
+                        inner: Ty::Named(sub.clone()),
+                        let_else: false,
+                        unwrap: false,
+                    },
+                );
+                let n = ActiveNarrow {
+                    root: path.root,
+                    path: path.fields,
+                    name,
+                    inner: Ty::Named(sub),
+                    test_id: e.id,
+                };
+                Ok((vec![n], Vec::new()))
+            }
+            // Tests of a union member: `typeof x === "string"`, `x.kind === "circle"`,
+            // `x instanceof C`, `"field" in x`, `Array.isArray(x)`.
+            _ if self.is_union_test_shape(e) => {
+                if let Some(t) = self.union_test(e)? {
+                    let (n, other) = self.narrow_union(&t, e.id)?;
+                    let other: Vec<ActiveNarrow> = other.into_iter().collect();
+                    return Ok(if t.positive {
+                        (vec![n], other)
+                    } else {
+                        (other, vec![n])
+                    });
+                }
+                self.truthy(e)?;
+                Ok((Vec::new(), Vec::new()))
+            }
             ExprKind::Binary { op, left, right } if op.is_equality() => {
                 let null_right = matches!(right.kind, ExprKind::Null | ExprKind::Undefined);
                 let null_left = matches!(left.kind, ExprKind::Null | ExprKind::Undefined);
@@ -594,11 +715,131 @@ impl<'m> Infer<'m> {
                 self.truthy(e)?;
                 Ok((Vec::new(), Vec::new()))
             }
+            // `isNaN(n)` on the `Option` of `parseInt`: `n` exists when the test is false.
+            ExprKind::Call { callee, args, .. }
+                if args.len() == 1 && nan_test_name(callee).is_some() =>
+            {
+                let positive = nan_test_name(callee) == Some(false);
+                let value = &args[0].expr;
+                if self.path_of(value).is_some()
+                    && matches!(
+                        self.expr(value, None).map(|t| self.types.resolve(&t)),
+                        Ok(Ty::Option(_))
+                    )
+                    && let Some(n) = self.narrow_value(value, e.id, positive)?
+                {
+                    self.set_ty(e.id, Ty::Bool);
+                    return Ok(if positive {
+                        (vec![n], Vec::new())
+                    } else {
+                        (Vec::new(), vec![n])
+                    });
+                }
+                self.truthy(e)?;
+                Ok((Vec::new(), Vec::new()))
+            }
             _ => {
                 self.truthy(e)?;
                 Ok((Vec::new(), Vec::new()))
             }
         }
+    }
+
+    /// `x instanceof C` where `x` is of a base class of `C`: (base, C). Marks the base
+    /// as dynamically dispatched.
+    fn instance_test(
+        &mut self,
+        value: &'m Expr,
+        class: &Expr,
+    ) -> IResult<Option<(String, String)>> {
+        let ExprKind::Ident(sub) = &class.kind else {
+            return Ok(None);
+        };
+        if self
+            .struct_by_name(sub)
+            .is_none_or(|s| s.kind != StructKind::Class)
+        {
+            return Ok(None);
+        }
+        let vt = self.expr(value, None)?;
+        let Ty::Named(base) = self.types.resolve(&vt) else {
+            return Ok(None);
+        };
+        if self.union_by_name(&base).is_some() || base == *sub || !self.is_subclass(sub, &base) {
+            return Ok(None);
+        }
+        self.polymorphic.insert(base.clone());
+        // Instances of the subclasses of `sub` are seen as `sub` too.
+        if self
+            .structs
+            .iter()
+            .any(|s| s.name != *sub && self.is_subclass(&s.name, sub))
+        {
+            self.polymorphic.insert(sub.clone());
+        }
+        Ok(Some((base, sub.clone())))
+    }
+
+    /// Whether an expression has the shape of a union member test (the union itself is
+    /// checked by `union_test`).
+    fn is_union_test_shape(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Binary { op, left, right } if op.is_equality() => {
+                matches!(left.kind, ExprKind::TypeOf(_))
+                    || matches!(right.kind, ExprKind::TypeOf(_))
+                    || (matches!(left.kind, ExprKind::Member { .. })
+                        && matches!(right.kind, ExprKind::Str(_))
+                        && self.member_is_tag(left))
+                    || (matches!(right.kind, ExprKind::Member { .. })
+                        && matches!(left.kind, ExprKind::Str(_))
+                        && self.member_is_tag(right))
+            }
+            ExprKind::Binary {
+                op: BinOp::InstanceOf | BinOp::In,
+                ..
+            } => true,
+            ExprKind::Call { callee, .. } => {
+                matches!(&callee.kind, ExprKind::Member { obj, prop, .. }
+                if prop == "isArray" && matches!(&obj.kind, ExprKind::Ident(n) if n == "Array"))
+            }
+            _ => false,
+        }
+    }
+
+    /// `x.kind` where `x` is a union with the discriminant `kind`.
+    fn member_is_tag(&self, e: &Expr) -> bool {
+        let ExprKind::Member { obj, prop, .. } = &e.kind else {
+            return false;
+        };
+        let Some(path) = self.path_of(obj) else {
+            return false;
+        };
+        if let Some(i) = self.active_narrow(&path) {
+            let inner = self.narrows[i].inner.clone();
+            return self
+                .union_of_ty(&inner)
+                .is_some_and(|u| u.discriminant.as_deref() == Some(prop.as_str()));
+        }
+        let ty = match &path.root {
+            Root::Var(id) => self.vars[id].ty.clone(),
+            Root::This => match self.ctx().this.clone() {
+                Some(c) => Ty::Named(c),
+                None => return false,
+            },
+        };
+        let mut ty = self.types.resolve(&ty);
+        for f in &path.fields {
+            let Ty::Named(n) = &ty else { return false };
+            let Some(s) = self.struct_by_name(n) else {
+                return false;
+            };
+            let Some(field) = s.field(f) else {
+                return false;
+            };
+            ty = self.types.resolve(&field.ty);
+        }
+        self.union_of_ty(&ty)
+            .is_some_and(|u| u.discriminant.as_deref() == Some(prop.as_str()))
     }
 
     /// A value used as a condition: boolean, number, string, list or nullable.
@@ -639,6 +880,9 @@ impl<'m> Infer<'m> {
                 path: path.fields.clone(),
                 name: name.clone(),
                 positive,
+                union: None,
+                complement: None,
+                instance_of: None,
                 mutated: false,
                 inner: (*inner).clone(),
                 let_else: false,
@@ -777,6 +1021,22 @@ impl<'m> Infer<'m> {
         {
             info.escapes = true;
         }
+    }
+}
+
+/// `isNaN` / `Number.isNaN` (true) or `isFinite` / `Number.isFinite` (false).
+pub(super) fn nan_test_name(callee: &Expr) -> Option<bool> {
+    match &callee.kind {
+        ExprKind::Ident(n) if n == "isNaN" => Some(true),
+        ExprKind::Ident(n) if n == "isFinite" => Some(false),
+        ExprKind::Member { obj, prop, .. } if matches!(&obj.kind, ExprKind::Ident(n) if n == "Number") => {
+            match prop.as_str() {
+                "isNaN" => Some(true),
+                "isFinite" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

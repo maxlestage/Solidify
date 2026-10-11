@@ -110,8 +110,8 @@ static EN: Dict = Dict {
         cta2: "Install the CLI",
         facts: [
             ("0", "dependencies"),
-            ("17", "programs checked against Node.js"),
-            ("1", "file in, 1 file out"),
+            ("26", "programs checked against Node.js"),
+            ("1", "Rust file out, however many files in"),
         ],
     },
     play: Play {
@@ -148,7 +148,7 @@ static EN: Dict = Dict {
         rules: [
             (
                 "Integers first",
-                "`let n = 0` is an `i64`. Write `2.0`, or divide, and the whole family of that number becomes `f64`.",
+                "`let n = 0` is an `i64`. Write `2.0`, divide, or read the number from JSON, and the whole family of that number becomes `f64`. `parseInt` gives `Option<i64>`: `NaN` is `None`.",
             ),
             (
                 "Null is Option",
@@ -212,13 +212,43 @@ static EN: Dict = Dict {
                 "println!, f64 methods, small helpers",
             ),
             ("recursive classes", "Option<Box<T>>"),
+            (
+                "class B extends A, abstract, super, instanceof",
+                "flattened structs, a trait per base class, Box<dyn ALike> where an A is expected",
+            ),
+            (
+                "A | B, discriminated unions, typeof",
+                "enum with one variant per member, match",
+            ),
+            ("function*, yield, yield*", "JsGenerator<T>, for x in gen"),
+            (
+                "setTimeout, setInterval, new Promise",
+                "an event loop run by main, JsPromise",
+            ),
+            (
+                "/regex/, test, exec, match, replace, split",
+                "JsRegex, a backtracking engine shipped in the file",
+            ),
+            (
+                "JSON.stringify, JSON.parse",
+                "the value's JsValue, JsFromJson for the parsed type",
+            ),
+            (
+                "import, export, import * as ns",
+                "one mod per file, pub for exports",
+            ),
+            (
+                "console.log of objects, arrays, maps",
+                "the exact text Node.js prints",
+            ),
+            ("any, unknown", "inferred from use"),
         ],
-        limits_title: "Not yet",
-        limits: "Inheritance (`extends`), `any`, regular expressions, JSON, timers, imports between files, unions of different types, `typeof` and `instanceof` tests, generators. Each one is refused with a clear message.",
+        limits_title: "What stays different",
+        limits: "Rust values are not JavaScript references: an object stored in two places is copied, and changing one copy leaves the other alone (variables changed inside closures that outlive them are shared). Numbers are `i64` until a float is involved, so an integer that overflows panics where JavaScript would lose precision. Imports go between your own files only, not to packages. `JSON` replacers and revivers, `Symbol`, `Proxy`, `eval`, prototypes and `arguments` have no Rust counterpart and are refused with a clear message.",
     },
     install: Install {
         title: "Install",
-        lead: "One crate, no dependency, a single binary. Translate a file, or pipe through the standard input.",
+        lead: "One crate, no dependency, a single binary. Translate a file and the files it imports, or pipe one file through the standard input.",
         cli: "Command line",
         library: "As a library",
         check: "Check without writing",
@@ -253,8 +283,11 @@ static FR: Dict = Dict {
         cta2: "Installer la ligne de commande",
         facts: [
             ("0", "dépendance"),
-            ("17", "programmes vérifiés contre Node.js"),
-            ("1", "fichier en entrée, 1 fichier en sortie"),
+            ("26", "programmes vérifiés contre Node.js"),
+            (
+                "1",
+                "fichier Rust en sortie, autant de fichiers en entrée que voulu",
+            ),
         ],
     },
     play: Play {
@@ -291,7 +324,7 @@ static FR: Dict = Dict {
         rules: [
             (
                 "Les entiers d'abord",
-                "`let n = 0` est un `i64`. Écrivez `2.0`, ou divisez, et toute la famille de ce nombre devient `f64`.",
+                "`let n = 0` est un `i64`. Écrivez `2.0`, divisez, ou lisez le nombre depuis du JSON, et toute la famille de ce nombre devient `f64`. `parseInt` donne un `Option<i64>` : `NaN` est `None`.",
             ),
             (
                 "Null est Option",
@@ -355,13 +388,43 @@ static FR: Dict = Dict {
                 "println!, méthodes de f64, petits utilitaires",
             ),
             ("classes récursives", "Option<Box<T>>"),
+            (
+                "class B extends A, abstract, super, instanceof",
+                "structs aplaties, un trait par classe de base, Box<dyn ALike> là où un A est attendu",
+            ),
+            (
+                "A | B, unions discriminées, typeof",
+                "enum avec une variante par membre, match",
+            ),
+            ("function*, yield, yield*", "JsGenerator<T>, for x in gen"),
+            (
+                "setTimeout, setInterval, new Promise",
+                "une boucle d'événements lancée par main, JsPromise",
+            ),
+            (
+                "/regex/, test, exec, match, replace, split",
+                "JsRegex, un moteur à retour arrière livré dans le fichier",
+            ),
+            (
+                "JSON.stringify, JSON.parse",
+                "la JsValue de la valeur, JsFromJson pour le type lu",
+            ),
+            (
+                "import, export, import * as ns",
+                "un mod par fichier, pub pour les exports",
+            ),
+            (
+                "console.log d'objets, tableaux, maps",
+                "le texte exact qu'imprime Node.js",
+            ),
+            ("any, unknown", "déduits de l'usage"),
         ],
-        limits_title: "Pas encore",
-        limits: "L'héritage (`extends`), `any`, les expressions régulières, JSON, les minuteurs, les imports entre fichiers, les unions de types différents, les tests `typeof` et `instanceof`, les générateurs. Chacun est refusé avec un message clair.",
+        limits_title: "Ce qui reste différent",
+        limits: "Les valeurs Rust ne sont pas des références JavaScript : un objet rangé à deux endroits est copié, et modifier une copie ne touche pas l'autre (les variables modifiées dans des closures qui leur survivent sont partagées). Les nombres sont des `i64` tant qu'un flottant n'intervient pas : un entier qui déborde fait paniquer là où JavaScript perdrait de la précision. Les imports vont entre vos propres fichiers, pas vers des paquets. Les replacers et revivers de `JSON`, `Symbol`, `Proxy`, `eval`, les prototypes et `arguments` n'ont pas d'équivalent Rust et sont refusés avec un message clair.",
     },
     install: Install {
         title: "Installer",
-        lead: "Une crate, aucune dépendance, un seul binaire. Traduisez un fichier, ou passez par l'entrée standard.",
+        lead: "Une crate, aucune dépendance, un seul binaire. Traduisez un fichier et ceux qu'il importe, ou passez un fichier par l'entrée standard.",
         cli: "Ligne de commande",
         library: "Comme bibliothèque",
         check: "Vérifier sans écrire",

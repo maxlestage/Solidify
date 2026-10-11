@@ -1,0 +1,31 @@
+[ { x: 1, y: 2 }, { x: 3, y: 4 } ] { x: 1, y: 2 } [ 1, 2, 3 ] [ 'a', "it's" ] []
+Dog { name: 'Rex', age: 3, nickname: undefined } [
+  Dog { name: 'a', age: 1, nickname: undefined },
+  Dog { name: 'b', age: 2, nickname: 'bee' }
+]
+{ id: 7, tags: [ 'x', 'y' ], status: 'active', home: null } { nested: { deep: { deeper: [Object] } } }
+Map(3) { 'zoe' => 10, 'maya' => 9, 'adam' => 8 } Set(3) { 3, 1, 2 } Map(0) {} Set(0) {}
+Scores: [ 'zoe', 'maya', 'adam' ] [ 10, 9, 8 ] [ 3, 1, 2 ]
+zoe => 10
+maya => 9
+adam => 8
+[
+     0,  100,  200,  300,  400,  500,
+   600,  700,  800,  900, 1000, 1100,
+  1200, 1300, 1400, 1500, 1600, 1700,
+  1800, 1900, 2000, 2100, 2200, 2300,
+  2400, 2500, 2600, 2700, 2800, 2900
+]
+[
+  'alpha',   'beta',
+  'gamma',   'delta',
+  'epsilon', 'zeta',
+  'eta',     'theta',
+  'iota',    'kappa',
+  'lambda'
+]
+{ matrix: [ [ 1, 2, 3 ], [ 4, 5, 6 ], [ 7, 8, 9 ] ] } [ [ [ [Array] ] ] ]
+1,2,3 [object Object] 1,2,3,4,5,6,7,8,9 [ 1.5, 2.25, -0.5 ] [ true, false ]
+{ b: [ 2 ], a: [ 1, 1 ] } [ 'b', 'a' ] [ [ 'b', [ 2 ] ], [ 'a', [ 1, 1 ] ] ]
+{ x: 3, y: 4 } undefined 10 undefined
+items: 1,3 1, 2 1,2;3 1,2,3

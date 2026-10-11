@@ -25,12 +25,34 @@ impl<'m> Infer<'m> {
         Ok(())
     }
 
+    /// Whether an argument is a regular expression.
+    fn is_regex(&mut self, arg: Option<&'m Arg>) -> bool {
+        let Some(a) = arg else { return false };
+        match &a.expr.kind {
+            ExprKind::Regex { .. } => true,
+            ExprKind::New { callee, .. } => {
+                matches!(&callee.kind, ExprKind::Ident(n) if n == "RegExp")
+            }
+            ExprKind::Ident(name) => self
+                .lookup(name)
+                .map(|id| self.vars[&id].ty.clone())
+                .is_some_and(|t| matches!(self.types.resolve(&t), Ty::Named(n) if n == "RegExp")),
+            _ => false,
+        }
+    }
+
     fn done(&mut self, e: &Expr, name: String, ty: Ty) -> IResult<Ty> {
         self.calls.insert(e.id, Callee::Builtin(leak(name)));
         Ok(ty)
     }
 
-    fn no_more_than(&self, args: &[Arg], n: usize, name: &str, span: Span) -> IResult<()> {
+    pub(super) fn no_more_than(
+        &self,
+        args: &[Arg],
+        n: usize,
+        name: &str,
+        span: Span,
+    ) -> IResult<()> {
         if args.len() > n {
             return self.err(
                 format!(
@@ -61,7 +83,10 @@ impl<'m> Infer<'m> {
                     }
                     let t = self.expr(&a.expr, None)?;
                     if let Ty::Var(_) = self.types.resolve(&t) {
-                        return self.err("the type of this value is not known yet: add an annotation", a.expr.span);
+                        return self.err(
+                            "the type of this value is not known yet: add an annotation",
+                            a.expr.span,
+                        );
                     }
                 }
                 self.done(e, full, Ty::Void)
@@ -82,8 +107,8 @@ impl<'m> Infer<'m> {
             }
             (
                 "Math",
-                "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp"
-                | "log" | "log2" | "log10" | "fround",
+                "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh"
+                | "cosh" | "tanh" | "exp" | "log" | "log2" | "log10" | "fround",
             ) => {
                 let n = self.types.num(Flavor::Unknown);
                 self.arg_typed(args, 0, Some(n), &full, span)?;
@@ -131,15 +156,18 @@ impl<'m> Infer<'m> {
                 self.done(e, full, f)
             }
             ("Math", _) => self.err(format!("`Math.{prop}` is not supported"), span),
-            ("Number", "isInteger" | "isNaN" | "isFinite" | "isSafeInteger") => {
+            ("Number", "isInteger" | "isSafeInteger") => {
                 let n = self.types.num(Flavor::Unknown);
                 self.arg_typed(args, 0, Some(n), &full, span)?;
                 self.done(e, full, Ty::Bool)
             }
+            ("Number", "isNaN" | "isFinite") => {
+                self.nan_test_arg(args, &full, span)?;
+                self.done(e, full, Ty::Bool)
+            }
             ("Number", "parseInt") => {
-                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
-                let i = self.types.int();
-                self.done(e, "global.parseInt".into(), i)
+                let t = self.parse_int_call(args, &full, span)?;
+                self.done(e, "global.parseInt".into(), t)
             }
             ("Number", "parseFloat") => {
                 self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
@@ -153,7 +181,7 @@ impl<'m> Infer<'m> {
             }
             ("Object", "keys" | "values" | "entries") => {
                 let t = self.arg_typed(args, 0, None, &full, span)?;
-                let Ty::Map(k, v) = self.types.resolve(&t) else {
+                let Ty::Map(k, v, _) = self.types.resolve(&t) else {
                     return self.err(
                         format!("`{full}` works on a `Record` or `Map`; struct fields are known at compile time"),
                         span,
@@ -194,9 +222,9 @@ impl<'m> Infer<'m> {
                 }
                 let t = self.arg_typed(args, 0, None, &full, span)?;
                 let item = match self.types.resolve(&t) {
-                    Ty::Array(t) | Ty::Set(t) => *t,
+                    Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => *t,
                     Ty::Str => Ty::Str,
-                    Ty::Map(k, v) => Ty::Tuple(vec![*k, *v]),
+                    Ty::Map(k, v, _) => Ty::Tuple(vec![*k, *v]),
                     other => {
                         let d = self.describe(&other);
                         return self.err(format!("`Array.from` cannot read {d}"), span);
@@ -210,12 +238,71 @@ impl<'m> Infer<'m> {
                 }
                 self.done(e, full, Ty::Array(Box::new(item)))
             }
-            ("Array", "isArray") => self.err("`Array.isArray` is not needed: types are known at compile time", span),
-            ("Array", _) => self.err(format!("`Array.{prop}` is not supported"), span),
-            ("JSON", _) => self.err(
-                "`JSON` is not supported: Rust uses the serde crate for that, which Solidify does not generate",
+            ("Array", "isArray") => self.err(
+                "`Array.isArray` is not needed: types are known at compile time",
                 span,
             ),
+            ("Array", _) => self.err(format!("`Array.{prop}` is not supported"), span),
+            ("Promise", "all") => {
+                // Each value is already awaited where it is made: the array itself.
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                let Ty::Array(_) = self.types.resolve(&t) else {
+                    return self.err("`Promise.all` needs an array", span);
+                };
+                self.done(e, full, t)
+            }
+            ("Promise", "resolve") => {
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                self.done(e, full, t)
+            }
+            ("Promise", _) => self.err(
+                format!("`Promise.{prop}` is not supported: use `await` and async functions"),
+                span,
+            ),
+            ("JSON", "stringify") => {
+                self.no_more_than(args, 3, &full, span)?;
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                if let Ty::Var(_) = self.types.resolve(&t) {
+                    return self.err(
+                        "the type of this value is not known yet: add an annotation",
+                        args[0].expr.span,
+                    );
+                }
+                if let Some(a) = args.get(1)
+                    && !matches!(a.expr.kind, ExprKind::Null | ExprKind::Undefined)
+                {
+                    return self.err(
+                        "replacer functions are not supported in `JSON.stringify`: pass `null`",
+                        a.expr.span,
+                    );
+                }
+                if args.len() == 3 {
+                    let it = self.arg_typed(args, 2, None, &full, span)?;
+                    if !matches!(self.types.resolve(&it), Ty::Str) {
+                        let i = self.types.int();
+                        self.expect(&it, &i, args[2].expr.span)?;
+                    }
+                }
+                self.done(e, full, Ty::Str)
+            }
+            ("JSON", "parse") => {
+                if args.len() > 1 {
+                    return self.err(
+                        "reviver functions are not supported in `JSON.parse`",
+                        args[1].expr.span,
+                    );
+                }
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                // It throws on bad text: the function fails like one with a `throw`.
+                if self.ctx().try_depth == 0 {
+                    let id = self.ctx().id;
+                    self.funcs.get_mut(&id).expect("fn").throw_direct = true;
+                }
+                let t = self.types.fresh();
+                self.json_targets.push(t.clone());
+                self.done(e, full, t)
+            }
+            ("JSON", _) => self.err(format!("`JSON.{prop}` is not supported"), span),
             ("Date", "now") => {
                 let i = self.types.int();
                 self.done(e, full, i)
@@ -251,8 +338,8 @@ impl<'m> Infer<'m> {
                 let item = (**item).clone();
                 self.array_method(e, obj, item, prop, args, span)
             }
-            Ty::Map(k, v) => {
-                let (k, v) = ((**k).clone(), (**v).clone());
+            Ty::Map(k, v, record) => {
+                let (k, v, record) = ((**k).clone(), (**v).clone(), *record);
                 let full = format!("map.{prop}");
                 match prop {
                     "get" => {
@@ -265,7 +352,7 @@ impl<'m> Infer<'m> {
                         self.mark_stored(&args[0].expr);
                         self.mark_stored(&args[1].expr);
                         self.mark_receiver_mutated(obj);
-                        self.done(e, full, Ty::Map(Box::new(k), Box::new(v)))
+                        self.done(e, full, Ty::Map(Box::new(k), Box::new(v), record))
                     }
                     "has" => {
                         self.arg_typed(args, 0, Some(k), &full, span)?;
@@ -354,10 +441,47 @@ impl<'m> Infer<'m> {
                 "toString" => self.done(e, "error.toString".into(), Ty::Str),
                 _ => self.err(format!("Error has no method `{prop}`"), span),
             },
+            Ty::Named(n) if n == "RegExp" => {
+                let full = format!("regex.{prop}");
+                match prop {
+                    "test" => {
+                        self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                        self.done(e, full, Ty::Bool)
+                    }
+                    "exec" => {
+                        self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                        self.done(
+                            e,
+                            full,
+                            Ty::Option(Box::new(Ty::Named("RegExpMatch".into()))),
+                        )
+                    }
+                    "toString" => self.done(e, full, Ty::Str),
+                    _ => self.err(format!("RegExp has no method `{prop}`"), span),
+                }
+            }
+            Ty::Named(n) if n == "RegExpMatch" => self.err(
+                format!("a match has no method `{prop}`: its groups are `m[i]`"),
+                span,
+            ),
             Ty::Tuple(_) => self.err(
                 format!("tuples have no method `{prop}`: use an array"),
                 span,
             ),
+            Ty::Gen(item) => {
+                let item = (**item).clone();
+                match prop {
+                    "next" => {
+                        self.no_more_than(args, 0, "next", span)?;
+                        self.mark_receiver_mutated(obj);
+                        self.done(e, "generator.next".into(), Ty::Option(Box::new(item)))
+                    }
+                    _ => self.err(
+                        format!("generators have no method `{prop}`: iterate with `for … of`"),
+                        span,
+                    ),
+                }
+            }
             Ty::Any => self.err(
                 format!(
                     "`{}` is `any`: give it a type to call `.{prop}()`",
@@ -388,6 +512,11 @@ impl<'m> Infer<'m> {
                 self.done(e, full, Ty::Str)
             }
             "split" => {
+                if self.is_regex(args.first()) {
+                    self.arg_typed(args, 0, None, &full, span)?;
+                    self.no_more_than(args, 1, &full, span)?;
+                    return self.done(e, "string.splitRegex".into(), Ty::Array(Box::new(Ty::Str)));
+                }
                 self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
                 self.no_more_than(args, 1, &full, span)?;
                 self.done(e, full, Ty::Array(Box::new(Ty::Str)))
@@ -428,9 +557,33 @@ impl<'m> Infer<'m> {
                 self.done(e, full, Ty::Str)
             }
             "replace" | "replaceAll" => {
-                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
-                self.arg_typed(args, 1, Some(Ty::Str), &full, span)?;
-                self.done(e, full, Ty::Str)
+                let regex = self.is_regex(args.first());
+                if regex {
+                    self.arg_typed(args, 0, None, &full, span)?;
+                } else {
+                    self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                }
+                // The replacement: a string, or a function of the match and its groups.
+                let by_function = matches!(
+                    args.get(1).map(|a| &a.expr.kind),
+                    Some(ExprKind::Arrow(_) | ExprKind::Func(_))
+                );
+                if by_function {
+                    let (ExprKind::Arrow(f) | ExprKind::Func(f)) = &args[1].expr.kind else {
+                        unreachable!()
+                    };
+                    let params = vec![Ty::Str; f.params.len()];
+                    self.callback(args, 1, params, Ty::Str, &full, span)?;
+                } else {
+                    self.arg_typed(args, 1, Some(Ty::Str), &full, span)?;
+                }
+                let name = match (regex, by_function) {
+                    (true, true) => format!("{full}RegexWith"),
+                    (true, false) => format!("{full}Regex"),
+                    (false, true) => format!("{full}With"),
+                    (false, false) => full,
+                };
+                self.done(e, name, Ty::Str)
             }
             "padStart" | "padEnd" => {
                 let n = int(self);
@@ -451,8 +604,46 @@ impl<'m> Infer<'m> {
                 let i = int(self);
                 self.done(e, full, i)
             }
-            "match" | "matchAll" | "search" => {
-                self.err("regular expressions are not supported", span)
+            "match" => {
+                if !self.is_regex(args.first()) {
+                    return self.err("`match` needs a regular expression", span);
+                }
+                self.arg_typed(args, 0, None, &full, span)?;
+                let global = self
+                    .regex_flags(&args[0].expr)
+                    .is_some_and(|f| f.contains('g'));
+                if global {
+                    self.done(
+                        e,
+                        "string.matchAll".into(),
+                        Ty::Option(Box::new(Ty::Array(Box::new(Ty::Str)))),
+                    )
+                } else {
+                    self.done(
+                        e,
+                        full,
+                        Ty::Option(Box::new(Ty::Named("RegExpMatch".into()))),
+                    )
+                }
+            }
+            "matchAll" => {
+                if !self.is_regex(args.first()) {
+                    return self.err("`matchAll` needs a regular expression", span);
+                }
+                self.arg_typed(args, 0, None, &full, span)?;
+                self.done(
+                    e,
+                    "string.matches".into(),
+                    Ty::Array(Box::new(Ty::Named("RegExpMatch".into()))),
+                )
+            }
+            "search" => {
+                if !self.is_regex(args.first()) {
+                    return self.err("`search` needs a regular expression", span);
+                }
+                self.arg_typed(args, 0, None, &full, span)?;
+                let i = int(self);
+                self.done(e, full, i)
             }
             _ => self.err(format!("strings have no method `{prop}`"), span),
         }

@@ -7,8 +7,8 @@ name: Pages
 # Runs after every successful CI run of a push on master, and by hand from the Actions tab.
 # A red CI publishes nothing.
 #
-# One-time setup, possible from the GitHub app or the mobile website:
-# Settings → Pages → Build and deployment → Source: GitHub Actions.
+# The first run switches GitHub Pages on for the repository (Settings → Pages → Source:
+# GitHub Actions) with the workflow's own token; nothing to click.
 on:
   workflow_run:
     workflows: [CI]
@@ -30,7 +30,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Until Pages is switched on (see the setup above), skip with a warning instead of failing.
+  # Switches Pages on when it is not yet (build type "workflow"); when the token is not
+  # allowed to, skips with a warning instead of failing.
   check:
     if: >-
       github.event_name == 'workflow_dispatch' || (
@@ -40,6 +41,11 @@ jobs:
     outputs:
       enabled: ${{ steps.pages.outputs.enabled }}
     steps:
+      - id: enable
+        uses: actions/configure-pages@v5
+        with:
+          enablement: true
+        continue-on-error: true
       - id: pages
         env:
           GH_TOKEN: ${{ github.token }}
@@ -48,7 +54,7 @@ jobs:
           if [ "$source" = "workflow" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
           else
-            echo "::warning::GitHub Pages is not published by GitHub Actions yet: Settings → Pages → Build and deployment → Source: GitHub Actions."
+            echo "::warning::GitHub Pages could not be switched on from here: Settings → Pages → Build and deployment → Source: GitHub Actions."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
