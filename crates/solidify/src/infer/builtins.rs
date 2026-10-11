@@ -77,6 +77,9 @@ impl<'m> Infer<'m> {
     ) -> IResult<Ty> {
         let full = format!("{ns}.{prop}");
         let span = e.span;
+        if ns == "Reflect" {
+            return self.reflect_call(e, prop, args);
+        }
         match (ns, prop) {
             // `Symbol.for("key")`: one symbol per key, `Symbol.keyFor(s)`: its key.
             ("Symbol", "for") => {

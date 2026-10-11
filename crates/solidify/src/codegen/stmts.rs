@@ -814,9 +814,7 @@ impl<'a> Gen<'a> {
     pub(super) fn update_text(&mut self, inc: bool, arg: &'a Expr) -> GResult<String> {
         let ty = self.ty_of(arg);
         if self.is_dynamic(&ty) {
-            let place = self.dyn_place_mut(arg)?;
-            let sym = if inc { "+" } else { "-" };
-            return Ok(format!("js_op_assign({place}, \"{sym}\", JsValue::Int(1))"));
+            return self.dyn_update(inc, arg);
         }
         let x = self.expr_mut_root(arg)?;
         let target = self.place(x);

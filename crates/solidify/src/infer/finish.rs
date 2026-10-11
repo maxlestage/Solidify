@@ -151,6 +151,7 @@ impl<'m> Infer<'m> {
             enum_literal: self.enum_literal,
             dyn_casts,
             dyn_literals: self.dyn_literals,
+            eval_scopes: self.eval_scopes,
             narrow_tests,
             narrowed_uses: self.narrowed_uses,
             drop_decl,

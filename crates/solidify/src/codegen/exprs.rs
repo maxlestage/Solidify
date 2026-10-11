@@ -342,10 +342,10 @@ impl<'a> Gen<'a> {
                     PREC_POSTFIX,
                 ))
             }
+            ExprKind::Delete(target) => self.delete_expr(target),
             ExprKind::Tagged { .. }
             | ExprKind::Super
             | ExprKind::Class(_)
-            | ExprKind::Delete(_)
             | ExprKind::Yield { .. } => self.err("this expression is not supported", e.span),
         }
     }
