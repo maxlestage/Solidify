@@ -138,7 +138,7 @@ impl<'m> Infer<'m> {
             // Given by `desugar` to the target of a proxy.
             crate::types::DYNAMIC => Ty::dynamic(),
             "never" => Ty::Never,
-            "bigint" => return self.err("bigint is not supported", span),
+            "bigint" => Ty::named("bigint"),
             "symbol" => Ty::named("Symbol"),
             "Array" | "ReadonlyArray" => Ty::Array(Box::new(arg(self, 0)?)),
             "Map" | "ReadonlyMap" => {

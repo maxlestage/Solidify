@@ -446,6 +446,8 @@ pub enum ExprKind {
         raw: String,
         int: bool,
     },
+    /// `123n`.
+    BigInt(String),
     Str(String),
     Template {
         quasis: Vec<String>,

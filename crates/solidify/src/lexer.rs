@@ -17,6 +17,8 @@ pub enum Tok {
         /// literal, which may still become a float by inference.
         int: bool,
     },
+    /// `123n`: the digits as written, with their prefix (`0x…`).
+    BigInt(String),
     Str(String),
     /// `` `a${b}c` ``: the cooked text parts (one more than the expressions) and the tokens
     /// of each `${…}`.
@@ -303,10 +305,15 @@ impl<'a> Lexer<'a> {
             }
         }
         if self.bytes.get(self.pos) == Some(&b'n') {
-            return Err(Error::new(
-                "BigInt literals are not supported",
-                Span::new(start, self.pos + 1),
-            ));
+            if !int {
+                return Err(Error::new(
+                    "a BigInt literal is an integer",
+                    Span::new(start, self.pos + 1),
+                ));
+            }
+            let text = self.src[start..self.pos].replace('_', "");
+            self.pos += 1;
+            return Ok(Tok::BigInt(text));
         }
         if self
             .bytes
@@ -549,7 +556,13 @@ fn regex_allowed(prev: Option<&Token>) -> bool {
         None => true,
         Some(Tok::Ident(word)) => REGEX_AFTER.contains(&word.as_str()),
         Some(Tok::Punct(p)) => !matches!(*p, ")" | "]" | "}"),
-        Some(Tok::Num { .. } | Tok::Str(_) | Tok::Template { .. } | Tok::Regex { .. }) => false,
+        Some(
+            Tok::Num { .. }
+            | Tok::BigInt(_)
+            | Tok::Str(_)
+            | Tok::Template { .. }
+            | Tok::Regex { .. },
+        ) => false,
         Some(Tok::Private(_) | Tok::Eof) => false,
     }
 }
