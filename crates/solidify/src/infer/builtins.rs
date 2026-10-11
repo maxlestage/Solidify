@@ -1,0 +1,665 @@
+//! The standard library that is understood: `console`, `Math`, `Object`, `Array`,
+//! `Number`, `JSON`, and the methods of strings, arrays, maps, sets and numbers.
+
+use std::rc::Rc;
+
+use super::finish::leak;
+use super::{Callee, IResult, Infer};
+use crate::ast::*;
+use crate::error::Span;
+use crate::types::{Flavor, FuncTy, Ty};
+
+impl<'m> Infer<'m> {
+    /// Types a callback argument against the signature it must have.
+    fn callback(
+        &mut self,
+        args: &'m [Arg],
+        i: usize,
+        params: Vec<Ty>,
+        ret: Ty,
+        name: &str,
+        span: Span,
+    ) -> IResult<()> {
+        let f = Ty::Func(Rc::new(FuncTy { params, ret }));
+        self.arg_typed(args, i, Some(f), name, span)?;
+        Ok(())
+    }
+
+    fn done(&mut self, e: &Expr, name: String, ty: Ty) -> IResult<Ty> {
+        self.calls.insert(e.id, Callee::Builtin(leak(name)));
+        Ok(ty)
+    }
+
+    fn no_more_than(&self, args: &[Arg], n: usize, name: &str, span: Span) -> IResult<()> {
+        if args.len() > n {
+            return self.err(
+                format!(
+                    "`{name}` takes at most {n} argument{}",
+                    if n == 1 { "" } else { "s" }
+                ),
+                span,
+            );
+        }
+        Ok(())
+    }
+
+    /// `console.log(…)`, `Math.floor(…)`, `Object.keys(…)`…
+    pub(super) fn namespace_call(
+        &mut self,
+        e: &'m Expr,
+        ns: &str,
+        prop: &str,
+        args: &'m [Arg],
+    ) -> IResult<Ty> {
+        let full = format!("{ns}.{prop}");
+        let span = e.span;
+        match (ns, prop) {
+            ("console", "log" | "error" | "warn" | "info" | "debug") => {
+                for a in args {
+                    if a.spread {
+                        return self.err("spread arguments are not supported here", a.expr.span);
+                    }
+                    let t = self.expr(&a.expr, None)?;
+                    if let Ty::Var(_) = self.types.resolve(&t) {
+                        return self.err("the type of this value is not known yet: add an annotation", a.expr.span);
+                    }
+                }
+                self.done(e, full, Ty::Void)
+            }
+            ("console", _) => self.err(format!("`console.{prop}` is not supported"), span),
+            ("Math", "floor" | "ceil" | "round" | "trunc" | "sign") => {
+                let n = self.types.num(Flavor::Unknown);
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                let i = self.types.int();
+                self.done(e, full, i)
+            }
+            ("Math", "abs") => {
+                let n = self.types.num(Flavor::Unknown);
+                self.arg_typed(args, 0, Some(n.clone()), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, n)
+            }
+            (
+                "Math",
+                "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp"
+                | "log" | "log2" | "log10" | "fround",
+            ) => {
+                let n = self.types.num(Flavor::Unknown);
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                let f = self.types.float();
+                self.done(e, full, f)
+            }
+            ("Math", "atan2" | "hypot") => {
+                let f = self.types.float();
+                for i in 0..args.len() {
+                    let n = self.types.num(Flavor::Unknown);
+                    self.arg_typed(args, i, Some(n), &full, span)?;
+                }
+                if args.len() < 2 {
+                    return self.err(format!("`{full}` needs two arguments"), span);
+                }
+                self.done(e, full, f)
+            }
+            ("Math", "pow") => {
+                let n = self.types.num(Flavor::Unknown);
+                self.arg_typed(args, 0, Some(n.clone()), &full, span)?;
+                self.arg_typed(args, 1, Some(n.clone()), &full, span)?;
+                self.no_more_than(args, 2, &full, span)?;
+                self.done(e, full, n)
+            }
+            ("Math", "max" | "min") => {
+                let n = self.types.num(Flavor::Unknown);
+                if args.len() == 1 && args[0].spread {
+                    let arr = Ty::Array(Box::new(n.clone()));
+                    let t = self.expr(&args[0].expr, Some(&arr))?;
+                    self.expect(&t, &arr, args[0].expr.span)?;
+                    return self.done(e, format!("{full}..."), n);
+                }
+                if args.is_empty() {
+                    return self.err(format!("`{full}` needs arguments"), span);
+                }
+                for i in 0..args.len() {
+                    self.arg_typed(args, i, Some(n.clone()), &full, span)?;
+                }
+                self.done(e, full, n)
+            }
+            ("Math", "random") => {
+                self.no_more_than(args, 0, &full, span)?;
+                let f = self.types.float();
+                self.done(e, full, f)
+            }
+            ("Math", _) => self.err(format!("`Math.{prop}` is not supported"), span),
+            ("Number", "isInteger" | "isNaN" | "isFinite" | "isSafeInteger") => {
+                let n = self.types.num(Flavor::Unknown);
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                self.done(e, full, Ty::Bool)
+            }
+            ("Number", "parseInt") => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                let i = self.types.int();
+                self.done(e, "global.parseInt".into(), i)
+            }
+            ("Number", "parseFloat") => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                let f = self.types.float();
+                self.done(e, "global.parseFloat".into(), f)
+            }
+            ("String", "fromCharCode") => {
+                let i = self.types.int();
+                self.arg_typed(args, 0, Some(i), &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
+            ("Object", "keys" | "values" | "entries") => {
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                let Ty::Map(k, v) = self.types.resolve(&t) else {
+                    return self.err(
+                        format!("`{full}` works on a `Record` or `Map`; struct fields are known at compile time"),
+                        span,
+                    );
+                };
+                let out = match prop {
+                    "keys" => Ty::Array(k),
+                    "values" => Ty::Array(v),
+                    _ => Ty::Array(Box::new(Ty::Tuple(vec![*k, *v]))),
+                };
+                self.done(e, full, out)
+            }
+            ("Object", _) => self.err(format!("`Object.{prop}` is not supported"), span),
+            ("Array", "from") => {
+                if args.is_empty() {
+                    return self.err("`Array.from` needs an argument", span);
+                }
+                // `Array.from({ length: n }, (_, i) => …)`
+                if let ExprKind::Object(props) = &args[0].expr.kind
+                    && props.len() == 1
+                    && props[0].key.name().as_deref() == Some("length")
+                {
+                    let PropValue::Expr(len) = &props[0].value else {
+                        return self.err("`Array.from` needs `{ length: n }`", args[0].expr.span);
+                    };
+                    let i = self.types.int();
+                    let lt = self.expr(len, Some(&i))?;
+                    self.expect(&lt, &i, len.span)?;
+                    self.set_ty(args[0].expr.id, Ty::Void);
+                    let u = self.types.fresh();
+                    if args.len() > 1 {
+                        let i2 = self.types.int();
+                        self.callback(args, 1, vec![Ty::Void, i2], u.clone(), &full, span)?;
+                    } else {
+                        self.unify(&u, &Ty::Void, span)?;
+                    }
+                    return self.done(e, "Array.from.length".into(), Ty::Array(Box::new(u)));
+                }
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                let item = match self.types.resolve(&t) {
+                    Ty::Array(t) | Ty::Set(t) => *t,
+                    Ty::Str => Ty::Str,
+                    Ty::Map(k, v) => Ty::Tuple(vec![*k, *v]),
+                    other => {
+                        let d = self.describe(&other);
+                        return self.err(format!("`Array.from` cannot read {d}"), span);
+                    }
+                };
+                if args.len() > 1 {
+                    let u = self.types.fresh();
+                    let i = self.types.int();
+                    self.callback(args, 1, vec![item, i], u.clone(), &full, span)?;
+                    return self.done(e, "Array.from.map".into(), Ty::Array(Box::new(u)));
+                }
+                self.done(e, full, Ty::Array(Box::new(item)))
+            }
+            ("Array", "isArray") => self.err("`Array.isArray` is not needed: types are known at compile time", span),
+            ("Array", _) => self.err(format!("`Array.{prop}` is not supported"), span),
+            ("JSON", _) => self.err(
+                "`JSON` is not supported: Rust uses the serde crate for that, which Solidify does not generate",
+                span,
+            ),
+            ("Date", "now") => {
+                let i = self.types.int();
+                self.done(e, full, i)
+            }
+            ("performance", "now") => {
+                let f = self.types.float();
+                self.done(e, full, f)
+            }
+            ("process", "exit") => {
+                let i = self.types.int();
+                if !args.is_empty() {
+                    self.arg_typed(args, 0, Some(i), &full, span)?;
+                }
+                self.done(e, full, Ty::Never)
+            }
+            _ => self.err(format!("`{full}` is not supported"), span),
+        }
+    }
+
+    /// A method of a string, an array, a map, a set, a number or a boolean.
+    pub(super) fn builtin_method(
+        &mut self,
+        e: &'m Expr,
+        obj: &'m Expr,
+        ot: &Ty,
+        prop: &str,
+        args: &'m [Arg],
+    ) -> IResult<Ty> {
+        let span = e.span;
+        match ot {
+            Ty::Str => self.string_method(e, prop, args, span),
+            Ty::Array(item) => {
+                let item = (**item).clone();
+                self.array_method(e, obj, item, prop, args, span)
+            }
+            Ty::Map(k, v) => {
+                let (k, v) = ((**k).clone(), (**v).clone());
+                let full = format!("map.{prop}");
+                match prop {
+                    "get" => {
+                        self.arg_typed(args, 0, Some(k), &full, span)?;
+                        self.done(e, full, Ty::Option(Box::new(v)))
+                    }
+                    "set" => {
+                        self.arg_typed(args, 0, Some(k.clone()), &full, span)?;
+                        self.arg_typed(args, 1, Some(v.clone()), &full, span)?;
+                        self.mark_stored(&args[0].expr);
+                        self.mark_stored(&args[1].expr);
+                        self.mark_mutated(obj);
+                        self.done(e, full, Ty::Map(Box::new(k), Box::new(v)))
+                    }
+                    "has" => {
+                        self.arg_typed(args, 0, Some(k), &full, span)?;
+                        self.done(e, full, Ty::Bool)
+                    }
+                    "delete" => {
+                        self.arg_typed(args, 0, Some(k), &full, span)?;
+                        self.mark_mutated(obj);
+                        self.done(e, full, Ty::Bool)
+                    }
+                    "clear" => {
+                        self.mark_mutated(obj);
+                        self.done(e, full, Ty::Void)
+                    }
+                    "keys" => self.done(e, full, Ty::Array(Box::new(k))),
+                    "values" => self.done(e, full, Ty::Array(Box::new(v))),
+                    "entries" => self.done(e, full, Ty::Array(Box::new(Ty::Tuple(vec![k, v])))),
+                    "forEach" => {
+                        self.callback(args, 0, vec![v, k], Ty::Void, &full, span)?;
+                        self.done(e, full, Ty::Void)
+                    }
+                    _ => self.err(format!("Map has no method `{prop}`"), span),
+                }
+            }
+            Ty::Set(item) => {
+                let item = (**item).clone();
+                let full = format!("set.{prop}");
+                match prop {
+                    "add" => {
+                        self.arg_typed(args, 0, Some(item.clone()), &full, span)?;
+                        self.mark_stored(&args[0].expr);
+                        self.mark_mutated(obj);
+                        self.done(e, full, Ty::Set(Box::new(item)))
+                    }
+                    "has" => {
+                        self.arg_typed(args, 0, Some(item), &full, span)?;
+                        self.done(e, full, Ty::Bool)
+                    }
+                    "delete" => {
+                        self.arg_typed(args, 0, Some(item), &full, span)?;
+                        self.mark_mutated(obj);
+                        self.done(e, full, Ty::Bool)
+                    }
+                    "clear" => {
+                        self.mark_mutated(obj);
+                        self.done(e, full, Ty::Void)
+                    }
+                    "values" | "keys" => self.done(e, full, Ty::Array(Box::new(item))),
+                    "forEach" => {
+                        self.callback(args, 0, vec![item], Ty::Void, &full, span)?;
+                        self.done(e, full, Ty::Void)
+                    }
+                    _ => self.err(format!("Set has no method `{prop}`"), span),
+                }
+            }
+            Ty::Num(_) => {
+                let full = format!("number.{prop}");
+                match prop {
+                    "toFixed" => {
+                        if !args.is_empty() {
+                            let i = self.types.int();
+                            self.arg_typed(args, 0, Some(i), &full, span)?;
+                        }
+                        self.done(e, full, Ty::Str)
+                    }
+                    "toString" => {
+                        if !args.is_empty() {
+                            let i = self.types.int();
+                            self.arg_typed(args, 0, Some(i), &full, span)?;
+                        }
+                        self.done(e, full, Ty::Str)
+                    }
+                    "toPrecision" => {
+                        let i = self.types.int();
+                        self.arg_typed(args, 0, Some(i), &full, span)?;
+                        self.done(e, full, Ty::Str)
+                    }
+                    _ => self.err(format!("numbers have no method `{prop}`"), span),
+                }
+            }
+            Ty::Bool => match prop {
+                "toString" => self.done(e, "boolean.toString".into(), Ty::Str),
+                _ => self.err(format!("booleans have no method `{prop}`"), span),
+            },
+            Ty::Named(n) if n == "Error" => match prop {
+                "toString" => self.done(e, "error.toString".into(), Ty::Str),
+                _ => self.err(format!("Error has no method `{prop}`"), span),
+            },
+            Ty::Tuple(_) => self.err(
+                format!("tuples have no method `{prop}`: use an array"),
+                span,
+            ),
+            Ty::Any => self.err(
+                format!(
+                    "`{}` is `any`: give it a type to call `.{prop}()`",
+                    self.text(obj)
+                ),
+                obj.span,
+            ),
+            other => {
+                let d = self.describe(other);
+                self.err(format!("{d} has no method `{prop}`"), span)
+            }
+        }
+    }
+
+    fn string_method(
+        &mut self,
+        e: &'m Expr,
+        prop: &str,
+        args: &'m [Arg],
+        span: Span,
+    ) -> IResult<Ty> {
+        let full = format!("string.{prop}");
+        let int = |this: &mut Self| this.types.int();
+        match prop {
+            "toUpperCase" | "toLowerCase" | "trim" | "trimStart" | "trimEnd" | "trimLeft"
+            | "trimRight" | "toString" | "valueOf" | "normalize" => {
+                self.no_more_than(args, 0, &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
+            "split" => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::Array(Box::new(Ty::Str)))
+            }
+            "includes" | "startsWith" | "endsWith" => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::Bool)
+            }
+            "indexOf" | "lastIndexOf" => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                let i = int(self);
+                self.done(e, full, i)
+            }
+            "slice" | "substring" | "substr" => {
+                for i in 0..args.len().min(2) {
+                    let n = int(self);
+                    self.arg_typed(args, i, Some(n), &full, span)?;
+                }
+                self.no_more_than(args, 2, &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
+            "charAt" | "at" => {
+                let n = int(self);
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
+            "charCodeAt" | "codePointAt" => {
+                let n = int(self);
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                let i = int(self);
+                self.done(e, full, i)
+            }
+            "repeat" => {
+                let n = int(self);
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
+            "replace" | "replaceAll" => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                self.arg_typed(args, 1, Some(Ty::Str), &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
+            "padStart" | "padEnd" => {
+                let n = int(self);
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                if args.len() > 1 {
+                    self.arg_typed(args, 1, Some(Ty::Str), &full, span)?;
+                }
+                self.done(e, full, Ty::Str)
+            }
+            "concat" => {
+                for i in 0..args.len() {
+                    self.arg_typed(args, i, Some(Ty::Str), &full, span)?;
+                }
+                self.done(e, full, Ty::Str)
+            }
+            "localeCompare" => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                let i = int(self);
+                self.done(e, full, i)
+            }
+            "match" | "matchAll" | "search" => {
+                self.err("regular expressions are not supported", span)
+            }
+            _ => self.err(format!("strings have no method `{prop}`"), span),
+        }
+    }
+
+    fn array_method(
+        &mut self,
+        e: &'m Expr,
+        obj: &'m Expr,
+        item: Ty,
+        prop: &str,
+        args: &'m [Arg],
+        span: Span,
+    ) -> IResult<Ty> {
+        let full = format!("array.{prop}");
+        let arr = Ty::Array(Box::new(item.clone()));
+        match prop {
+            "push" | "unshift" => {
+                if args.is_empty() {
+                    return self.err(format!("`{full}` needs an argument"), span);
+                }
+                for a in args {
+                    if a.spread {
+                        let t = self.expr(&a.expr, Some(&arr))?;
+                        self.expect(&t, &arr, a.expr.span)?;
+                    } else {
+                        let t = self.expr(&a.expr, Some(&item))?;
+                        self.expect(&t, &item, a.expr.span)?;
+                        self.mark_stored(&a.expr);
+                    }
+                }
+                self.mark_mutated(obj);
+                let i = self.types.int();
+                self.done(e, full, i)
+            }
+            "pop" | "shift" => {
+                self.no_more_than(args, 0, &full, span)?;
+                self.mark_mutated(obj);
+                self.done(e, full, Ty::Option(Box::new(item)))
+            }
+            "indexOf" | "lastIndexOf" => {
+                self.arg_typed(args, 0, Some(item), &full, span)?;
+                if args.len() > 1 {
+                    let i = self.types.int();
+                    self.arg_typed(args, 1, Some(i), &full, span)?;
+                }
+                let i = self.types.int();
+                self.done(e, full, i)
+            }
+            "includes" => {
+                self.arg_typed(args, 0, Some(item), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::Bool)
+            }
+            "map" => {
+                let u = self.types.fresh();
+                let i = self.types.int();
+                self.callback(args, 0, vec![item, i, arr], u.clone(), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::Array(Box::new(u)))
+            }
+            "flatMap" => {
+                let u = self.types.fresh();
+                let i = self.types.int();
+                let inner = Ty::Array(Box::new(u.clone()));
+                self.callback(args, 0, vec![item, i], inner, &full, span)?;
+                self.done(e, full, Ty::Array(Box::new(u)))
+            }
+            "filter" => {
+                let i = self.types.int();
+                self.callback(args, 0, vec![item, i, arr.clone()], Ty::Bool, &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, arr)
+            }
+            "forEach" => {
+                let i = self.types.int();
+                self.callback(args, 0, vec![item, i, arr], Ty::Void, &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::Void)
+            }
+            "reduce" | "reduceRight" => {
+                let acc = if args.len() > 1 {
+                    self.arg_typed(args, 1, None, &full, span)?
+                } else {
+                    item.clone()
+                };
+                let i = self.types.int();
+                self.callback(
+                    args,
+                    0,
+                    vec![acc.clone(), item, i],
+                    acc.clone(),
+                    &full,
+                    span,
+                )?;
+                self.no_more_than(args, 2, &full, span)?;
+                if args.len() > 1 {
+                    self.mark_stored(&args[1].expr);
+                }
+                self.done(e, full, acc)
+            }
+            "find" | "findLast" => {
+                let i = self.types.int();
+                self.callback(args, 0, vec![item.clone(), i], Ty::Bool, &full, span)?;
+                self.done(e, full, Ty::Option(Box::new(item)))
+            }
+            "findIndex" | "findLastIndex" => {
+                let i = self.types.int();
+                self.callback(args, 0, vec![item, i], Ty::Bool, &full, span)?;
+                let r = self.types.int();
+                self.done(e, full, r)
+            }
+            "some" | "every" => {
+                let i = self.types.int();
+                self.callback(args, 0, vec![item, i], Ty::Bool, &full, span)?;
+                self.done(e, full, Ty::Bool)
+            }
+            "join" => {
+                if !args.is_empty() {
+                    self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                }
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::Str)
+            }
+            "slice" => {
+                for i in 0..args.len().min(2) {
+                    let n = self.types.int();
+                    self.arg_typed(args, i, Some(n), &full, span)?;
+                }
+                self.no_more_than(args, 2, &full, span)?;
+                self.done(e, full, arr)
+            }
+            "splice" => {
+                let n = self.types.int();
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                if args.len() > 1 {
+                    let n = self.types.int();
+                    self.arg_typed(args, 1, Some(n), &full, span)?;
+                }
+                for i in 2..args.len() {
+                    self.arg_typed(args, i, Some(item.clone()), &full, span)?;
+                    self.mark_stored(&args[i].expr);
+                }
+                self.mark_mutated(obj);
+                self.done(e, full, arr)
+            }
+            "concat" => {
+                for a in args {
+                    let t = self.expr(&a.expr, Some(&arr))?;
+                    if self.types.unify(&t, &arr).is_err() {
+                        self.expect(&t, &item, a.expr.span)?;
+                    }
+                }
+                self.done(e, full, arr)
+            }
+            "reverse" | "sort" | "fill" | "toSorted" | "toReversed" => {
+                match prop {
+                    "sort" | "toSorted" => {
+                        if !args.is_empty() {
+                            let n = self.types.num(Flavor::Unknown);
+                            self.callback(
+                                args,
+                                0,
+                                vec![item.clone(), item.clone()],
+                                n,
+                                &full,
+                                span,
+                            )?;
+                        }
+                    }
+                    "fill" => {
+                        self.arg_typed(args, 0, Some(item.clone()), &full, span)?;
+                        for i in 1..args.len().min(3) {
+                            let n = self.types.int();
+                            self.arg_typed(args, i, Some(n), &full, span)?;
+                        }
+                    }
+                    _ => self.no_more_than(args, 0, &full, span)?,
+                }
+                if matches!(prop, "reverse" | "sort" | "fill") {
+                    self.mark_mutated(obj);
+                }
+                self.done(e, full, arr)
+            }
+            "at" => {
+                let n = self.types.int();
+                self.arg_typed(args, 0, Some(n), &full, span)?;
+                self.done(e, full, Ty::Option(Box::new(item)))
+            }
+            "flat" => {
+                self.no_more_than(args, 0, &full, span)?;
+                let Ty::Array(inner) = self.types.resolve(&item) else {
+                    return self.err("`flat` needs an array of arrays", span);
+                };
+                self.done(e, full, Ty::Array(inner))
+            }
+            "entries" => {
+                let i = self.types.int();
+                self.done(e, full, Ty::Array(Box::new(Ty::Tuple(vec![i, item]))))
+            }
+            "keys" => {
+                let i = self.types.int();
+                self.done(e, full, Ty::Array(Box::new(i)))
+            }
+            "values" => self.done(e, full, arr),
+            "toString" => self.done(e, full, Ty::Str),
+            _ => self.err(format!("arrays have no method `{prop}`"), span),
+        }
+    }
+}

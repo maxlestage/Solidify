@@ -1,0 +1,24 @@
+[package]
+name = "solidify"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Write TypeScript or JavaScript, get Rust: a transpiler with type inference, no dependencies."
+authors = ["Maxime Nathan Lestage"]
+license-file = "LICENSE"
+repository = "https://github.com/maxlestage/Solidify"
+homepage = "https://maxlestage.github.io/Solidify/"
+readme = "README.md"
+keywords = ["typescript", "javascript", "transpiler", "compiler", "rust"]
+categories = ["compilers", "development-tools", "command-line-utilities"]
+include = ["src", "tests", "README.md", "LICENSE"]
+
+[lib]
+name = "solidify"
+path = "src/lib.rs"
+
+[[bin]]
+name = "solidify"
+path = "src/main.rs"
+
+[dependencies]

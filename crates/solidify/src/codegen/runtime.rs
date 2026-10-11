@@ -1,0 +1,312 @@
+//! Small helpers written into the generated file when the program needs them: JavaScript
+//! string and array operations with no direct equivalent in Rust's standard library.
+
+/// A helper, by name; the text is appended at the end of the output.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Helper {
+    StrSlice,
+    StrSubstring,
+    StrCharAt,
+    StrIndexOf,
+    StrLastIndexOf,
+    StrCharCodeAt,
+    StrPadStart,
+    StrPadEnd,
+    StrSplit,
+    VecSlice,
+    VecSplice,
+    VecIndexOf,
+    VecLastIndexOf,
+    VecAt,
+    VecShift,
+    Compare,
+    Ordering,
+    ParseInt,
+    ParseFloat,
+    ToNumber,
+    Random,
+    NumToString,
+    BlockOn,
+}
+
+impl Helper {
+    pub fn source(self) -> &'static str {
+        match self {
+            Helper::StrSlice => {
+                r#"/// `s.slice(start, end)`: character positions, negative ones counted from the end.
+fn js_slice(s: &str, start: i64, end: Option<i64>) -> String {
+    let len = s.chars().count() as i64;
+    let clamp = |i: i64| if i < 0 { (len + i).max(0) } else { i.min(len) };
+    let (a, b) = (clamp(start), clamp(end.unwrap_or(len)));
+    if b <= a {
+        return String::new();
+    }
+    s.chars().skip(a as usize).take((b - a) as usize).collect()
+}"#
+            }
+            Helper::StrSubstring => {
+                r#"/// `s.substring(start, end)`: character positions, swapped when out of order.
+fn js_substring(s: &str, start: i64, end: Option<i64>) -> String {
+    let len = s.chars().count() as i64;
+    let clamp = |i: i64| i.clamp(0, len);
+    let (mut a, mut b) = (clamp(start), clamp(end.unwrap_or(len)));
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+    s.chars().skip(a as usize).take((b - a) as usize).collect()
+}"#
+            }
+            Helper::StrCharAt => {
+                r#"/// `s.charAt(i)` / `s[i]`: one character, or an empty string.
+fn js_char_at(s: &str, i: i64) -> String {
+    if i < 0 {
+        return String::new();
+    }
+    s.chars().nth(i as usize).map(String::from).unwrap_or_default()
+}"#
+            }
+            Helper::StrIndexOf => {
+                r#"/// `s.indexOf(needle)`: the character position, or -1.
+fn js_index_of(s: &str, needle: &str) -> i64 {
+    match s.find(needle) {
+        Some(byte) => s[..byte].chars().count() as i64,
+        None => -1,
+    }
+}"#
+            }
+            Helper::StrLastIndexOf => {
+                r#"/// `s.lastIndexOf(needle)`: the last character position, or -1.
+fn js_last_index_of(s: &str, needle: &str) -> i64 {
+    match s.rfind(needle) {
+        Some(byte) => s[..byte].chars().count() as i64,
+        None => -1,
+    }
+}"#
+            }
+            Helper::StrCharCodeAt => {
+                r#"/// `s.charCodeAt(i)`: the code of a character, or -1 (NaN in JavaScript).
+fn js_char_code_at(s: &str, i: i64) -> i64 {
+    if i < 0 {
+        return -1;
+    }
+    s.chars().nth(i as usize).map_or(-1, |c| c as i64)
+}"#
+            }
+            Helper::StrPadStart => {
+                r#"/// `s.padStart(width, pad)`.
+fn js_pad_start(s: &str, width: i64, pad: &str) -> String {
+    let len = s.chars().count() as i64;
+    if width <= len || pad.is_empty() {
+        return s.to_string();
+    }
+    let fill: String = pad.chars().cycle().take((width - len) as usize).collect();
+    format!("{fill}{s}")
+}"#
+            }
+            Helper::StrPadEnd => {
+                r#"/// `s.padEnd(width, pad)`.
+fn js_pad_end(s: &str, width: i64, pad: &str) -> String {
+    let len = s.chars().count() as i64;
+    if width <= len || pad.is_empty() {
+        return s.to_string();
+    }
+    let fill: String = pad.chars().cycle().take((width - len) as usize).collect();
+    format!("{s}{fill}")
+}"#
+            }
+            Helper::StrSplit => {
+                r#"/// `s.split(sep)`: an empty separator splits into characters.
+fn js_split(s: &str, sep: &str) -> Vec<String> {
+    if sep.is_empty() {
+        s.chars().map(String::from).collect()
+    } else {
+        s.split(sep).map(String::from).collect()
+    }
+}"#
+            }
+            Helper::VecSlice => {
+                r#"/// `list.slice(start, end)`: negative positions are counted from the end.
+fn js_slice_vec<T: Clone>(v: &[T], start: i64, end: Option<i64>) -> Vec<T> {
+    let len = v.len() as i64;
+    let clamp = |i: i64| if i < 0 { (len + i).max(0) } else { i.min(len) };
+    let (a, b) = (clamp(start), clamp(end.unwrap_or(len)));
+    if b <= a {
+        return Vec::new();
+    }
+    v[a as usize..b as usize].to_vec()
+}"#
+            }
+            Helper::VecSplice => {
+                r#"/// `list.splice(start, count, ...items)`: removes and inserts in place, returns the removed.
+fn js_splice<T>(v: &mut Vec<T>, start: i64, count: Option<i64>, items: Vec<T>) -> Vec<T> {
+    let len = v.len() as i64;
+    let start = if start < 0 { (len + start).max(0) } else { start.min(len) } as usize;
+    let count = count.map_or(v.len() - start, |c| c.clamp(0, len - start as i64) as usize);
+    v.splice(start..start + count, items).collect()
+}"#
+            }
+            Helper::VecIndexOf => {
+                r#"/// `list.indexOf(item)`: the position, or -1.
+fn js_index_of_item<T: PartialEq>(v: &[T], item: &T) -> i64 {
+    v.iter().position(|x| x == item).map_or(-1, |i| i as i64)
+}"#
+            }
+            Helper::VecLastIndexOf => {
+                r#"/// `list.lastIndexOf(item)`: the last position, or -1.
+fn js_last_index_of_item<T: PartialEq>(v: &[T], item: &T) -> i64 {
+    v.iter().rposition(|x| x == item).map_or(-1, |i| i as i64)
+}"#
+            }
+            Helper::VecAt => {
+                r#"/// `list.at(i)`: negative positions are counted from the end.
+fn js_at<T: Clone>(v: &[T], i: i64) -> Option<T> {
+    let i = if i < 0 { v.len() as i64 + i } else { i };
+    if i < 0 { None } else { v.get(i as usize).cloned() }
+}"#
+            }
+            Helper::VecShift => {
+                r#"/// `list.shift()`: removes and returns the first element.
+fn js_shift<T>(v: &mut Vec<T>) -> Option<T> {
+    if v.is_empty() { None } else { Some(v.remove(0)) }
+}"#
+            }
+            Helper::Compare => {
+                r#"/// `a.localeCompare(b)`: -1, 0 or 1.
+fn js_compare(a: &str, b: &str) -> i64 {
+    match a.cmp(b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}"#
+            }
+            Helper::Ordering => {
+                r#"/// The ordering a JavaScript comparator's result stands for.
+fn js_ordering(n: f64) -> std::cmp::Ordering {
+    n.partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)
+}"#
+            }
+            Helper::ParseInt => {
+                r#"/// `parseInt(s)`: the leading integer, or NaN.
+fn js_parse_int(s: &str) -> f64 {
+    let s = s.trim_start();
+    let end = s
+        .char_indices()
+        .take_while(|&(i, c)| c.is_ascii_digit() || (i == 0 && (c == '-' || c == '+')))
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+}"#
+            }
+            Helper::ParseFloat => {
+                r#"/// `parseFloat(s)`: the leading number, or NaN.
+fn js_parse_float(s: &str) -> f64 {
+    let s = s.trim_start();
+    let mut end = 0;
+    let (mut dot, mut exp, mut digits) = (false, false, false);
+    for (i, c) in s.char_indices() {
+        let ok = match c {
+            '0'..='9' => {
+                digits = true;
+                true
+            }
+            '-' | '+' => i == 0 || matches!(s[..i].chars().last(), Some('e' | 'E')),
+            '.' => !dot && !exp && std::mem::replace(&mut dot, true) == false,
+            'e' | 'E' => digits && !exp && std::mem::replace(&mut exp, true) == false,
+            _ => false,
+        };
+        if !ok {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    let mut text = &s[..end];
+    while !text.is_empty() && text.parse::<f64>().is_err() {
+        text = &text[..text.len() - 1];
+    }
+    text.parse::<f64>().unwrap_or(f64::NAN)
+}"#
+            }
+            Helper::ToNumber => {
+                r#"/// `Number(s)`: the whole string as a number, 0 when blank, NaN otherwise.
+fn js_number(s: &str) -> f64 {
+    let s = s.trim();
+    if s.is_empty() {
+        return 0.0;
+    }
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        return i64::from_str_radix(hex, 16).map_or(f64::NAN, |n| n as f64);
+    }
+    match s {
+        "Infinity" | "+Infinity" => f64::INFINITY,
+        "-Infinity" => f64::NEG_INFINITY,
+        _ => s.parse::<f64>().unwrap_or(f64::NAN),
+    }
+}"#
+            }
+            Helper::Random => {
+                r#"/// `Math.random()`: a pseudo-random number in [0, 1), seeded from the clock.
+fn js_random() -> f64 {
+    use std::cell::Cell;
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0x9E37_79B9_7F4A_7C15, |d| d.as_nanos() as u64 | 1),
+        );
+    }
+    STATE.with(|s| {
+        let mut x = s.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
+}"#
+            }
+            Helper::NumToString => {
+                r#"/// `n.toString(radix)`.
+fn js_num_to_string(mut n: i64, radix: i64) -> String {
+    if !(2..=36).contains(&radix) {
+        return n.to_string();
+    }
+    if n == 0 {
+        return "0".into();
+    }
+    let negative = n < 0;
+    n = n.abs();
+    let mut digits = Vec::new();
+    while n > 0 {
+        digits.push(std::char::from_digit((n % radix) as u32, radix as u32).unwrap_or('?'));
+        n /= radix;
+    }
+    if negative {
+        digits.push('-');
+    }
+    digits.iter().rev().collect()
+}"#
+            }
+            Helper::BlockOn => {
+                r#"/// Runs a future to completion (the async functions here never wait on I/O).
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    fn noop(_: *const ()) {}
+    fn clone(p: *const ()) -> RawWaker {
+        RawWaker::new(p, &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut future = std::pin::pin!(future);
+    loop {
+        if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
+            return v;
+        }
+    }
+}"#
+            }
+        }
+    }
+}
