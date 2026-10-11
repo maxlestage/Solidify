@@ -464,6 +464,26 @@ impl<'m> Infer<'m> {
                 format!("a match has no method `{prop}`: its groups are `m[i]`"),
                 span,
             ),
+            Ty::Named(n) if n == "Date" => {
+                let full = format!("date.{prop}");
+                self.no_more_than(args, 0, &full, span)?;
+                match prop {
+                    "getTime" | "valueOf" | "getFullYear" | "getMonth" | "getDate" | "getDay"
+                    | "getHours" | "getMinutes" | "getSeconds" | "getMilliseconds"
+                    | "getUTCFullYear" | "getUTCMonth" | "getUTCDate" | "getUTCDay"
+                    | "getUTCHours" | "getUTCMinutes" | "getUTCSeconds"
+                    | "getUTCMilliseconds" | "getTimezoneOffset" => {
+                        let i = self.types.int();
+                        self.done(e, full, i)
+                    }
+                    "toISOString" | "toJSON" | "toString" | "toDateString" | "toTimeString"
+                    | "toUTCString" => self.done(e, full, Ty::Str),
+                    _ => self.err(
+                        format!("Date has no method `{prop}`: the UTC getters and the ISO text are supported"),
+                        span,
+                    ),
+                }
+            }
             Ty::Tuple(_) => self.err(
                 format!("tuples have no method `{prop}`: use an array"),
                 span,

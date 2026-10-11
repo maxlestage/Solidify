@@ -518,6 +518,16 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
+    /// The value of a local: a closure stays a closure (only fields and collections keep
+    /// functions behind an `Rc`).
+    fn local_value(&mut self, x: E, it: &Ty, ty: &Ty) -> String {
+        if matches!(self.resolve(ty), Ty::Func(_)) {
+            self.owned(x, it)
+        } else {
+            self.owned_as(x, it, ty)
+        }
+    }
+
     /// A variable holding an expression to destructure: the variable itself, or a temporary.
     fn temp_binding(&mut self, init: &'a Expr, hint: &str) -> GResult<String> {
         if let ExprKind::Ident(_) = &init.kind {
@@ -551,7 +561,7 @@ impl<'a> Gen<'a> {
                 ExprKind::Arrow(f) | ExprKind::Func(f) => self.closure(f, &[], true)?,
                 _ => self.expr(init)?,
             };
-            let value = self.owned_as(x, &it, ty);
+            let value = self.local_value(x, &it, ty);
             let needs_type = matches!(
                 value.as_str(),
                 "Vec::new()"
@@ -624,7 +634,7 @@ impl<'a> Gen<'a> {
                 ));
                 return Ok(());
             }
-            let value = self.owned_as(x, &it, ty);
+            let value = self.local_value(x, &it, ty);
             let m = if var.mutated { "mut " } else { "" };
             let name = self.bind(id, Repr::Owned);
             self.line(&format!("let {m}{name} = {value};"));
@@ -658,7 +668,7 @@ impl<'a> Gen<'a> {
         let value = if usize_value {
             x.code.clone()
         } else {
-            self.owned_as(x, &it, ty)
+            self.local_value(x, &it, ty)
         };
         let float_literal = match &init.kind {
             ExprKind::Num { .. } => self.is_float(ty),
