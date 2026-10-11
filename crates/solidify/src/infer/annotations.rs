@@ -401,6 +401,7 @@ impl<'m> Infer<'m> {
             type_params: Vec::new(),
             type_bounds: Vec::new(),
             parent_args: Vec::new(),
+            implements_args: Vec::new(),
         });
         let fields = self.fields_from_members(name, members)?;
         self.struct_mut(name).expect("struct").fields = fields;

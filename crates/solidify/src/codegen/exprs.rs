@@ -220,6 +220,34 @@ impl<'a> Gen<'a> {
                 index,
                 optional: true,
             } => self.optional_index(obj, index),
+            ExprKind::Index { obj, index, .. }
+                if matches!(self.p.calls.get(&e.id), Some(Callee::Builtin("enum.name"))) =>
+            {
+                // `Level[x]`: the member's name.
+                let binding = self.p.refs[&obj.id];
+                let en = pascal(&self.p.var(binding).name);
+                let it = self.ty_of(index);
+                if matches!(self.resolve(&it), Ty::Num(_)) {
+                    let x = self.expr_as(index, Want::Owned)?;
+                    let x = if self.is_float(&it) {
+                        x
+                    } else {
+                        format!("{x} as f64")
+                    };
+                    Ok(E::new(
+                        format!("{en}::name_of({x})"),
+                        PREC_POSTFIX,
+                        Repr::Str,
+                    ))
+                } else {
+                    let x = self.expr(index)?;
+                    Ok(E::new(
+                        format!("{}.name()", Self::paren(&x, PREC_POSTFIX)),
+                        PREC_POSTFIX,
+                        Repr::Str,
+                    ))
+                }
+            }
             ExprKind::Index { obj, index, .. } => self.index(e, obj, index),
             ExprKind::As(inner, _) | ExprKind::NonNull(inner) => {
                 let inner_ty = self.ty_of(inner);
@@ -834,8 +862,13 @@ impl<'a> Gen<'a> {
         };
         // A shape held dynamically (classes stand in for it): boxed.
         if self.p.is_dyn(&struct_name) {
+            let args = match self.ty_of(e) {
+                Ty::Named(_, args) => args,
+                _ => Vec::new(),
+            };
+            let g = self.dyn_generics(&struct_name, &args, true, e.span)?;
             return Ok(E::owned(
-                format!("Box::new({literal}) as Box<dyn {name}Like>"),
+                format!("Box::new({literal}) as Box<dyn {name}Like{g}>"),
                 super::PREC_CAST,
             ));
         }

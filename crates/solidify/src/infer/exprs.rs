@@ -366,6 +366,37 @@ impl<'m> Infer<'m> {
                         t => Ty::Option(Box::new(t)),
                     });
                 }
+                // `Level[Level.High]`, `Level[2]`: the name of a numeric enum's member.
+                if let Some((name, id)) = self.type_ref(obj)
+                    && self.vars[&id].role == Role::Enum
+                {
+                    let numeric = self
+                        .enum_by_name(&name)
+                        .is_some_and(|en| en.kind == EnumKind::Numeric);
+                    if !numeric {
+                        return self.err(
+                            format!("only numeric enums map values back to names: `{name}[…]`"),
+                            e.span,
+                        );
+                    }
+                    self.refs.insert(obj.id, id);
+                    self.set_ty(obj.id, Ty::Void);
+                    let it = self.expr(index, None)?;
+                    match self.types.resolve(&it) {
+                        Ty::Named(n, _) if n == name => {}
+                        Ty::Num(_) => {}
+                        other => {
+                            let d = self.describe(&other);
+                            return self.err(
+                                format!("`{name}[…]` takes a number or a {name}, not {d}"),
+                                index.span,
+                            );
+                        }
+                    }
+                    self.calls.insert(e.id, Callee::Builtin("enum.name"));
+                    self.enum_names.insert(name);
+                    return Ok(Ty::Str);
+                }
                 self.index(obj, index, e.span)
             }
             ExprKind::As(inner, ty) => {
@@ -1076,6 +1107,7 @@ impl<'m> Infer<'m> {
             type_params: Vec::new(),
             type_bounds: Vec::new(),
             parent_args: Vec::new(),
+            implements_args: Vec::new(),
         });
         self.literal_struct.insert(e.id, name.clone());
         Ok(Ty::named(name))

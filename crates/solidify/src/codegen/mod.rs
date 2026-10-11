@@ -784,7 +784,6 @@ pub fn pascal(name: &str) -> String {
         "String",
         "Rc",
         "RefCell",
-        "Cell",
         "HashMap",
         "HashSet",
         "Self",
@@ -792,7 +791,6 @@ pub fn pascal(name: &str) -> String {
         "Mutex",
         "Fn",
         "FnMut",
-        "Ordering",
         "Iterator",
         "Display",
         "Debug",
@@ -1700,7 +1698,12 @@ impl<'a> Gen<'a> {
                 } else if self.is_type_param(&n) {
                     n
                 } else if self.p.is_dyn(&n) {
-                    format!("Box<dyn {}Like>", pascal(&n))
+                    let args = match self.resolve(ty) {
+                        Ty::Named(_, args) => args,
+                        _ => Vec::new(),
+                    };
+                    let g = self.dyn_generics(&n, &args, false, span)?;
+                    format!("Box<dyn {}Like{g}>", pascal(&n))
                 } else {
                     let args = match self.resolve(ty) {
                         Ty::Named(_, args) => args,
@@ -1807,6 +1810,49 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `<i64>` after the trait of a generic class or interface held dynamically: the
+    /// type's arguments, else (`cast` set) placeholders Rust infers, else the parameters.
+    pub(super) fn dyn_generics(
+        &mut self,
+        n: &str,
+        args: &[Ty],
+        cast: bool,
+        span: Span,
+    ) -> GResult<String> {
+        let params = self
+            .p
+            .struct_info(n)
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        if params.is_empty() {
+            return Ok(String::new());
+        }
+        let parts: Vec<String> = if cast {
+            // Rust tells them from where the value goes.
+            params.iter().map(|_| "_".to_string()).collect()
+        } else if args.len() == params.len() {
+            let mut out = Vec::new();
+            for a in args {
+                out.push(self.rust_ty(a, span)?);
+            }
+            out
+        } else {
+            params
+        };
+        Ok(format!("<{}>", parts.join(", ")))
+    }
+
+    /// `dyn CLike<…>` for a type held dynamically, with its type arguments.
+    pub(super) fn dyn_ty(&mut self, ty: &Ty, span: Span) -> GResult<Option<String>> {
+        match self.resolve(ty) {
+            Ty::Named(n, args) if self.p.is_dyn(&n) => {
+                let g = self.dyn_generics(&n, &args, false, span)?;
+                Ok(Some(format!("dyn {}Like{g}", pascal(&n))))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// `dyn CLike` for a class held dynamically, else `None`.
     pub(super) fn dyn_name(&self, ty: &Ty) -> Option<String> {
         match self.resolve(ty) {
@@ -1831,11 +1877,11 @@ impl<'a> Gen<'a> {
         Ok(match mode {
             Mode::Value => self.rust_ty(ty, span)?,
             Mode::FnImpl => self.fn_param_ty(ty, span)?,
-            Mode::Ref => match self.dyn_name(ty) {
+            Mode::Ref => match self.dyn_ty(ty, span)? {
                 Some(d) => format!("&{d}"),
                 None => format!("&{}", self.rust_ty(ty, span)?),
             },
-            Mode::RefMut => match self.dyn_name(ty) {
+            Mode::RefMut => match self.dyn_ty(ty, span)? {
                 Some(d) => format!("&mut {d}"),
                 None => format!("&mut {}", self.rust_ty(ty, span)?),
             },
@@ -1846,7 +1892,7 @@ impl<'a> Gen<'a> {
             },
             Mode::OptRef => match self.resolve(ty) {
                 Ty::Option(inner) if self.is_str(&inner) => "Option<&str>".into(),
-                Ty::Option(inner) => match self.dyn_name(&inner) {
+                Ty::Option(inner) => match self.dyn_ty(&inner, span)? {
                     Some(d) => format!("Option<&{d}>"),
                     None => format!("Option<&{}>", self.rust_ty(&inner, span)?),
                 },
@@ -2146,12 +2192,15 @@ impl<'a> Gen<'a> {
             code = format!("{en}::{variant}({code})");
         }
         // An instance of a subclass where the base class is held dynamically.
-        if let (Ty::Named(from_class, ..), Ty::Named(base, ..)) = (&from_r, &target)
+        if let (Ty::Named(from_class, ..), Ty::Named(base, base_args)) = (&from_r, &target)
             && from_class != base
             && self.p.is_dyn(base)
             && self.p.is_subclass(from_class, base)
         {
-            let trait_name = format!("Box<dyn {}Like>", pascal(base));
+            let g = self
+                .dyn_generics(base, base_args, true, Span::default())
+                .unwrap_or_default();
+            let trait_name = format!("Box<dyn {}Like{g}>", pascal(base));
             code = if self.p.is_dyn(from_class) {
                 format!("{code} as {trait_name}")
             } else {

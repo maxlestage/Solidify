@@ -226,6 +226,9 @@ pub struct StructInfo {
     pub type_bounds: Vec<(String, String)>,
     /// `extends Base<number>`: the base class's type arguments.
     pub parent_args: Vec<Ty>,
+    /// `implements Container<number>`: the type arguments given to each generic
+    /// interface implemented.
+    pub implements_args: Vec<(String, Vec<Ty>)>,
 }
 
 impl StructInfo {
@@ -401,6 +404,8 @@ pub struct Program {
     pub undef_fields: HashSet<(String, String)>,
     /// Arrays whose missing elements are `undefined`.
     pub undef_elem_vars: HashSet<NodeId>,
+    /// Numeric enums whose values are mapped back to names (`Level[x]`).
+    pub enum_names: BTreeSet<String>,
 }
 
 /// `T | undefined` (and not `T | null`): a missing value is `undefined`.
@@ -760,6 +765,8 @@ pub(super) struct Infer<'m> {
     /// `for (const x of xs)`: (loop variable, collection): a changed element changes the
     /// collection.
     pub(super) loop_sources: Vec<(NodeId, NodeId)>,
+    /// Loop variables over a field of `this`, with the method.
+    pub(super) loop_this_sources: Vec<(NodeId, NodeId)>,
     pub(super) synth_names: HashSet<String>,
     pub(super) main_id: NodeId,
     pub(super) has_main: bool,
@@ -768,6 +775,8 @@ pub(super) struct Infer<'m> {
     pub(super) this_class_stack: Vec<String>,
     /// (constraint, type given, where): see [`Self::record_bound_uses`].
     pub(super) bound_uses: Vec<(String, Ty, Span)>,
+    /// Numeric enums whose values are mapped back to names (`Level[x]`).
+    pub(super) enum_names: BTreeSet<String>,
     /// `f<number>(…)`: the type arguments of the call being checked.
     pub(super) type_args: Option<(Span, Vec<Ty>)>,
     /// `return` statements of each function: (giving `this`, giving something else).
@@ -887,6 +896,7 @@ pub fn infer<'m>(
         method_receivers: Vec::new(),
         this_calls: Vec::new(),
         loop_sources: Vec::new(),
+        loop_this_sources: Vec::new(),
         synth_names: HashSet::new(),
         main_id,
         has_main: false,
@@ -901,6 +911,7 @@ pub fn infer<'m>(
         var_inits: Vec::new(),
         fn_returns: Vec::new(),
         type_args: None,
+        enum_names: BTreeSet::new(),
         bound_uses: Vec::new(),
         generic_aliases: HashMap::new(),
         hints: HashMap::new(),
@@ -1243,7 +1254,7 @@ impl<'m> Infer<'m> {
             Ty::Option(inner) => self.types.resolve(&inner),
             other => other,
         };
-        let (Ty::Named(base, ..), Ty::Named(class, ..)) = (target, found) else {
+        let (Ty::Named(base, base_args), Ty::Named(class, ..)) = (target, found) else {
             return false;
         };
         if base == class {
@@ -1267,11 +1278,49 @@ impl<'m> Infer<'m> {
             // An interface the class declares, or satisfies with its fields and methods.
             _ => {
                 if !self.is_subclass(&class, &base) {
-                    if !self.satisfies(&class, &base_info) {
+                    // A generic interface: its parameters as the expected type gives them.
+                    let args: Vec<Ty> = if base_args.len() == base_info.type_params.len() {
+                        base_args.clone()
+                    } else {
+                        base_info
+                            .type_params
+                            .iter()
+                            .map(|_| self.types.fresh())
+                            .collect()
+                    };
+                    let given: HashMap<String, Ty> = base_info
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(args.iter().cloned())
+                        .collect();
+                    if !self.satisfies(&class, &base_info, &given) {
                         return false;
                     }
                     if let Some(s) = self.struct_mut(&class) {
                         s.implements.push(base.clone());
+                        if !args.is_empty() {
+                            s.implements_args.push((base.clone(), args));
+                        }
+                    }
+                } else if !base_args.is_empty() {
+                    // Declared: the arguments it was declared with are those expected.
+                    let declared = self
+                        .ancestry(&class)
+                        .iter()
+                        .filter_map(|c| self.struct_by_name(c))
+                        .find_map(|s| {
+                            s.implements_args
+                                .iter()
+                                .find(|(i, _)| *i == base)
+                                .map(|(_, a)| a.clone())
+                        });
+                    if let Some(declared) = declared {
+                        for (x, y) in declared.iter().zip(&base_args) {
+                            if self.types.unify(x, y).is_err() {
+                                return false;
+                            }
+                        }
                     }
                 }
             }
@@ -1281,7 +1330,8 @@ impl<'m> Infer<'m> {
     }
 
     /// Whether a class has every field and method of an interface, with the same types.
-    fn satisfies(&mut self, class: &str, iface: &StructInfo) -> bool {
+    fn satisfies(&mut self, class: &str, iface: &StructInfo, given: &HashMap<String, Ty>) -> bool {
+        let sub = |this: &Self, t: &Ty| finish::substitute(t, given, &this.types);
         for f in &iface.fields {
             let Some(cf) = self.ancestry(class).iter().find_map(|c| {
                 self.struct_by_name(c)
@@ -1289,7 +1339,8 @@ impl<'m> Infer<'m> {
             }) else {
                 return false;
             };
-            if cf.optional != f.optional || self.types.unify(&cf.ty, &f.ty).is_err() {
+            let ft = sub(self, &f.ty);
+            if cf.optional != f.optional || self.types.unify(&cf.ty, &ft).is_err() {
                 return false;
             }
         }
@@ -1302,11 +1353,14 @@ impl<'m> Infer<'m> {
                 self.funcs[&cm.fn_id].sig.clone(),
             );
             if a.params.len() != b.params.len()
-                || a.params
-                    .iter()
-                    .zip(&b.params)
-                    .any(|(x, y)| self.types.unify(x, y).is_err())
-                || self.types.unify(&a.ret, &b.ret).is_err()
+                || a.params.iter().zip(&b.params).any(|(x, y)| {
+                    let x = sub(self, x);
+                    self.types.unify(&x, y).is_err()
+                })
+                || {
+                    let ret = sub(self, &a.ret);
+                    self.types.unify(&ret, &b.ret).is_err()
+                }
             {
                 return false;
             }

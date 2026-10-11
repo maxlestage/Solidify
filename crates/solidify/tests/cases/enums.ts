@@ -45,3 +45,11 @@ if (dir === "down") dir = "up";
 console.log(dir, Color.Blue);
 const colors = [Color.Red, Color.Blue];
 console.log(colors.length, colors.includes(Color.Blue));
+
+enum Level {
+  Off,
+  Low,
+  High = 5,
+}
+const level: Level = Level.High;
+console.log(Level[level], Level[Level.Low], Level[0], Level[7]);
