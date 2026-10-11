@@ -52,7 +52,71 @@ fn inline_discriminant(members: &[&TypeAnn]) -> Option<String> {
     None
 }
 
+/// `{ [k: string]: T }` alone: its key and value types.
+pub(super) fn index_only(members: &[TypeMember]) -> Option<(&TypeAnn, &TypeAnn)> {
+    match members {
+        [TypeMember::Index { key, value, .. }] => Some((key, value)),
+        _ => None,
+    }
+}
+
+/// `string`, `number`, `boolean`, `bigint`: the side of a branded intersection that is real.
+pub(super) fn is_primitive_ann(ann: &TypeAnn) -> bool {
+    matches!(ann, TypeAnn::Named { name, args, .. }
+        if args.is_empty() && matches!(name.as_str(), "string" | "number" | "boolean" | "bigint"))
+}
+
 impl<'m> Infer<'m> {
+    /// The fields of `A & B & { c: T }`, in order; a later member wins a shared name.
+    pub(super) fn intersection_fields(
+        &mut self,
+        owner: &str,
+        ann: &TypeAnn,
+    ) -> IResult<Vec<FieldInfo>> {
+        let TypeAnn::Intersection(members, _) = ann else {
+            unreachable!("an intersection")
+        };
+        let mut fields: Vec<FieldInfo> = Vec::new();
+        for m in members {
+            let own = match m {
+                TypeAnn::Object(ms, _) => self.fields_from_members(owner, ms)?,
+                TypeAnn::Intersection(..) => self.intersection_fields(owner, m)?,
+                _ => {
+                    let t = self.ann(m, owner)?;
+                    let s = match self.types.resolve(&t) {
+                        Ty::Named(n, ..) => self.struct_by_name(&n).cloned(),
+                        _ => None,
+                    };
+                    match s {
+                        Some(s) if s.kind != StructKind::Class && s.methods.is_empty() => s.fields,
+                        Some(s) if s.kind != StructKind::Class => {
+                            return self.err(
+                                format!(
+                                    "`{}` has methods: extend it with an interface instead of `&`",
+                                    s.name
+                                ),
+                                m.span(),
+                            );
+                        }
+                        _ => {
+                            return self.err(
+                                "an intersection joins object types (or brands a primitive)",
+                                m.span(),
+                            );
+                        }
+                    }
+                }
+            };
+            for f in own {
+                match fields.iter_mut().find(|g| g.name == f.name) {
+                    Some(g) => *g = f,
+                    None => fields.push(f),
+                }
+            }
+        }
+        Ok(fields)
+    }
+
     /// The type an annotation denotes. `hint` names the structs made for inline object types.
     pub(super) fn ann(&mut self, ann: &TypeAnn, hint: &str) -> IResult<Ty> {
         match ann {
@@ -67,8 +131,24 @@ impl<'m> Infer<'m> {
                 Ok(Ty::Tuple(out))
             }
             TypeAnn::Union(members, span) => self.union_ann(members, *span, hint),
-            TypeAnn::Intersection(_, span) => {
-                self.err("intersection types are not supported", *span)
+            TypeAnn::Intersection(members, span) => {
+                // `string & { __brand: "Id" }`: the brand only exists for the checker.
+                if let Some(p) = members.iter().find(|m| is_primitive_ann(m)) {
+                    return self.ann(p, hint);
+                }
+                let fields = self.intersection_fields(hint, ann)?;
+                if let Some(existing) = self.same_shape_named(&fields) {
+                    return Ok(Ty::named(existing));
+                }
+                let name = self.synth_name(hint);
+                self.define_struct_from_members(&name, &[], StructKind::Synth, false, *span)?;
+                self.struct_mut(&name).expect("struct").fields = fields;
+                Ok(Ty::named(name))
+            }
+            TypeAnn::Object(members, _) if let Some((k, v)) = index_only(members) => {
+                let k = self.ann(k, hint)?;
+                let v = self.ann(v, hint)?;
+                Ok(Ty::Map(Box::new(k), Box::new(v), true))
             }
             TypeAnn::Object(members, span) => {
                 let name = self.synth_name(hint);
@@ -111,10 +191,29 @@ impl<'m> Infer<'m> {
                 Lit::Bool(_) => Ok(Ty::Bool),
                 Lit::Null | Lit::Undefined => Ok(Ty::Null),
             },
-            TypeAnn::TypeOf(_, span) => self.err("`typeof` types are not supported", *span),
-            TypeAnn::KeyOf(_, span) => self.err("`keyof` types are not supported", *span),
-            TypeAnn::Indexed(_, _, span) => {
-                self.err("indexed access types are not supported", *span)
+            TypeAnn::TypeOf(name, span) => match self.lookup(name) {
+                Some(id) => Ok(self.vars[&id].ty.clone()),
+                None => self.err(format!("unknown variable `{name}`"), *span),
+            },
+            // The names of the keys: strings.
+            TypeAnn::KeyOf(..) => Ok(Ty::Str),
+            TypeAnn::Indexed(obj, key, span) => {
+                let t = self.ann(obj, hint)?;
+                match (self.types.resolve(&t), &**key) {
+                    (Ty::Named(n, ..), TypeAnn::Lit(Lit::Str(k), _)) => {
+                        match self.struct_by_name(&n).and_then(|s| s.field(k)) {
+                            Some(f) if f.optional => Ok(Ty::Option(Box::new(f.ty.clone()))),
+                            Some(f) => Ok(f.ty.clone()),
+                            None => self.err(format!("`{n}` has no property `{k}`"), *span),
+                        }
+                    }
+                    (Ty::Array(e), _) => Ok(*e),
+                    (Ty::Tuple(ts), TypeAnn::Lit(Lit::Num(i), _)) if (*i as usize) < ts.len() => {
+                        Ok(ts[*i as usize].clone())
+                    }
+                    (Ty::Map(_, v, _), _) => Ok(*v),
+                    _ => self.err("this indexed access type cannot be resolved", *span),
+                }
             }
         }
     }
