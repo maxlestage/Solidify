@@ -283,6 +283,8 @@ pub struct Method {
     pub func: Function,
     pub is_static: bool,
     pub access: Option<Access>,
+    /// `abstract m(): T;`: a signature the subclasses implement.
+    pub is_abstract: bool,
     pub span: Span,
 }
 

@@ -81,6 +81,8 @@ impl<'m> Infer<'m> {
             main_id: self.main_id,
             has_main: self.has_main,
             boxed,
+            polymorphic: self.polymorphic,
+            overrides: self.overrides,
         })
     }
 
@@ -158,9 +160,9 @@ impl<'m> Infer<'m> {
     fn propagate_mutation(&mut self) {
         loop {
             let mut changed = false;
-            // Methods calling `this.m()` where `m` mutates self.
+            // Methods calling `this.m()` where `m` (or an override of it) mutates self.
             for (callee, caller) in self.this_calls.clone() {
-                if self.funcs.get(&callee).is_some_and(|f| f.mutates_self)
+                if self.method_mutates(callee)
                     && let Some(c) = self.funcs.get_mut(&caller)
                     && !c.mutates_self
                 {
@@ -168,9 +170,9 @@ impl<'m> Infer<'m> {
                     changed = true;
                 }
             }
-            // `obj.m()` where `m` mutates self: `obj` is mutated.
+            // `obj.m()` where `m` (or an override of it) mutates self: `obj` is mutated.
             for (callee, root) in self.method_receivers.clone() {
-                if self.funcs.get(&callee).is_some_and(|f| f.mutates_self)
+                if self.method_mutates(callee)
                     && let Some(v) = self.vars.get_mut(&root)
                     && !v.mutated
                 {
@@ -212,6 +214,15 @@ impl<'m> Infer<'m> {
                 break;
             }
         }
+    }
+
+    /// Whether a method, or an override of it, changes `this`.
+    fn method_mutates(&self, fn_id: NodeId) -> bool {
+        self.funcs.get(&fn_id).is_some_and(|f| f.mutates_self)
+            || self
+                .overrides
+                .get(&fn_id)
+                .is_some_and(|os| os.iter().any(|o| self.method_mutates(*o)))
     }
 
     /// Parameters whose type is still unknown become type parameters; numbers of unknown

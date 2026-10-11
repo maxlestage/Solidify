@@ -90,6 +90,24 @@ impl<'a> Gen<'a> {
                 self.finish_call(code, &info, e)
             }
             Callee::Ctor(_) => unreachable!("constructors go through new"),
+            Callee::SuperCtor(_) => self.err(
+                "`super(…)` must be the first statement of the constructor",
+                e.span,
+            ),
+            Callee::SuperMethod { class, name, fn_id } => {
+                // The base class's version, written into this class as `base_method`.
+                let info = self.p.funcs[&fn_id].clone();
+                let list = self.user_args(&info, args, e.span)?;
+                let helper = format!("{}_{}", snake(&class), snake(&name));
+                if let Some(current) = self.current_class.clone() {
+                    self.super_helpers
+                        .entry(current)
+                        .or_default()
+                        .insert((class.clone(), name.clone()));
+                }
+                let code = format!("self.{helper}({list})");
+                self.finish_call(code, &info, e)
+            }
             Callee::Builtin(name) => {
                 let ExprKind::Member { obj, .. } = &callee.kind else {
                     return self.global_call(e, name, args);
@@ -211,7 +229,7 @@ impl<'a> Gen<'a> {
                         Mode::Slice => self.coerce(x, &at, Want::Slice),
                         Mode::OptRef => {
                             if matches!(self.resolve(&at), Ty::Option(_)) {
-                                let deref = matches!(self.resolve(pt), Ty::Option(ref i) if self.is_str(i) || self.is_boxed(i));
+                                let deref = matches!(self.resolve(pt), Ty::Option(ref i) if self.is_str(i) || self.is_boxed(i) || self.dyn_name(i).is_some());
                                 match x.repr {
                                     Repr::Owned if self.opt_ref_param_e(&x) => x.code,
                                     _ => format!(
@@ -291,16 +309,28 @@ impl<'a> Gen<'a> {
     ) -> GResult<E> {
         match self.p.calls.get(&e.id).cloned() {
             Some(Callee::Ctor(class)) => {
-                let info = self.p.struct_info(&class).expect("class").clone();
                 let name = pascal(&class);
-                match info.ctor {
+                let ctor = self
+                    .p
+                    .ancestry(&class)
+                    .iter()
+                    .find_map(|c| self.p.struct_info(c).and_then(|s| s.ctor));
+                let built = match ctor {
                     Some(ctor) => {
                         let f = self.p.funcs[&ctor].clone();
                         let list = self.user_args(&f, args, e.span)?;
-                        self.finish_call(format!("{name}::new({list})"), &f, e)
+                        self.finish_call(format!("{name}::new({list})"), &f, e)?
                     }
-                    None => Ok(E::owned(format!("{name}::new()"), PREC_POSTFIX)),
+                    None => E::owned(format!("{name}::new()"), PREC_POSTFIX),
+                };
+                // A class held dynamically: every value of it is boxed.
+                if self.p.is_dyn(&class) {
+                    return Ok(E::owned(
+                        format!("Box::new({}) as Box<dyn {name}Like>", built.code),
+                        PREC_CAST,
+                    ));
                 }
+                Ok(built)
             }
             Some(Callee::Builtin("new Error")) => match args.first() {
                 Some(a) => {

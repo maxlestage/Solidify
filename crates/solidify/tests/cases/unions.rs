@@ -86,6 +86,10 @@ struct Lexer {
 }
 
 impl Lexer {
+    pub fn new() -> Self {
+        Self { tokens: Vec::new(), current: None }
+    }
+
     pub fn push(&mut self, t: Token) {
         self.tokens.push(t.clone());
         self.current = Some(t);
@@ -107,10 +111,6 @@ impl Lexer {
             }
         }
         parts.join(" ")
-    }
-
-    pub fn new() -> Self {
-        Self { tokens: Vec::new(), current: None }
     }
 }
 

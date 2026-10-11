@@ -400,6 +400,7 @@ impl<'m> Infer<'m> {
                 positive: t.positive,
                 union: Some((t.union.clone(), t.variant.clone())),
                 complement: complement.clone(),
+                instance_of: None,
                 mutated: false,
                 inner: t.inner.clone(),
                 let_else: false,

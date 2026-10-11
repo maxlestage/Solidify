@@ -1,0 +1,13 @@
+circle with area 3.14
+rect with area 6.00 (2x3)
+square with area 4.00 (2x2)
+13.142 3
+Rex barks 2 sit+roll animalia
+Generic makes a sound
+Rex barks
+Rex knows 3 tricks
+Bit yaps
+Bit knows 2 tricks
+a puppy!
+Rex Gen 1,2,0
+Dog { name: 'Rex', sounds: 2, tricks: [ 'sit', 'roll', 'fetch' ] } Circle { name: 'circle', radius: 1 }

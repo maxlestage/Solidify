@@ -1188,10 +1188,34 @@ impl<'a> Parser<'a> {
             if !self.at_punct("{") {
                 // Abstract method or overload signature.
                 self.semicolon_in_class();
-                if is_abstract {
-                    return Err(Error::new("abstract methods are not supported", start));
+                if !is_abstract {
+                    return Ok(None);
                 }
-                return Ok(None);
+                let span = start.to(self.last_span());
+                return Ok(Some(ClassMember::Method(Method {
+                    name,
+                    kind,
+                    func: Function {
+                        name: None,
+                        type_params,
+                        params,
+                        ret,
+                        body: FnBody::Block(Block {
+                            stmts: Vec::new(),
+                            span,
+                        }),
+                        is_async,
+                        is_arrow: false,
+                        is_generator,
+                        exported: false,
+                        span,
+                        id,
+                    },
+                    is_static,
+                    access,
+                    is_abstract: true,
+                    span,
+                })));
             }
             let body = self.block()?;
             let span = start.to(self.last_span());
@@ -1213,6 +1237,7 @@ impl<'a> Parser<'a> {
                 },
                 is_static,
                 access,
+                is_abstract: false,
                 span,
             })));
         }

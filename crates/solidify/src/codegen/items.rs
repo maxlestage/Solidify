@@ -4,7 +4,7 @@ use super::{
     FnGen, GResult, Gen, Helper, Mode, Repr, Want, pascal, screaming, snake, string_literal,
 };
 use crate::ast::*;
-use crate::infer::{EnumKind, EnumValue, Role, StructKind};
+use crate::infer::{Callee, EnumKind, EnumValue, Role, StructKind};
 use crate::types::Ty;
 
 impl<'a> Gen<'a> {
@@ -40,7 +40,7 @@ impl<'a> Gen<'a> {
                 for c in &s.comments {
                     self.line(&format!("/// {c}"));
                 }
-                self.function_item(f, None)?;
+                self.function_item(f, None, None)?;
             }
         }
         if self.p.has_main {
@@ -61,6 +61,8 @@ impl<'a> Gen<'a> {
         out.push_str(body.trim_start_matches('\n'));
         let union_impls = self.union_impls()?;
         out.push_str(&union_impls);
+        let traits = self.trait_items()?;
+        out.push_str(&traits);
         let impls = self.inspect_impls()?;
         for h in self.helpers.clone() {
             out.push('\n');
@@ -387,7 +389,12 @@ impl<'a> Gen<'a> {
         } else {
             ""
         };
-        self.line("#[derive(Debug, Clone, PartialEq)]");
+        // A `dyn` value cannot be compared.
+        if s.fields.iter().any(|f| self.contains_dyn(&f.ty)) {
+            self.line("#[derive(Debug, Clone)]");
+        } else {
+            self.line("#[derive(Debug, Clone, PartialEq)]");
+        }
         self.line(&format!("{vis}struct {name} {{"));
         self.indent += 1;
         for f in &s.fields {
@@ -409,10 +416,40 @@ impl<'a> Gen<'a> {
             return Ok(());
         }
         let class = self.class_asts.get(&s.name).copied().expect("class ast");
-        let has_impl = s.ctor.is_some() || !s.methods.is_empty() || !s.statics.is_empty();
-        if !has_impl {
-            return Ok(());
+        // The methods written for this class: its own, then the inherited ones it does
+        // not override (abstract classes only get their constructor and statics).
+        let mut methods: Vec<(String, &'a Method)> = Vec::new();
+        let mut seen: Vec<(String, MethodKind)> = Vec::new();
+        if !s.is_abstract {
+            for owner in self.p.ancestry(&s.name) {
+                let Some(ast) = self.class_asts.get(&owner).copied() else {
+                    continue;
+                };
+                for m in &ast.members {
+                    let ClassMember::Method(m) = m else { continue };
+                    if m.kind == MethodKind::Constructor
+                        || (m.is_static && owner != s.name)
+                        || seen.contains(&(m.name.clone(), m.kind))
+                    {
+                        continue;
+                    }
+                    seen.push((m.name.clone(), m.kind));
+                    if !m.is_abstract {
+                        methods.push((owner.clone(), m));
+                    }
+                }
+            }
         }
+        let inherited_ctor = if s.ctor.is_none() {
+            self.p.ancestry(&s.name)[1..].iter().find_map(|c| {
+                self.p
+                    .struct_info(c)
+                    .and_then(|si| si.ctor.map(|id| (c.clone(), id)))
+            })
+        } else {
+            None
+        };
+        self.current_class = Some(s.name.clone());
         self.blank();
         self.line(&format!("impl {name} {{"));
         self.indent += 1;
@@ -444,22 +481,19 @@ impl<'a> Gen<'a> {
             self.line(&format!("pub const {}: {t} = {value};", screaming(sname)));
             first = false;
         }
-        for m in &class.members {
-            let ClassMember::Method(m) = m else { continue };
-            if !first {
-                self.blank();
-            }
-            first = false;
-            match m.kind {
-                MethodKind::Constructor => self.constructor_item(class, s, m)?,
-                _ => self.function_item(&m.func, Some(m))?,
-            }
+        if !first {
+            self.blank();
         }
-        if s.ctor.is_none() {
+        first = false;
+        if let Some(m) = class.members.iter().find_map(|m| match m {
+            ClassMember::Method(m) if m.kind == MethodKind::Constructor => Some(m),
+            _ => None,
+        }) {
+            self.constructor_item(class, s, m)?;
+        } else if let Some((owner, ctor)) = inherited_ctor {
+            self.inherited_constructor(class, s, &owner, ctor)?;
+        } else {
             // A class without constructor: `new()` from the field initializers.
-            if !first {
-                self.blank();
-            }
             self.line("pub fn new() -> Self {");
             self.indent += 1;
             self.fns.push(self.plain_ctx(
@@ -474,9 +508,112 @@ impl<'a> Gen<'a> {
             self.indent -= 1;
             self.line("}");
         }
+        for (_, m) in methods {
+            if !first {
+                self.blank();
+            }
+            first = false;
+            self.function_item(&m.func, Some(m), None)?;
+        }
+        // `super.m()`: the base class's version, as `base_m`, possibly needing more.
+        let mut written: std::collections::BTreeSet<(String, String)> = Default::default();
+        loop {
+            let pending: Vec<(String, String)> = self
+                .super_helpers
+                .get(&s.name)
+                .map(|set| {
+                    set.iter()
+                        .filter(|h| !written.contains(*h))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            if pending.is_empty() {
+                break;
+            }
+            for (owner, method) in pending {
+                written.insert((owner.clone(), method.clone()));
+                let Some(ast) = self.class_asts.get(&owner).copied() else {
+                    continue;
+                };
+                let Some(m) = ast.members.iter().find_map(|m| match m {
+                    ClassMember::Method(m) if m.name == method && m.kind == MethodKind::Method => {
+                        Some(m)
+                    }
+                    _ => None,
+                }) else {
+                    continue;
+                };
+                self.blank();
+                let helper = format!("{}_{}", snake(&owner), snake(&method));
+                self.function_item(&m.func, Some(m), Some(&helper))?;
+            }
+        }
+        self.indent -= 1;
+        self.line("}");
+        self.current_class = None;
+        Ok(())
+    }
+
+    /// The constructor a class gets from its base class: the same parameters, the base
+    /// part built first.
+    fn inherited_constructor(
+        &mut self,
+        class: &'a Class,
+        s: &crate::infer::StructInfo,
+        owner: &str,
+        ctor: NodeId,
+    ) -> GResult<()> {
+        let f = self.fn_asts.get(&ctor).copied().expect("ctor ast");
+        let info = self.p.funcs[&ctor].clone();
+        self.push_scope();
+        self.fns
+            .push(self.plain_ctx(f.id, Ty::Named(s.name.clone()), Some(s.name.clone()), true));
+        self.fn_ctx_mut().returns_result = info.throws;
+        let params = self.param_list(f, &info)?;
+        let names: Vec<String> = info.params.iter().map(|b| self.name(*b)).collect();
+        let call = format!(
+            "{}::new({}){}",
+            pascal(owner),
+            names.join(", "),
+            if info.throws { "?" } else { "" }
+        );
+        let parent = s.parent.clone().expect("parent");
+        let assigned = self.base_fields(&parent);
+        let fields = self.initial_fields(class, s, &assigned);
+        self.fns.pop();
+        self.pop_scope();
+        let fields = fields?;
+        let ret = if info.throws {
+            "Result<Self, String>"
+        } else {
+            "Self"
+        };
+        self.line(&format!("pub fn new({params}) -> {ret} {{"));
+        self.indent += 1;
+        self.line(&format!("let base = {call};"));
+        self.line(&format!(
+            "{}Self {{ {} }}{}",
+            if info.throws { "Ok(" } else { "" },
+            fields.join(", "),
+            if info.throws { ")" } else { "" }
+        ));
         self.indent -= 1;
         self.line("}");
         Ok(())
+    }
+
+    /// The fields of the base class, taken from `base`.
+    fn base_fields(&self, parent: &str) -> Vec<(String, String)> {
+        self.p
+            .struct_info(parent)
+            .map(|p| {
+                p.fields
+                    .iter()
+                    .map(|f| (f.name.clone(), format!("base.{}", snake(&f.name))))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn plain_ctx(&self, id: NodeId, ret_ty: Ty, class: Option<String>, in_ctor: bool) -> FnGen {
@@ -566,6 +703,43 @@ impl<'a> Gen<'a> {
         let FnBody::Block(body) = &f.body else {
             unreachable!()
         };
+        // `super(args)`: the base part is built first.
+        let mut prelude: Vec<String> = Vec::new();
+        let mut super_at = None;
+        for (i, st) in body.stmts.iter().enumerate() {
+            if let StmtKind::Expr(x) = &st.kind
+                && let ExprKind::Call { callee, args, .. } = &x.kind
+                && matches!(callee.kind, ExprKind::Super)
+            {
+                let owner = match self.p.calls.get(&x.id) {
+                    Some(Callee::SuperCtor(owner)) => owner.clone(),
+                    _ => s.parent.clone().unwrap_or_default(),
+                };
+                let call = match self.p.struct_info(&owner).and_then(|o| o.ctor) {
+                    Some(ctor) => {
+                        let pf = self.p.funcs[&ctor].clone();
+                        let list = self.user_args(&pf, args, x.span)?;
+                        format!(
+                            "{}::new({list}){}",
+                            pascal(&owner),
+                            if pf.throws { "?" } else { "" }
+                        )
+                    }
+                    None => format!("{}::new()", pascal(&owner)),
+                };
+                prelude.push(format!("let base = {call};"));
+                super_at = Some(i);
+                break;
+            }
+        }
+        let lead: &[Stmt] = match super_at {
+            Some(i) => &body.stmts[..i],
+            None => &[],
+        };
+        let stmts: &[Stmt] = match super_at {
+            Some(i) => &body.stmts[i + 1..],
+            None => &body.stmts,
+        };
         // Parameter properties.
         let mut assigned: Vec<(String, String)> = Vec::new();
         for (i, p) in f.params.iter().enumerate() {
@@ -583,7 +757,7 @@ impl<'a> Gen<'a> {
         }
         // `this.x = expr` statements at the start: field values.
         let mut simple = 0;
-        for st in &body.stmts {
+        for st in stmts {
             let StmtKind::Expr(e) = &st.kind else { break };
             let ExprKind::Assign {
                 op: AssignOp::Assign,
@@ -613,10 +787,25 @@ impl<'a> Gen<'a> {
             assigned.push((prop.clone(), v));
             simple += 1;
         }
-        let rest = &body.stmts[simple..];
+        let rest = &stmts[simple..];
+        if super_at.is_some()
+            && let Some(parent) = &s.parent
+        {
+            for (fname, value) in self.base_fields(parent) {
+                if !assigned.iter().any(|(n, _)| *n == fname) {
+                    assigned.push((fname, value));
+                }
+            }
+        }
         let fields = self.initial_fields(class, s, &assigned);
         let text = self.capture(|g| {
             g.indent += 1;
+            for st in lead {
+                g.stmt(st)?;
+            }
+            for p in &prelude {
+                g.line(p);
+            }
             let fields = fields?;
             if rest.is_empty() {
                 g.line(&format!(
@@ -678,14 +867,19 @@ impl<'a> Gen<'a> {
         Ok(params.join(", "))
     }
 
-    /// A function or a method.
+    /// A function or a method (`rename` gives a method another name: the base class's
+    /// version written for a subclass).
     pub(super) fn function_item(
         &mut self,
         f: &'a Function,
         method: Option<&'a Method>,
+        rename: Option<&str>,
     ) -> GResult<()> {
         let info = self.p.funcs[&f.id].clone();
-        let class = info.method_of.clone();
+        let class = self
+            .current_class
+            .clone()
+            .or_else(|| info.method_of.clone());
         self.push_scope();
         let ret_ty = self.resolve(&info.sig.ret);
         self.fns.push(FnGen {
@@ -749,8 +943,9 @@ impl<'a> Gen<'a> {
         let (name, self_param, vis) = match method {
             Some(m) => {
                 let base = snake(&m.name);
-                let name = match m.kind {
-                    MethodKind::Set => format!("set_{base}"),
+                let name = match (rename, m.kind) {
+                    (Some(r), _) => r.to_string(),
+                    (None, MethodKind::Set) => format!("set_{base}"),
                     _ => base,
                 };
                 let self_param = if m.is_static {
@@ -784,6 +979,252 @@ impl<'a> Gen<'a> {
         self.out.push_str(&body);
         self.line("}");
         Ok(())
+    }
+
+    /// The signature of a method as a trait wants it, and its parameter names.
+    fn method_sig(&mut self, m: &'a Method, mutable: bool) -> GResult<(String, Vec<String>)> {
+        let info = self.p.funcs[&m.func.id].clone();
+        self.push_scope();
+        self.fns.push(self.plain_ctx(
+            m.func.id,
+            info.sig.ret.clone(),
+            info.method_of.clone(),
+            false,
+        ));
+        let params = self.param_list(&m.func, &info);
+        let names: Vec<String> = info.params.iter().map(|b| self.name(*b)).collect();
+        let ret_ty = self.resolve(&info.sig.ret);
+        let ret = self.fn_return_ty(&ret_ty, m.span);
+        self.fns.pop();
+        self.pop_scope();
+        let (params, ret) = (params?, ret?);
+        let ret = if info.throws {
+            format!(" -> Result<{ret}, String>")
+        } else if ret == "()" {
+            String::new()
+        } else {
+            format!(" -> {ret}")
+        };
+        let name = match m.kind {
+            MethodKind::Set => format!("set_{}", snake(&m.name)),
+            _ => snake(&m.name),
+        };
+        let self_param = if mutable { "&mut self" } else { "&self" };
+        let all = if params.is_empty() {
+            self_param.to_string()
+        } else {
+            format!("{self_param}, {params}")
+        };
+        Ok((format!("fn {name}({all}){ret}"), names))
+    }
+
+    /// The methods a class answers to, its own first: (declaring class, method).
+    fn class_methods(&self, class: &str) -> Vec<(String, &'a Method)> {
+        let mut out = Vec::new();
+        let mut seen: Vec<(String, MethodKind)> = Vec::new();
+        for owner in self.p.ancestry(class) {
+            let Some(ast) = self.class_asts.get(&owner).copied() else {
+                continue;
+            };
+            for m in &ast.members {
+                let ClassMember::Method(m) = m else { continue };
+                if m.kind == MethodKind::Constructor
+                    || m.is_static
+                    || seen.contains(&(m.name.clone(), m.kind))
+                {
+                    continue;
+                }
+                seen.push((m.name.clone(), m.kind));
+                out.push((owner.clone(), m));
+            }
+        }
+        out
+    }
+
+    /// A trait per base class held dynamically, with the accessors of its fields and its
+    /// methods, implemented by the class and every subclass.
+    fn trait_items(&mut self) -> GResult<String> {
+        let mut bases: Vec<String> = self.p.polymorphic.iter().cloned().collect();
+        bases.sort();
+        let inspect = self.helpers.contains(&Helper::Inspect);
+        let mut out = String::new();
+        for base in bases {
+            let Some(info) = self.p.struct_info(&base).cloned() else {
+                continue;
+            };
+            let name = pascal(&base);
+            let trait_name = format!("{name}Like");
+            let ancestry = self.p.ancestry(&base);
+            let parent_dyn = ancestry[1..].iter().find(|a| self.p.is_dyn(a)).cloned();
+            let mut supers = vec!["std::fmt::Debug".to_string()];
+            if inspect {
+                supers.push("JsInspect".into());
+            }
+            if let Some(p) = &parent_dyn {
+                supers.push(format!("{}Like", pascal(p)));
+            }
+            // What the base trait already declares is not declared again.
+            let (parent_fields, parent_methods): (Vec<String>, Vec<(String, MethodKind)>) =
+                match &parent_dyn {
+                    Some(p) => (
+                        self.p
+                            .struct_info(p)
+                            .map(|s| s.fields.iter().map(|f| f.name.clone()).collect())
+                            .unwrap_or_default(),
+                        self.class_methods(p)
+                            .iter()
+                            .map(|(_, m)| (m.name.clone(), m.kind))
+                            .collect(),
+                    ),
+                    None => (Vec::new(), Vec::new()),
+                };
+            let fields: Vec<crate::infer::FieldInfo> = info
+                .fields
+                .iter()
+                .filter(|f| !parent_fields.contains(&f.name))
+                .cloned()
+                .collect();
+            let methods: Vec<(String, &'a Method)> = self
+                .class_methods(&base)
+                .into_iter()
+                .filter(|(_, m)| {
+                    !parent_methods.contains(&(m.name.clone(), m.kind))
+                        && m.func.type_params.is_empty()
+                })
+                .collect();
+            let tests: Vec<(String, bool)> = self
+                .instance_tests
+                .iter()
+                .filter(|(b, _, _)| *b == base)
+                .map(|(_, sub, m)| (sub.clone(), *m))
+                .collect();
+            // The trait.
+            let mut lines: Vec<String> = Vec::new();
+            for f in &fields {
+                let ty = if f.optional {
+                    Ty::Option(Box::new(f.ty.clone()))
+                } else {
+                    f.ty.clone()
+                };
+                let t = self.rust_ty(&ty, f.span)?;
+                let fname = snake(&f.name);
+                lines.push(format!("    fn {fname}(&self) -> &{t};"));
+                if self.dyn_setters.contains(&(base.clone(), f.name.clone())) {
+                    lines.push(format!("    fn {fname}_mut(&mut self) -> &mut {t};"));
+                }
+            }
+            let mut sigs: Vec<(String, Vec<String>, String, bool)> = Vec::new();
+            for (owner, m) in &methods {
+                let mutable = self.p.method_mutates(m.func.id);
+                let (sig, names) = self.method_sig(m, mutable)?;
+                lines.push(format!("    {sig};"));
+                sigs.push((sig, names, owner.clone(), mutable));
+                let _ = owner;
+            }
+            for (sub, mutable) in &tests {
+                let target = if self.p.is_dyn(sub) {
+                    format!("dyn {}Like", pascal(sub))
+                } else {
+                    pascal(sub)
+                };
+                lines.push(format!(
+                    "    fn as_{}(&self) -> Option<&{target}>;",
+                    snake(sub)
+                ));
+                if *mutable {
+                    lines.push(format!(
+                        "    fn as_{}_mut(&mut self) -> Option<&mut {target}>;",
+                        snake(sub)
+                    ));
+                }
+            }
+            let clone_name = format!("clone_{}", snake(&base));
+            lines.push(format!(
+                "    fn {clone_name}(&self) -> Box<dyn {trait_name}>;"
+            ));
+            out.push_str(&format!(
+                "\n/// `{base}` and its subclasses.\ntrait {trait_name}: {} {{\n{}\n}}\n",
+                supers.join(" + "),
+                lines.join("\n")
+            ));
+            out.push_str(&format!(
+                "\nimpl Clone for Box<dyn {trait_name}> {{\n    fn clone(&self) -> Self {{\n        self.{clone_name}()\n    }}\n}}\n"
+            ));
+            // The implementations.
+            let mut classes: Vec<String> = vec![base.clone()];
+            classes.extend(self.p.descendants(&base));
+            let order: Vec<String> = self.p.structs.iter().map(|s| s.name.clone()).collect();
+            classes.sort_by_key(|c| order.iter().position(|o| o == c));
+            for c in classes {
+                if self.p.struct_info(&c).is_none_or(|s| s.is_abstract) {
+                    continue;
+                }
+                let cname = pascal(&c);
+                let mut body: Vec<String> = Vec::new();
+                for f in &fields {
+                    let ty = if f.optional {
+                        Ty::Option(Box::new(f.ty.clone()))
+                    } else {
+                        f.ty.clone()
+                    };
+                    let t = self.rust_ty(&ty, f.span)?;
+                    let fname = snake(&f.name);
+                    body.push(format!(
+                        "    fn {fname}(&self) -> &{t} {{\n        &self.{fname}\n    }}"
+                    ));
+                    if self.dyn_setters.contains(&(base.clone(), f.name.clone())) {
+                        body.push(format!(
+                            "    fn {fname}_mut(&mut self) -> &mut {t} {{\n        &mut self.{fname}\n    }}"
+                        ));
+                    }
+                }
+                for (sig, names, _, _) in &sigs {
+                    let method = sig
+                        .trim_start_matches("fn ")
+                        .split('(')
+                        .next()
+                        .unwrap_or_default();
+                    let args = std::iter::once("self".to_string())
+                        .chain(names.iter().cloned())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    body.push(format!(
+                        "    {sig} {{\n        {cname}::{method}({args})\n    }}"
+                    ));
+                }
+                for (sub, mutable) in &tests {
+                    let target = if self.p.is_dyn(sub) {
+                        format!("dyn {}Like", pascal(sub))
+                    } else {
+                        pascal(sub)
+                    };
+                    let is = self.p.is_subclass(&c, sub);
+                    body.push(format!(
+                        "    fn as_{}(&self) -> Option<&{target}> {{\n        {}\n    }}",
+                        snake(sub),
+                        if is { "Some(self)" } else { "None" }
+                    ));
+                    if *mutable {
+                        body.push(format!(
+                            "    fn as_{}_mut(&mut self) -> Option<&mut {target}> {{\n        {}\n    }}",
+                            snake(sub),
+                            if is { "Some(self)" } else { "None" }
+                        ));
+                    }
+                }
+                body.push(format!(
+                    "    fn {clone_name}(&self) -> Box<dyn {trait_name}> {{\n        Box::new(self.clone())\n    }}"
+                ));
+                out.push_str(&format!(
+                    "\nimpl {trait_name} for {cname} {{\n{}\n}}\n",
+                    body.join("\n\n")
+                ));
+                if inspect {
+                    self.mark_inspected(&Ty::Named(c.clone()));
+                }
+            }
+        }
+        Ok(out)
     }
 
     fn main_item(&mut self) -> GResult<()> {

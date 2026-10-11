@@ -480,7 +480,7 @@ impl<'a> Gen<'a> {
         let e = self.expr(x)?;
         // Objects, arrays, maps and sets become strings the way JavaScript does it.
         if self.is_inspect_ty(&ty)
-            && !matches!(self.resolve(&ty), Ty::Named(ref n) if self.p.struct_info(n).is_some_and(|s| s.method("toString", MethodKind::Method).is_some()))
+            && !matches!(self.resolve(&ty), Ty::Named(ref n) if self.p.find_method(n, "toString", MethodKind::Method).is_some())
         {
             if let Some((_, text)) = empty_literal(x) {
                 return Ok((format_text(text), None));
@@ -505,8 +505,8 @@ impl<'a> Gen<'a> {
             && !self.p.is_enum(&n)
             && self
                 .p
-                .struct_info(&n)
-                .is_some_and(|s| s.method("toString", MethodKind::Method).is_some())
+                .find_method(&n, "toString", MethodKind::Method)
+                .is_some()
         {
             let code = self.coerce(e, &ty, Want::Display);
             return Ok(("{}".into(), Some(format!("{code}.to_string()"))));
@@ -954,7 +954,30 @@ impl<'a> Gen<'a> {
                 )?;
                 Ok(E::owned(format!("{rc}.contains_key({key})"), PREC_POSTFIX))
             }
-            BinOp::InstanceOf => self.err("`instanceof` is not supported", e.span),
+            BinOp::InstanceOf => {
+                let ExprKind::Ident(sub) = &right.kind else {
+                    return self.err("`instanceof` needs a class name", right.span);
+                };
+                let Ty::Named(class) = self.resolve(&lt) else {
+                    self.expr(left)?;
+                    return Ok(E::atom("false", Repr::Owned));
+                };
+                if self.p.is_subclass(&class, sub) {
+                    self.expr(left)?;
+                    return Ok(E::atom("true", Repr::Owned));
+                }
+                if self.p.is_dyn(&class) && self.p.is_subclass(sub, &class) {
+                    self.instance_tests
+                        .insert((class.clone(), sub.clone(), false));
+                    let x = self.recv(left)?;
+                    return Ok(E::owned(
+                        format!("{x}.as_{}().is_some()", snake(sub)),
+                        PREC_POSTFIX,
+                    ));
+                }
+                self.expr(left)?;
+                Ok(E::atom("false", Repr::Owned))
+            }
         }
     }
 
@@ -1290,7 +1313,20 @@ impl<'a> Gen<'a> {
         let name = snake(&n.name);
         let copy = self.is_copy(inner);
         let boxed = self.is_boxed(inner) && n.union.is_none();
-        let (source, repr) = if n.union.is_some() {
+        let (source, repr) = if let Some(sub) = &n.instance_of {
+            // `x.as_sub()` gives the subclass when `x` is one.
+            let base = match self.resolve(path_ty) {
+                Ty::Named(b) => b,
+                _ => String::new(),
+            };
+            self.instance_tests.insert((base, sub.clone(), mutated));
+            let recv = Self::paren(&x, PREC_POSTFIX);
+            if mutated {
+                (format!("{recv}.as_{}_mut()", snake(sub)), Repr::RefMut)
+            } else {
+                (format!("{recv}.as_{}()", snake(sub)), Repr::Ref)
+            }
+        } else if n.union.is_some() {
             // The enum is matched where it is: its members are borrowed, or moved when
             // the value is not needed afterwards.
             if mutated {
@@ -1509,6 +1545,14 @@ impl<'a> Gen<'a> {
             Ty::Named(n) => {
                 let info = self.p.struct_info(&n).expect("struct");
                 if info.field(prop).is_some() {
+                    // Through a `dyn` value, a field is read with its accessor.
+                    if self.p.is_dyn(&n) && !matches!(obj.kind, ExprKind::This) {
+                        return Ok(E::new(
+                            format!("{base}.{}()", snake(prop)),
+                            PREC_POSTFIX,
+                            Repr::Ref,
+                        ));
+                    }
                     let repr = if o.repr == Repr::Owned && o.var.is_none() {
                         Repr::Owned
                     } else {
@@ -1518,7 +1562,7 @@ impl<'a> Gen<'a> {
                     x.var = None;
                     return Ok(x);
                 }
-                if info.method(prop, MethodKind::Get).is_some() {
+                if self.p.find_method(&n, prop, MethodKind::Get).is_some() {
                     return Ok(E::owned(format!("{base}.{}()", snake(prop)), PREC_POSTFIX));
                 }
                 self.err(format!("unknown property `{prop}`"), e.span)

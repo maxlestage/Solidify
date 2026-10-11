@@ -7,13 +7,13 @@ struct Point {
 
 #[derive(Debug, Clone, PartialEq)]
 struct Counter {
-    pub count: i64,
     pub name: String,
+    pub count: i64,
 }
 
 impl Counter {
-    pub fn new(name: &str) -> Self {
-        Self { count: 0, name: name.to_string() }
+    pub fn new(name: String) -> Self {
+        Self { name, count: 0 }
     }
 
     pub fn increment(&mut self) {
@@ -33,7 +33,7 @@ fn describe(p: &Point) -> String {
 }
 
 fn main() {
-    let mut c = Counter::new("clicks");
+    let mut c = Counter::new("clicks".to_string());
     c.increment();
     c.increment();
     println!("{}", c.label());
