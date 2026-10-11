@@ -862,6 +862,25 @@ pub(super) type Use = (NodeId, usize, NodeId, Vec<(NodeId, u8)>);
 
 pub(super) type IResult<T> = Result<T, Error>;
 
+/// The native functions the embedded Node modules (`src/node/*.ts`) are written with:
+/// name, parameters (`s` text, `b` boolean), result (`s`, `b`, `i` integer, `a` texts,
+/// `v` nothing).
+pub(crate) const INTRINSICS: &[(&str, &str, char)] = &[
+    ("__fs_read", "s", 's'),
+    ("__fs_write", "ss", 'v'),
+    ("__fs_append", "ss", 'v'),
+    ("__fs_exists", "s", 'b'),
+    ("__fs_is_dir", "s", 'b'),
+    ("__fs_size", "s", 'i'),
+    ("__fs_readdir", "s", 'a'),
+    ("__fs_mkdir", "sb", 'v'),
+    ("__fs_remove", "sb", 'v'),
+    ("__fs_rename", "ss", 'v'),
+    ("__fs_copy", "ss", 'v'),
+    ("__os_info", "s", 's'),
+    ("__os_cpus", "", 'i'),
+];
+
 pub(super) const GLOBALS: &[&str] = &[
     "console",
     "eval",

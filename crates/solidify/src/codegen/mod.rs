@@ -965,6 +965,7 @@ impl<'a> Gen<'a> {
             Helper::Dynamic => "JsValue",
             Helper::Eval => "js_eval",
             Helper::Shared => "Shared",
+            Helper::Node => "js_node_os_info",
         }
     }
 

@@ -13,7 +13,8 @@ use crate::ast::*;
 use crate::error::Span;
 
 /// Rewrites the statements of a file; new nodes take their ids from `next_id`.
-pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
+pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) -> Option<String> {
+    let default_export = common_js(body, next_id);
     eval_declarations(body, next_id);
     for_each_function(body, &mut |f| {
         if let FnBody::Block(b) = &mut f.body {
@@ -27,6 +28,7 @@ pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
     omitted_parameters(body);
     for_each_function(body, &mut |f| rest_arguments(f, &mut ids));
     for_each_class(body, &mut |c| implicit_fields(c));
+    default_export
 }
 
 struct Ids<'a>(&'a mut NodeId);
@@ -998,4 +1000,200 @@ fn proxy_targets(body: &mut [Stmt]) {
         }
     }
     mark(body, &names);
+}
+
+/// CommonJS: `const x = require("m")`, `const { a } = require("m")` become imports;
+/// `module.exports = …` and `exports.x = …` become exports. The name exported by
+/// `module.exports = name` is given back (the default export).
+fn common_js(body: &mut Vec<Stmt>, next_id: &mut NodeId) -> Option<String> {
+    let mut default = None;
+    let mut out = Vec::with_capacity(body.len());
+    for mut s in std::mem::take(body) {
+        let span = s.span;
+        let import =
+            |default: Option<String>, namespace: Option<String>, names, from: String| Stmt {
+                kind: StmtKind::Import(Import {
+                    default,
+                    namespace,
+                    names,
+                    from,
+                    type_only: false,
+                }),
+                span,
+                comments: Vec::new(),
+            };
+        match &mut s.kind {
+            // `const x = require("m")`, `const { a, b: c } = require("m")`.
+            StmtKind::Var(v)
+                if v.decls.len() == 1 && require_of(v.decls[0].init.as_ref()).is_some() =>
+            {
+                let from = require_of(v.decls[0].init.as_ref()).expect("require");
+                match &v.decls[0].pat {
+                    Pattern::Ident { name, .. } => {
+                        out.push(import(Some(name.clone()), None, Vec::new(), from))
+                    }
+                    Pattern::Object { props, .. } => {
+                        let mut names = Vec::new();
+                        for p in props {
+                            let local = match &p.value {
+                                Pattern::Ident { name, .. } => name.clone(),
+                                _ => p.key.clone(),
+                            };
+                            let alias = (local != p.key).then_some(local);
+                            names.push((p.key.clone(), alias));
+                        }
+                        out.push(import(None, None, names, from));
+                    }
+                    _ => out.push(s),
+                }
+                continue;
+            }
+            // `require("m")`: for what it does.
+            StmtKind::Expr(e) if require_of(Some(e)).is_some() => {
+                let from = require_of(Some(e)).expect("require");
+                out.push(import(None, None, Vec::new(), from));
+                continue;
+            }
+            StmtKind::Expr(Expr {
+                kind:
+                    ExprKind::Assign {
+                        op: AssignOp::Assign,
+                        target: AssignTarget::Expr(t),
+                        value,
+                    },
+                ..
+            }) => {
+                // `module.exports = …`
+                if is_path(t, &["module", "exports"]) {
+                    match &value.kind {
+                        ExprKind::Ident(name) => default = Some(name.clone()),
+                        ExprKind::Object(props) => {
+                            let mut names = Vec::new();
+                            for p in props {
+                                let Some(key) = p.key.name() else { continue };
+                                match &p.value {
+                                    PropValue::Shorthand(_) => names.push((key, None)),
+                                    PropValue::Expr(Expr {
+                                        kind: ExprKind::Ident(local),
+                                        ..
+                                    }) => {
+                                        names.push((local.clone(), (*local != key).then_some(key)));
+                                    }
+                                    PropValue::Expr(x) => {
+                                        out.push(export_const(&key, x.clone(), span, next_id));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            out.push(Stmt {
+                                kind: StmtKind::ExportNames(names),
+                                span,
+                                comments: Vec::new(),
+                            });
+                        }
+                        // `module.exports = function f() {}`, `= class {}`…: a name for it.
+                        _ => {
+                            let name = "moduleExports".to_string();
+                            out.push(export_const(&name, (**value).clone(), span, next_id));
+                            default = Some(name);
+                        }
+                    }
+                    continue;
+                }
+                // `exports.x = …`, `module.exports.x = …`
+                if let ExprKind::Member { obj, prop, .. } = &t.kind
+                    && (is_path(obj, &["exports"]) || is_path(obj, &["module", "exports"]))
+                {
+                    out.push(export_const(prop, (**value).clone(), span, next_id));
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        out.push(s);
+    }
+    // `require("m")` inside an expression: an import of its own, read by name.
+    let mut hoisted: Vec<(String, String)> = Vec::new();
+    for_each_expr_mut(&mut out, &mut |e| {
+        if let Some(from) = require_of(Some(e)) {
+            let local = format!(
+                "required_{}",
+                from.chars()
+                    .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+            );
+            if !hoisted.iter().any(|(_, l)| *l == local) {
+                hoisted.push((from, local.clone()));
+            }
+            e.kind = ExprKind::Ident(local);
+            return false;
+        }
+        true
+    });
+    let mut all: Vec<Stmt> = hoisted
+        .into_iter()
+        .map(|(from, local)| Stmt {
+            kind: StmtKind::Import(Import {
+                default: Some(local),
+                namespace: None,
+                names: Vec::new(),
+                from,
+                type_only: false,
+            }),
+            span: Span::default(),
+            comments: Vec::new(),
+        })
+        .collect();
+    all.extend(out);
+    *body = all;
+    default
+}
+
+/// `require("m")`: the module name.
+fn require_of(e: Option<&Expr>) -> Option<String> {
+    let ExprKind::Call { callee, args, .. } = &e?.kind else {
+        return None;
+    };
+    if !matches!(&callee.kind, ExprKind::Ident(n) if n == "require") || args.len() != 1 {
+        return None;
+    }
+    match &args[0].expr.kind {
+        ExprKind::Str(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// Whether `e` is the dotted path `parts` (`module.exports`).
+fn is_path(e: &Expr, parts: &[&str]) -> bool {
+    match (&e.kind, parts) {
+        (ExprKind::Ident(n), [only]) => n == only,
+        (ExprKind::Member { obj, prop, .. }, [rest @ .., last]) if !rest.is_empty() => {
+            prop == last && is_path(obj, rest)
+        }
+        _ => false,
+    }
+}
+
+/// `export const name = value`.
+fn export_const(name: &str, value: Expr, span: Span, next_id: &mut NodeId) -> Stmt {
+    let id = *next_id;
+    *next_id += 1;
+    Stmt {
+        kind: StmtKind::Var(VarDecl {
+            kind: VarKind::Const,
+            decls: vec![Declarator {
+                pat: Pattern::Ident {
+                    name: name.to_string(),
+                    span,
+                    id,
+                },
+                ty: None,
+                init: Some(value),
+                span,
+            }],
+            exported: true,
+        }),
+        span,
+        comments: Vec::new(),
+    }
 }

@@ -61,6 +61,19 @@ fn js_index_of(s: &str, needle: &str) -> i64 {
     }
 }
 
+/// `s.indexOf(needle, from)`.
+#[allow(dead_code)]
+fn js_index_of_from(s: &str, needle: &str, from: i64) -> i64 {
+    let from = from.max(0) as usize;
+    let Some((start, _)) = s.char_indices().nth(from).or((from == s.chars().count()).then_some((s.len(), ' '))) else {
+        return if needle.is_empty() { s.chars().count() as i64 } else { -1 };
+    };
+    match s[start..].find(needle) {
+        Some(byte) => s[..start + byte].chars().count() as i64,
+        None => -1,
+    }
+}
+
 /// `s.padStart(width, pad)`.
 fn js_pad_start(s: &str, width: i64, pad: &str) -> String {
     let len = s.chars().count() as i64;

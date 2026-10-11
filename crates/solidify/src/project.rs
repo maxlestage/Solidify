@@ -9,6 +9,25 @@ use std::path::{Path, PathBuf};
 use crate::ast::{Module, StmtKind};
 use crate::error::{Error, Span};
 
+/// Node's built-in modules, written in TypeScript on a few native functions.
+fn builtin_module(spec: &str) -> Option<(&'static str, &'static str)> {
+    let name = spec.strip_prefix("node:").unwrap_or(spec);
+    Some(match name {
+        "fs" => ("node:fs", include_str!("node/fs.ts")),
+        "fs/promises" => ("node:fs/promises", include_str!("node/fs_promises.ts")),
+        "path" | "path/posix" => ("node:path", include_str!("node/path.ts")),
+        "os" => ("node:os", include_str!("node/os.ts")),
+        "process" => ("node:process", include_str!("node/process.ts")),
+        _ => return None,
+    })
+}
+
+/// What an import names: a file on disk, or a built-in module.
+enum Target {
+    Disk(PathBuf),
+    Builtin(&'static str, &'static str),
+}
+
 /// A file of the program.
 #[derive(Clone, Debug)]
 pub struct FileInfo {
@@ -59,6 +78,24 @@ impl Project {
     /// One source, as the playground or the standard input give it.
     pub fn single(name: Option<&str>, src: &str) -> Result<Project, Error> {
         let module = crate::parser::parse(src)?;
+        // Built-in modules are part of Solidify: no disk needed.
+        let builtin = module.body.iter().any(|s| match &s.kind {
+            StmtKind::Import(i) => builtin_module(&i.from).is_some(),
+            StmtKind::ExportFrom { from, .. } => builtin_module(from).is_some(),
+            _ => false,
+        });
+        if builtin {
+            let mut loader = Loader::new(PathBuf::from("."), false);
+            loader
+                .load_text(
+                    PathBuf::from(name.unwrap_or("<stdin>")),
+                    name.unwrap_or("<stdin>").to_string(),
+                    src.to_string(),
+                    None,
+                )
+                .map_err(|e| Error::new(e.0, Span::default()))?;
+            return Ok(loader.finish());
+        }
         let file = FileInfo {
             name: name.unwrap_or("<stdin>").to_string(),
             module: String::new(),
@@ -81,40 +118,9 @@ impl Project {
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        let mut loader = Loader {
-            root,
-            files: Vec::new(),
-            texts: Vec::new(),
-            bodies: Vec::new(),
-            paths: Vec::new(),
-            stack: Vec::new(),
-            order: Vec::new(),
-            src: String::new(),
-            next_id: 0,
-        };
-        loader.load(entry.to_path_buf(), None)?;
-        let Loader {
-            mut files,
-            mut bodies,
-            order,
-            src,
-            next_id,
-            ..
-        } = loader;
-        name_modules(&mut files);
-        let mut body = Vec::new();
-        for i in order {
-            body.append(&mut bodies[i]);
-        }
-        Ok(Project {
-            files,
-            src,
-            module: Module {
-                body,
-                node_count: next_id,
-                default_export: None,
-            },
-        })
+        let mut loader = Loader::new(root, true);
+        loader.load(Target::Disk(entry.to_path_buf()), None)?;
+        Ok(loader.finish())
     }
 
     /// Translates the program to Rust.
@@ -166,14 +172,89 @@ struct Loader {
     order: Vec<usize>,
     src: String,
     next_id: usize,
+    /// Files on disk can be read (not in the playground).
+    disk: bool,
 }
 
 impl Loader {
+    fn new(root: PathBuf, disk: bool) -> Loader {
+        Loader {
+            root,
+            files: Vec::new(),
+            texts: Vec::new(),
+            bodies: Vec::new(),
+            paths: Vec::new(),
+            stack: Vec::new(),
+            order: Vec::new(),
+            src: String::new(),
+            next_id: 0,
+            disk,
+        }
+    }
+
+    /// The program: every file's statements, the imported ones first.
+    fn finish(self) -> Project {
+        let Loader {
+            mut files,
+            mut bodies,
+            order,
+            src,
+            next_id,
+            ..
+        } = self;
+        name_modules(&mut files);
+        // A name declared in two files: renamed in the later one.
+        if files.len() > 1 {
+            let words: Vec<String> = files
+                .iter()
+                .map(|f| {
+                    f.name
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                        .collect::<String>()
+                        .trim_matches('_')
+                        .to_string()
+                })
+                .collect();
+            let renames = crate::rename::separate_files(&mut bodies, &words);
+            for (f, map) in files.iter_mut().zip(&renames) {
+                if let Some(d) = &f.default_export
+                    && let Some(new) = map.get(d)
+                {
+                    f.default_export = Some(new.clone());
+                }
+            }
+        }
+        let mut body = Vec::new();
+        for i in order {
+            body.append(&mut bodies[i]);
+        }
+        Project {
+            files,
+            src,
+            module: Module {
+                body,
+                node_count: next_id,
+                default_export: None,
+            },
+        }
+    }
+
     fn load(
         &mut self,
-        path: PathBuf,
+        target: Target,
         importer: Option<(usize, usize)>,
     ) -> Result<usize, LoadError> {
+        let path = match target {
+            Target::Builtin(key, text) => {
+                let key_path = PathBuf::from(format!("<{key}>"));
+                if let Some(i) = self.paths.iter().position(|p| *p == key_path) {
+                    return Ok(i);
+                }
+                return self.load_text(key_path, key.to_string(), text.to_string(), None);
+            }
+            Target::Disk(path) => path,
+        };
         let shown = self.display(&path);
         let canonical = path.canonicalize().map_err(|_| match importer {
             Some((file, at)) => self.at(file, at, &format!("cannot find `{shown}`")),
@@ -195,6 +276,17 @@ impl Loader {
         }
         let text = std::fs::read_to_string(&path)
             .map_err(|e| LoadError(format!("error: cannot read {shown}: {e}")))?;
+        self.load_text(canonical, shown, text, Some(path))
+    }
+
+    /// Parses a file's text and loads what it imports (`path`: where it is on disk).
+    fn load_text(
+        &mut self,
+        canonical: PathBuf,
+        shown: String,
+        text: String,
+        path: Option<PathBuf>,
+    ) -> Result<usize, LoadError> {
         let index = self.files.len();
         let start = self.src.len();
         self.src.push_str(&text);
@@ -216,6 +308,17 @@ impl Loader {
             .map_err(|e| self.pretty(index, &e))?;
         self.next_id = module.node_count;
         self.files[index].default_export = module.default_export.clone();
+        let mut module = module;
+        // `import fs from "fs"`: the module itself, like `import * as fs`.
+        for s in &mut module.body {
+            if let StmtKind::Import(i) = &mut s.kind
+                && builtin_module(&i.from).is_some()
+                && i.namespace.is_none()
+                && let Some(d) = i.default.take()
+            {
+                i.namespace = Some(d);
+            }
+        }
         let mut imports: Vec<(usize, String)> = Vec::new();
         for s in &module.body {
             match &s.kind {
@@ -227,34 +330,96 @@ impl Loader {
         self.bodies[index] = module.body;
         self.stack.push(index);
         for (at, spec) in imports {
-            let target = self.resolve(index, at, &path, &spec)?;
+            let target = self.resolve(index, at, path.as_deref(), &spec)?;
             let t = self.load(target, Some((index, at)))?;
             self.files[index].imports.insert(at, t);
+            // `const m = require("./m")` of a file without a default export: the module.
+            if self.files[t].default_export.is_none() {
+                for s in &mut self.bodies[index] {
+                    if s.span.start == at
+                        && let StmtKind::Import(i) = &mut s.kind
+                        && i.namespace.is_none()
+                        && let Some(d) = i.default.take()
+                    {
+                        i.namespace = Some(d);
+                    }
+                }
+            }
         }
         self.stack.pop();
         self.order.push(index);
         Ok(index)
     }
 
-    /// The file a relative specifier names: `./x`, `./x.ts`, `./x.js`, `./dir`.
+    /// What a specifier names: a built-in module (`fs`, `node:path`), a file (`./x`,
+    /// `./x.ts`, `./x.js`, `./dir`), or a package in `node_modules`.
     fn resolve(
         &self,
         file: usize,
         at: usize,
-        from: &Path,
+        from: Option<&Path>,
         spec: &str,
-    ) -> Result<PathBuf, LoadError> {
-        if !(spec.starts_with("./") || spec.starts_with("../")) {
+    ) -> Result<Target, LoadError> {
+        if let Some((key, text)) = builtin_module(spec) {
+            return Ok(Target::Builtin(key, text));
+        }
+        let Some(from) = from.filter(|_| self.disk) else {
             return Err(self.at(
                 file,
                 at,
-                &format!(
-                    "`{spec}` is not one of your files: only relative imports (`./x`) are translated"
-                ),
+                &format!("`{spec}` is read from disk: translate the files with the command line"),
             ));
-        }
+        };
         let base = from.parent().map(Path::to_path_buf).unwrap_or_default();
+        if !(spec.starts_with("./") || spec.starts_with("../") || spec.starts_with('/')) {
+            return self.package(&base, spec).map(Target::Disk).ok_or_else(|| {
+                self.at(
+                    file,
+                    at,
+                    &format!("cannot find the package `{spec}` in a node_modules folder"),
+                )
+            });
+        }
         let target = base.join(spec);
+        Self::file_candidates(&target)
+            .ok_or_else(|| self.at(file, at, &format!("cannot find `{spec}`")))
+            .map(Target::Disk)
+    }
+
+    /// `name`, `@scope/name` or `name/sub/path` in the nearest `node_modules`: the file
+    /// its `package.json` names (`exports`, `module`, `main`, `types`), or `index`.
+    fn package(&self, from: &Path, spec: &str) -> Option<PathBuf> {
+        let mut parts = spec.splitn(if spec.starts_with('@') { 3 } else { 2 }, '/');
+        let name = if spec.starts_with('@') {
+            format!("{}/{}", parts.next()?, parts.next()?)
+        } else {
+            parts.next()?.to_string()
+        };
+        let sub = parts.next();
+        let mut dir = Some(from.to_path_buf());
+        while let Some(d) = dir {
+            let pkg = d.join("node_modules").join(&name);
+            if pkg.is_dir() {
+                if let Some(sub) = sub {
+                    return Self::file_candidates(&pkg.join(sub));
+                }
+                let manifest =
+                    std::fs::read_to_string(pkg.join("package.json")).unwrap_or_default();
+                for entry in package_entries(&manifest) {
+                    if let Some(f) = Self::file_candidates(&pkg.join(entry)) {
+                        return Some(f);
+                    }
+                }
+                return Self::file_candidates(&pkg.join("index"));
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
+        None
+    }
+
+    /// The file a path names, with the extensions TypeScript allows.
+    fn file_candidates(target: &Path) -> Option<PathBuf> {
+        let target = target.to_path_buf();
         let mut candidates = vec![target.clone()];
         if let Some(ext) = target.extension().and_then(|e| e.to_str()) {
             if matches!(ext, "js" | "mjs" | "cjs" | "jsx") {
@@ -271,10 +436,7 @@ impl Loader {
         for ext in ["ts", "mts", "js"] {
             candidates.push(target.join(format!("index.{ext}")));
         }
-        candidates
-            .into_iter()
-            .find(|c| c.is_file())
-            .ok_or_else(|| self.at(file, at, &format!("cannot find `{spec}`")))
+        candidates.into_iter().find(|c| c.is_file())
     }
 
     /// A path as shown in messages: relative to the entry file's directory.
@@ -312,6 +474,35 @@ impl Loader {
             1,
         ))
     }
+}
+
+/// The entry points a `package.json` names, most fitting first: the TypeScript
+/// sources, then the ES module, then the main file.
+fn package_entries(manifest: &str) -> Vec<String> {
+    let field = |key: &str| -> Option<String> {
+        let at = manifest.find(&format!("\"{key}\""))?;
+        let rest = manifest[at + key.len() + 2..]
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start();
+        let rest = rest.strip_prefix('"')?;
+        Some(rest[..rest.find('"')?].to_string())
+    };
+    // `"exports": { ".": { "import": "./x.js" } }` or `"exports": "./x.js"`: the first
+    // path given after the key.
+    let exports = manifest.find("\"exports\"").and_then(|at| {
+        let rest = &manifest[at..];
+        let start = rest.find("\"./")? + 1;
+        let end = rest[start..].find('"')? + start;
+        Some(rest[start..end].to_string())
+    });
+    ["source", "types", "typings"]
+        .iter()
+        .filter_map(|k| field(k))
+        .map(|t| t.trim_end_matches(".d.ts").to_string())
+        .chain(exports)
+        .chain(["module", "main"].iter().filter_map(|k| field(k)))
+        .collect()
 }
 
 /// Gives every imported file a Rust module name from its path.
