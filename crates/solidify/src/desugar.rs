@@ -14,6 +14,8 @@ use crate::error::Span;
 
 /// Rewrites the statements of a file; new nodes take their ids from `next_id`.
 pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) -> Option<String> {
+    plain_syntax(body, next_id);
+    static_state(body, next_id);
     let default_export = common_js(body, next_id);
     eval_declarations(body, next_id);
     for_each_function(body, &mut |f| {
@@ -32,6 +34,364 @@ pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) -> Option<String> {
     for_each_function(body, &mut |f| rest_arguments(f, &mut ids));
     for_each_class(body, &mut |c| implicit_fields(c));
     default_export
+}
+
+// ----- syntax with a plainer form -----
+
+/// Tagged templates become calls, `const A = class { … }` a class declaration, and
+/// static blocks the statements after their class.
+fn plain_syntax(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
+    let mut ids = Ids(next_id);
+    // `` tag`a${x}b` `` is `tag(["a", "b"], x)`.
+    for_each_expr_mut(body, &mut |e| {
+        if let ExprKind::Tagged { .. } = e.kind {
+            let ExprKind::Tagged { tag, quasis, exprs } =
+                std::mem::replace(&mut e.kind, ExprKind::Undefined)
+            else {
+                unreachable!()
+            };
+            let span = e.span;
+            let strings: Vec<ArrayElem> = quasis
+                .into_iter()
+                .map(|q| ArrayElem::Expr(ids.expr(ExprKind::Str(q), span)))
+                .collect();
+            let mut args = vec![Arg {
+                expr: ids.expr(ExprKind::Array(strings), span),
+                spread: false,
+            }];
+            args.extend(exprs.into_iter().map(|expr| Arg {
+                expr,
+                spread: false,
+            }));
+            e.kind = ExprKind::Call {
+                callee: tag,
+                args,
+                optional: false,
+                type_args: Vec::new(),
+            };
+        }
+        true
+    });
+    each_list(body, &mut class_statements);
+    for_each_function(body, &mut |func| {
+        if let FnBody::Block(b) = &mut func.body {
+            each_list(&mut b.stmts, &mut class_statements);
+        }
+    });
+}
+
+/// Calls `f` on a list of statements and on every list nested in its statements (not in
+/// functions).
+fn each_list(stmts: &mut Vec<Stmt>, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
+    f(stmts);
+    for s in stmts.iter_mut() {
+        each_list_in(s, f);
+    }
+}
+
+fn each_list_in(s: &mut Stmt, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
+    match &mut s.kind {
+        StmtKind::Block(b) => each_list(&mut b.stmts, f),
+        StmtKind::If {
+            then, otherwise, ..
+        } => {
+            each_list_in(then, f);
+            if let Some(o) = otherwise {
+                each_list_in(o, f);
+            }
+        }
+        StmtKind::While { body, .. }
+        | StmtKind::DoWhile { body, .. }
+        | StmtKind::For { body, .. }
+        | StmtKind::ForOf { body, .. }
+        | StmtKind::Labeled { body, .. } => each_list_in(body, f),
+        StmtKind::Switch { cases, .. } => {
+            for c in cases {
+                each_list(&mut c.body, f);
+            }
+        }
+        StmtKind::Try {
+            block,
+            catch,
+            finally,
+        } => {
+            each_list(&mut block.stmts, f);
+            if let Some(c) = catch {
+                each_list(&mut c.body.stmts, f);
+            }
+            if let Some(b) = finally {
+                each_list(&mut b.stmts, f);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `const A = class { … }` is `class A { … }`; a class's `static { … }` blocks run right
+/// after it, with `this` the class.
+fn class_statements(stmts: &mut Vec<Stmt>) {
+    let mut i = 0;
+    while i < stmts.len() {
+        if let StmtKind::Var(v) = &mut stmts[i].kind
+            && v.decls.len() == 1
+            && let Pattern::Ident { name, .. } = &v.decls[0].pat
+            && let Some(Expr {
+                kind: ExprKind::Class(_),
+                ..
+            }) = &v.decls[0].init
+        {
+            let name = name.clone();
+            let exported = v.exported;
+            let Some(Expr {
+                kind: ExprKind::Class(mut c),
+                ..
+            }) = v.decls[0].init.take()
+            else {
+                unreachable!()
+            };
+            c.name = name;
+            c.exported = exported;
+            stmts[i].kind = StmtKind::Class(*c);
+        }
+        if let StmtKind::Class(c) = &mut stmts[i].kind
+            && c.members
+                .iter()
+                .any(|m| matches!(m, ClassMember::StaticBlock(_)))
+        {
+            let class = c.name.clone();
+            let mut blocks = Vec::new();
+            c.members.retain_mut(|m| match m {
+                ClassMember::StaticBlock(b) => {
+                    blocks.push(std::mem::replace(
+                        b,
+                        Block {
+                            stmts: Vec::new(),
+                            span: b.span,
+                        },
+                    ));
+                    false
+                }
+                _ => true,
+            });
+            for (k, mut b) in blocks.into_iter().enumerate() {
+                for_each_expr_mut(&mut b.stmts, &mut |e| {
+                    if matches!(e.kind, ExprKind::This) {
+                        e.kind = ExprKind::Ident(class.clone());
+                    }
+                    // `this` in a function of its own is another one.
+                    !matches!(e.kind, ExprKind::Func(_) | ExprKind::Class(_))
+                });
+                let span = b.span;
+                stmts.insert(
+                    i + 1 + k,
+                    Stmt {
+                        kind: StmtKind::Block(b),
+                        span,
+                        comments: Vec::new(),
+                    },
+                );
+            }
+        }
+        i += 1;
+    }
+}
+
+/// Static fields of top-level classes that change, or hold more than a literal: variables
+/// of the module, `C.f` and `this.f` in static methods read and write them.
+fn static_state(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
+    use std::collections::{HashMap, HashSet};
+    let mut parents: HashMap<String, Option<String>> = HashMap::new();
+    let mut fields: HashMap<String, Vec<String>> = HashMap::new();
+    for s in body.iter() {
+        if let StmtKind::Class(c) = &s.kind {
+            let parent = match c.extends.as_ref().map(|e| &e.kind) {
+                Some(ExprKind::Ident(p)) => Some(p.clone()),
+                _ => None,
+            };
+            parents.insert(c.name.clone(), parent);
+            let statics: Vec<String> = c
+                .members
+                .iter()
+                .filter_map(|m| match m {
+                    ClassMember::Field(f) if f.is_static => Some(f.name.clone()),
+                    _ => None,
+                })
+                .collect();
+            if !statics.is_empty() {
+                fields.insert(c.name.clone(), statics);
+            }
+        }
+    }
+    if fields.is_empty() {
+        return;
+    }
+    // The class declaring `f` for `X.f`: X or one of its bases.
+    let owner = |x: &str, f: &str| -> Option<String> {
+        let mut c = Some(x.to_string());
+        let mut steps = 0;
+        while let Some(name) = c {
+            if fields
+                .get(&name)
+                .is_some_and(|fs| fs.iter().any(|g| g == f))
+            {
+                return Some(name);
+            }
+            c = parents.get(&name).cloned().flatten();
+            steps += 1;
+            if steps > 64 {
+                break;
+            }
+        }
+        None
+    };
+    // `this.f` in a static method is `C.f`.
+    for s in body.iter_mut() {
+        let StmtKind::Class(c) = &mut s.kind else {
+            continue;
+        };
+        let class = c.name.clone();
+        for m in &mut c.members {
+            let ClassMember::Method(m) = m else { continue };
+            if !m.is_static {
+                continue;
+            }
+            fn_body_mut(&mut m.func, &mut |e| {
+                if let ExprKind::Member { obj, prop, .. } = &mut e.kind
+                    && matches!(obj.kind, ExprKind::This)
+                    && owner(&class, prop).is_some()
+                {
+                    obj.kind = ExprKind::Ident(class.clone());
+                }
+                !matches!(e.kind, ExprKind::Func(_) | ExprKind::Class(_))
+            });
+        }
+    }
+    // Which ones change.
+    let mut changed: HashSet<(String, String)> = HashSet::new();
+    for_each_expr(body, &mut |e| {
+        let target = match &e.kind {
+            ExprKind::Assign {
+                target: AssignTarget::Expr(t),
+                ..
+            } => Some(&**t),
+            ExprKind::Update { arg, .. } => Some(&**arg),
+            _ => None,
+        };
+        if let Some(Expr {
+            kind: ExprKind::Member { obj, prop, .. },
+            ..
+        }) = target
+            && let ExprKind::Ident(x) = &obj.kind
+            && let Some(o) = owner(x, prop)
+        {
+            changed.insert((o, prop.clone()));
+        }
+        true
+    });
+    let literal = |e: &Expr| match &e.kind {
+        ExprKind::Num { .. } | ExprKind::Str(_) | ExprKind::Bool(_) => true,
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            arg,
+        } => matches!(arg.kind, ExprKind::Num { .. }),
+        _ => false,
+    };
+    let taken: HashSet<String> = body.iter().flat_map(declared_names).collect();
+    let mut vars: HashMap<(String, String), String> = HashMap::new();
+    let mut ids = Ids(next_id);
+    let mut i = 0;
+    while i < body.len() {
+        let StmtKind::Class(c) = &mut body[i].kind else {
+            i += 1;
+            continue;
+        };
+        let class = c.name.clone();
+        let exported = c.exported;
+        let mut moved = Vec::new();
+        c.members.retain_mut(|m| {
+            let ClassMember::Field(f) = m else {
+                return true;
+            };
+            let is_changed = changed.contains(&(class.clone(), f.name.clone()));
+            let keep = !f.is_static
+                || match &f.init {
+                    Some(init) => literal(init) && !is_changed,
+                    None => !is_changed,
+                };
+            if !keep {
+                moved.push(f.clone());
+            }
+            keep
+        });
+        let mut at = i + 1;
+        for f in moved {
+            let mut first = class.chars();
+            let base = first
+                .next()
+                .map(|h| h.to_lowercase().collect::<String>() + first.as_str())
+                .unwrap_or_default();
+            let mut fc = f.name.chars();
+            let field = fc
+                .next()
+                .map(|h| h.to_uppercase().collect::<String>() + fc.as_str())
+                .unwrap_or_default();
+            let mut name = format!("{base}{field}");
+            while taken.contains(&name) {
+                name.push_str("Static");
+            }
+            vars.insert((class.clone(), f.name.clone()), name.clone());
+            let span = f.span;
+            let init = f.init;
+            let id = ids.next();
+            body.insert(
+                at,
+                Stmt {
+                    kind: StmtKind::Var(VarDecl {
+                        kind: VarKind::Let,
+                        decls: vec![Declarator {
+                            pat: Pattern::Ident { name, span, id },
+                            ty: f.ty,
+                            init,
+                            span,
+                        }],
+                        exported,
+                    }),
+                    span,
+                    comments: Vec::new(),
+                },
+            );
+            at += 1;
+        }
+        i = at;
+    }
+    if vars.is_empty() {
+        return;
+    }
+    for_each_expr_mut(body, &mut |e| {
+        if let ExprKind::Member { obj, prop, .. } = &e.kind
+            && let ExprKind::Ident(x) = &obj.kind
+            && let Some(o) = owner(x, prop)
+            && let Some(v) = vars.get(&(o, prop.clone()))
+        {
+            e.kind = ExprKind::Ident(v.clone());
+            return false;
+        }
+        true
+    });
+}
+
+/// The names a top-level statement declares.
+fn declared_names(s: &Stmt) -> Vec<String> {
+    match &s.kind {
+        StmtKind::Var(v) => v
+            .decls
+            .iter()
+            .flat_map(|d| d.pat.names().into_iter().map(|(n, _)| n.to_string()))
+            .collect(),
+        StmtKind::Func(f) => f.name.clone().into_iter().collect(),
+        StmtKind::Class(c) => vec![c.name.clone()],
+        _ => Vec::new(),
+    }
 }
 
 struct Ids<'a>(&'a mut NodeId);
