@@ -1592,7 +1592,7 @@ impl<'a> Gen<'a> {
             Ty::Named(n) if n == "RegExp" => Ok(match prop {
                 "source" => E::owned(format!("{base}.source()"), PREC_POSTFIX),
                 "flags" => E::owned(format!("{base}.flags()"), PREC_POSTFIX),
-                "lastIndex" => E::atom("0", Repr::Owned),
+                "lastIndex" => E::owned(format!("{base}.last_index()"), PREC_POSTFIX),
                 _ => {
                     let flag = match prop {
                         "global" => 'g',
@@ -1996,6 +1996,8 @@ pub(super) fn narrow_path_expr(e: &Expr) -> &Expr {
             match &value.kind {
                 ExprKind::TypeOf(x) => x,
                 ExprKind::Member { obj, .. } if matches!(other.kind, ExprKind::Str(_)) => obj,
+                // `(m = re.exec(s)) !== null`: the test binds the value assigned.
+                ExprKind::Assign { value: rhs, .. } => rhs,
                 _ => value,
             }
         }

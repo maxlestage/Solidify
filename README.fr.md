@@ -113,7 +113,7 @@ Trois passes, toutes déterministes :
 | `A \| B`, `[1, "two"]`, unions discriminées, `typeof x === "string"`, `"kind" in x` | `enum` avec une variante par membre, `match` |
 | `function*`, `yield`, `yield*` | `JsGenerator<T>`, `for x in gen` |
 | `setTimeout`, `setInterval`, `clearTimeout`, `new Promise`, `Promise.all` | une boucle d'événements lancée par `main`, `JsPromise` |
-| `/regex/flags`, `new RegExp`, `test`, `exec`, `match`, `matchAll`, `replace`, `split`, `search` | `JsRegex`, un moteur à retour arrière livré dans le fichier généré |
+| `/regex/flags`, `new RegExp`, `test`, `exec`, `match`, `matchAll`, `replace`, `split`, `search`, `lastIndex`, `while ((m = re.exec(s)) !== null)` | `JsRegex`, un moteur à retour arrière livré dans le fichier généré, `while let Some(m) = re.exec(&s)` |
 | `JSON.stringify(v, null, 2)`, `JSON.parse` vers un type annoté | la `JsValue` de la valeur, un `JsFromJson` généré pour le type lu |
 | `import`, `export`, `export default`, `import * as ns`, `export … from` | un `mod` par fichier importé, `pub` pour les exports |
 | `console.log` d'objets, tableaux, maps, sets, valeurs imbriquées | le texte exact qu'imprime Node.js (règles de `util.inspect`) |

@@ -96,7 +96,11 @@ impl<'m> Infer<'m> {
             StmtKind::While { test, body } => {
                 let (pos, _) = self.condition(test)?;
                 for n in &pos {
-                    if let Some(t) = self.narrow_tests.get_mut(&n.test_id) {
+                    // The value may change in the body: read through the variable, except
+                    // when the test assigns it, which `while let` does afresh each time.
+                    if !self.assign_tests.contains(&n.test_id)
+                        && let Some(t) = self.narrow_tests.get_mut(&n.test_id)
+                    {
                         t.unwrap = true;
                     }
                 }
@@ -299,6 +303,9 @@ impl<'m> Infer<'m> {
     fn var_decl(&mut self, v: &'m VarDecl) -> IResult<()> {
         let top = self.fns.len() == 1 && self.scopes.len() == 1;
         for d in &v.decls {
+            if !top {
+                self.check_redeclaration(v.kind, &d.pat)?;
+            }
             let hint = match &d.pat {
                 Pattern::Ident { name, .. } => name.clone(),
                 _ => String::new(),
@@ -687,11 +694,27 @@ impl<'m> Infer<'m> {
                 let null_right = matches!(right.kind, ExprKind::Null | ExprKind::Undefined);
                 let null_left = matches!(left.kind, ExprKind::Null | ExprKind::Undefined);
                 if null_right || null_left {
-                    let value = if null_right { left } else { right };
+                    let value: &'m Expr = if null_right { left } else { right };
                     let positive = matches!(op, BinOp::NotEq | BinOp::StrictNotEq);
                     let other = if null_right { right } else { left };
                     self.set_ty(other.id, Ty::Null);
                     self.set_ty(e.id, Ty::Bool);
+                    // `(m = re.exec(s)) !== null`: the assignment happens, then `m` is tested.
+                    let value: &'m Expr = match &value.kind {
+                        ExprKind::Assign {
+                            op: AssignOp::Assign,
+                            target: AssignTarget::Expr(t),
+                            ..
+                        } if matches!(t.kind, ExprKind::Ident(_)) => {
+                            self.expr(value, None)?;
+                            if let Some(b) = self.root_binding(t) {
+                                self.assign_narrowed.entry(b).or_default().push(t.id);
+                            }
+                            self.assign_tests.insert(e.id);
+                            t
+                        }
+                        _ => value,
+                    };
                     if let Some(n) = self.narrow_value(value, e.id, positive)? {
                         return Ok(if positive {
                             (vec![n], Vec::new())
