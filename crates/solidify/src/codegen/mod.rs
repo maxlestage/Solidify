@@ -146,6 +146,8 @@ pub(super) struct FnGen {
     pub class: Option<String>,
     /// Closure counter for unique labels.
     pub labels: usize,
+    /// `this` is the handle of a shared object (`Shared<Self>`).
+    pub handle_this: bool,
 }
 
 pub(super) struct Gen<'a> {
@@ -165,6 +167,8 @@ pub(super) struct Gen<'a> {
     pub json_types: BTreeSet<String>,
     /// The expressions being written before their conversion to or from a `JsValue`.
     pub casting: HashSet<NodeId>,
+    /// Shared classes whose constructor returns the handle.
+    pub ctor_gives_handle: HashSet<String>,
     /// Fields read (or written: `true`) on union values: accessors on the enum.
     pub union_accessors: BTreeSet<(String, String, bool)>,
     /// Unions whose `typeof` is taken.
@@ -279,6 +283,7 @@ fn generate_with(
         inspected: BTreeSet::new(),
         json_types: BTreeSet::new(),
         casting: HashSet::new(),
+        ctor_gives_handle: HashSet::new(),
         union_accessors: BTreeSet::new(),
         union_typeof: BTreeSet::new(),
         current_class: None,
@@ -797,6 +802,7 @@ pub fn pascal(name: &str) -> String {
         "Self",
         "LazyLock",
         "Mutex",
+        "JsStatic",
         "Fn",
         "FnMut",
         "Iterator",
@@ -825,7 +831,7 @@ pub fn pascal(name: &str) -> String {
 }
 
 fn escape_keyword(name: String) -> String {
-    if name == "self" || name == "Self" || name == "super" || name == "crate" {
+    if name == "self" || name == "Self" || name == "super" || name == "crate" || name == "main" {
         return format!("{name}_");
     }
     if RUST_KEYWORDS.contains(&name.as_str()) {
@@ -900,6 +906,10 @@ impl<'a> Gen<'a> {
         if h == Helper::Eval {
             self.helper(Helper::Dynamic);
         }
+        if h == Helper::Shared {
+            self.helpers.insert(Helper::Inspect);
+            self.helpers.insert(Helper::NumText);
+        }
         if h == Helper::Dynamic {
             self.helpers.extend([
                 Helper::Inspect,
@@ -954,6 +964,7 @@ impl<'a> Gen<'a> {
             Helper::Date => "JsDate",
             Helper::Dynamic => "JsValue",
             Helper::Eval => "js_eval",
+            Helper::Shared => "Shared",
         }
     }
 
@@ -1452,13 +1463,14 @@ impl<'a> Gen<'a> {
     pub(super) fn fluent(&self, info: &FnInfo) -> bool {
         info.returns_this
             && info.method_of.as_ref().is_some_and(|c| {
-                !self.p.ancestry(c).iter().any(|a| {
-                    self.p.is_dyn(a)
-                        || self
-                            .p
-                            .struct_info(a)
-                            .is_some_and(|s| s.implements.iter().any(|i| self.p.is_dyn(i)))
-                })
+                !self.p.is_shared(c)
+                    && !self.p.ancestry(c).iter().any(|a| {
+                        self.p.is_dyn(a)
+                            || self
+                                .p
+                                .struct_info(a)
+                                .is_some_and(|s| s.implements.iter().any(|i| self.p.is_dyn(i)))
+                    })
             })
     }
 
@@ -1785,7 +1797,12 @@ impl<'a> Gen<'a> {
                         _ => Vec::new(),
                     };
                     let generics = self.type_args(&n, &args, span)?;
-                    format!("{}{generics}", pascal(&n))
+                    if self.p.is_shared(&n) {
+                        let h = self.helper(Helper::Shared);
+                        format!("{h}<{}{generics}>", pascal(&n))
+                    } else {
+                        format!("{}{generics}", pascal(&n))
+                    }
                 }
             }
             Ty::Func(f) => {

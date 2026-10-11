@@ -9,6 +9,30 @@ use crate::ast::*;
 use crate::types::Ty;
 
 impl<'a> Gen<'a> {
+    /// Whether `this` is the handle of a shared object (in its methods).
+    pub(super) fn this_is_handle(&self) -> bool {
+        self.fns.last().is_some_and(|f| {
+            f.handle_this
+                || (!f.in_ctor
+                    && f.this_name == "self"
+                    && f.class.as_ref().is_some_and(|c| self.p.is_shared(c)))
+        })
+    }
+
+    /// Whether `obj` (of struct `n`) is reached through a shared handle.
+    pub(super) fn through_handle(&self, obj: &Expr, n: &str) -> bool {
+        self.p.is_shared(n) && (!matches!(obj.kind, ExprKind::This) || self.this_is_handle())
+    }
+
+    /// A shared object, or maybe one: held by a handle, cloned to be kept.
+    pub(super) fn holds_shared(&self, ty: &Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Named(n, _) => self.p.is_shared(&n),
+            Ty::Option(t) => self.holds_shared(&t),
+            _ => false,
+        }
+    }
+
     pub(super) fn is_dynamic(&self, ty: &Ty) -> bool {
         self.resolve(ty).is_dynamic()
     }
