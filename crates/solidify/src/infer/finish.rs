@@ -304,6 +304,18 @@ fn exclusive(a: &[(NodeId, u8)], b: &[(NodeId, u8)]) -> bool {
         .any(|((ta, sa), (tb, sb))| ta == tb && sa != sb)
 }
 
+/// The next type parameter name not yet in `taken`.
+pub(super) fn fresh_type_param(taken: &[String]) -> String {
+    let mut n = 0;
+    loop {
+        let name = type_param_name(n);
+        if !taken.contains(&name) {
+            return name;
+        }
+        n += 1;
+    }
+}
+
 fn type_param_name(n: usize) -> String {
     let letters = ["T", "U", "V", "W", "X", "Y", "Z"];
     match letters.get(n) {
@@ -312,7 +324,7 @@ fn type_param_name(n: usize) -> String {
     }
 }
 
-fn collect_vars(types: &Types, t: &Ty, out: &mut Vec<usize>) {
+pub(super) fn collect_vars(types: &Types, t: &Ty, out: &mut Vec<usize>) {
     match types.resolve(t) {
         Ty::Var(v) => {
             if !out.contains(&v) {

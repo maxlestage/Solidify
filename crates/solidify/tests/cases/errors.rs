@@ -10,7 +10,7 @@ fn parse_positive(s: &str) -> Result<f64, String> {
 }
 
 fn sum(items: &[String]) -> Result<f64, String> {
-    let mut t = 0.0;
+    let mut t: f64 = 0.0;
     for item in items {
         t += parse_positive(item.as_str())?;
     }

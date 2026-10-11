@@ -533,16 +533,35 @@ impl<'a> Gen<'a> {
             ExprKind::Arrow(f) | ExprKind::Func(f) => self.closure(f, &[], true)?,
             _ => self.expr(init)?,
         };
+        if x.repr == Repr::OptRef && !var.stored && !var.captured {
+            let m = if var.reassigned { "mut " } else { "" };
+            let name = self.bind(id, Repr::OptRef);
+            self.line(&format!("let {m}{name} = {};", x.code));
+            return Ok(());
+        }
         let usize_value = x.repr == Repr::Usize && fixed && !var.stored;
         let value = if usize_value {
             x.code.clone()
         } else {
             self.owned_as(x, &it, ty)
         };
+        let float_literal = match &init.kind {
+            ExprKind::Num { .. } => self.is_float(ty),
+            ExprKind::Unary { op: UnaryOp::Neg, arg } => matches!(arg.kind, ExprKind::Num { .. }) && self.is_float(ty),
+            ExprKind::Array(elems) => {
+                matches!(self.resolve(ty), Ty::Array(ref item) if self.is_float(item))
+                    && elems.iter().all(|el| {
+                        matches!(el, ArrayElem::Expr(x) if matches!(&x.kind, ExprKind::Num { .. })
+                            || matches!(&x.kind, ExprKind::Unary { op: UnaryOp::Neg, arg } if matches!(arg.kind, ExprKind::Num { .. })))
+                    })
+            }
+            _ => false,
+        };
         let needs_type = matches!(
             value.as_str(),
             "Vec::new()" | "HashMap::new()" | "HashSet::new()" | "None" | "String::new()"
-        ) || matches!(self.resolve(&it), Ty::Null);
+        ) || matches!(self.resolve(&it), Ty::Null)
+            || float_literal;
         let closure_mut = match &init.kind {
             ExprKind::Arrow(f) | ExprKind::Func(f) => self.p.funcs[&f.id]
                 .captures
@@ -615,6 +634,32 @@ impl<'a> Gen<'a> {
         Ok(format!("{target} {}= {one}", if inc { "+" } else { "-" }))
     }
 
+    /// A nullable value as an `Option<&T>`: borrowed from where it lives.
+    fn borrowed_option(&mut self, value: &'a Expr) -> GResult<String> {
+        if let ExprKind::Cond { test, cons, alt } = &value.kind
+            && self.negative_narrow(test).is_none()
+        {
+            let c = self.cond(test)?;
+            let a = self.borrowed_option(cons)?;
+            let b = self.borrowed_option(alt)?;
+            return Ok(format!("if {c} {{ {a} }} else {{ {b} }}"));
+        }
+        let ty = self.ty_of(value);
+        let x = self.expr(value)?;
+        let inner = match self.resolve(&ty) {
+            Ty::Option(inner) => self.resolve(&inner),
+            Ty::Null => return Ok("None".into()),
+            other => other,
+        };
+        Ok(match x.repr {
+            Repr::OptRef => x.code,
+            _ if self.is_str(&inner) || self.is_boxed(&inner) => {
+                format!("{}.as_deref()", Self::paren(&x, PREC_POSTFIX))
+            }
+            _ => format!("{}.as_ref()", Self::paren(&x, PREC_POSTFIX)),
+        })
+    }
+
     /// The code of an assignment target.
     fn place(&mut self, x: E) -> String {
         match x.repr {
@@ -683,6 +728,11 @@ impl<'a> Gen<'a> {
             && op == AssignOp::Assign
         {
             let name = self.name(b);
+            if self.repr_of(b) == Repr::OptRef {
+                let v = self.borrowed_option(value)?;
+                self.line(&format!("{name} = {v};"));
+                return Ok(());
+            }
             let want = if self.repr_of(b) == Repr::RefMut {
                 Want::RefMut
             } else {
@@ -692,7 +742,15 @@ impl<'a> Gen<'a> {
             self.line(&format!("{name} = {v};"));
             return Ok(());
         }
-        let x = self.expr(t)?;
+        // The variable itself, even inside a region where it is narrowed.
+        let x = match (&t.kind, self.p.refs.get(&t.id)) {
+            (ExprKind::Ident(_), Some(&b)) => {
+                let mut x = E::atom(self.name(b), self.repr_of(b));
+                x.var = Some((b, t.id));
+                x
+            }
+            _ => self.expr(t)?,
+        };
         let place = self.place(x);
         match op {
             AssignOp::Assign => {
@@ -909,12 +967,6 @@ impl<'a> Gen<'a> {
         {
             let mut n = n.clone();
             n.positive = false;
-            // The `let_else` flag lives on the `!x` test's own entry when present.
-            if let Some(outer) = self.p.narrow_tests.get(&test.id) {
-                n.let_else = outer.let_else;
-            } else {
-                n.let_else = false;
-            }
             return Some((n, narrow_path_expr(arg)));
         }
         None
@@ -1155,8 +1207,16 @@ impl<'a> Gen<'a> {
         let (source, elem_repr, enumerate) = if let Some((obj, method, enumerate)) = direct {
             let o = self.expr(obj)?;
             let base = Self::paren(&o, PREC_POSTFIX);
+            let changed_in_loop =
+                o.var.is_some_and(|(b, _)| self.p.var(b).mutated) && body_mutates(body, obj);
             if method == "keys" {
                 (format!("0..{base}.len()"), Repr::Usize, false)
+            } else if changed_in_loop && matches!(method, "keys()" | "values()") {
+                (
+                    format!("{base}.{method}.cloned().collect::<Vec<_>>()"),
+                    Repr::Owned,
+                    enumerate,
+                )
             } else {
                 (format!("{base}.{method}"), Repr::Ref, enumerate)
             }
@@ -1719,6 +1779,28 @@ fn walk(s: &Stmt, f: &mut dyn FnMut(&Stmt) -> bool, stop_at_loops: bool) -> bool
         StmtKind::Labeled { body, .. } => walk(body, f, stop_at_loops),
         _ => false,
     }
+}
+
+/// Whether the loop body changes the collection it iterates (a method call on it).
+fn body_mutates(body: &Stmt, obj: &Expr) -> bool {
+    let ExprKind::Ident(name) = &obj.kind else {
+        return false;
+    };
+    walk(
+        body,
+        &mut |st| match &st.kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { callee, .. },
+                ..
+            }) => {
+                matches!(&callee.kind, ExprKind::Member { obj, prop, .. }
+                if matches!(&obj.kind, ExprKind::Ident(n) if n == name)
+                    && matches!(prop.as_str(), "set" | "delete" | "clear" | "add" | "push" | "pop" | "splice" | "shift" | "unshift"))
+            }
+            _ => false,
+        },
+        false,
+    )
 }
 
 /// Whether the body assigns to the variable (the loop variable of a counted loop).

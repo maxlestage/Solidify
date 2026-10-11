@@ -19,6 +19,14 @@ impl<'a> Gen<'a> {
                 let x = self.expr_plain(e)?;
                 let base = Self::paren(&x, PREC_POSTFIX);
                 let mutable = t.mutated || x.repr == Repr::RefMut || self.root_is_mut(e);
+                if x.repr == Repr::OptRef {
+                    let repr = if self.is_str(&t.inner) {
+                        Repr::Str
+                    } else {
+                        Repr::Ref
+                    };
+                    return Ok(E::new(format!("{base}.unwrap()"), PREC_POSTFIX, repr));
+                }
                 return Ok(if self.is_copy(&t.inner) && !mutable {
                     E::owned(format!("{base}.unwrap()"), PREC_POSTFIX)
                 } else if mutable {
@@ -233,6 +241,8 @@ impl<'a> Gen<'a> {
                 || r.starts_with("0o"))
         {
             r.to_lowercase()
+        } else if value.abs() > i32::MAX as f64 {
+            format!("{}_i64", value as i64)
         } else {
             format!("{}", value as i64)
         };
@@ -346,6 +356,11 @@ impl<'a> Gen<'a> {
                     "{code}.as_ref().map_or(\"{missing}\".to_string(), |v| {shown})"
                 )),
             ));
+        }
+        if spec == "{:?}" {
+            self.bound_needed(&ty, "std::fmt::Debug");
+        } else {
+            self.bound_needed(&ty, "std::fmt::Display");
         }
         let code = self.coerce(e, &ty, Want::Display);
         if is_plain_ident(&code) && !code.starts_with("r#") {
@@ -535,11 +550,7 @@ impl<'a> Gen<'a> {
         match op {
             UnaryOp::Not => {
                 let c = self.cond(arg)?;
-                let c = if c.contains("let ") || c.contains("&&") || c.contains("||") {
-                    format!("({c})")
-                } else {
-                    c
-                };
+                let c = if c.contains(' ') { format!("({c})") } else { c };
                 Ok(E::owned(format!("!{c}"), PREC_UNARY))
             }
             UnaryOp::Neg => {
@@ -697,6 +708,14 @@ impl<'a> Gen<'a> {
                 Ok(E::owned(format!("{lc} {sym} {rc}"), prec))
             }
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
+                if let Ty::Named(n) = self.resolve(&lt)
+                    && self.is_type_param(&n)
+                {
+                    self.bound_needed(&lt, "PartialOrd");
+                    let l = self.expr_as(left, Want::Ref)?;
+                    let r = self.expr_as(right, Want::Ref)?;
+                    return Ok(E::owned(format!("{l} {} {r}", op.symbol()), PREC_CMP));
+                }
                 if self.is_str(&lt) {
                     let l = self.expr_as(left, Want::StrRef)?;
                     let r = self.expr_as(right, Want::StrRef)?;
@@ -778,7 +797,9 @@ impl<'a> Gen<'a> {
         if let Ty::Named(n) = &lt
             && self.is_type_param(n)
         {
-            return (l.code, r.code);
+            let lc = self.coerce(l, &lt, Want::Ref);
+            let rc = self.coerce(r, rt, Want::Ref);
+            return (lc, rc);
         }
         if self.is_str(&lt) {
             // char == one-character literal
@@ -1021,7 +1042,20 @@ impl<'a> Gen<'a> {
     ) -> (String, String) {
         let name = snake(name);
         let copy = self.is_copy(inner);
-        let (source, repr) = if copy && x.repr != Repr::RefMut && !mutated {
+        let boxed = self.is_boxed(inner);
+        let (source, repr) = if boxed {
+            // `Option<Box<T>>`: the binding sees the `T`.
+            let base = Self::paren(&x, PREC_POSTFIX);
+            if mutated {
+                (format!("{base}.as_deref_mut()"), Repr::RefMut)
+            } else if x.repr == Repr::Owned && self.can_move(&x) {
+                (format!("{base}.map(|b| *b)"), Repr::Owned)
+            } else if self.opt_ref_param(&x) {
+                (base, Repr::Ref)
+            } else {
+                (format!("{base}.as_deref()"), Repr::Ref)
+            }
+        } else if copy && x.repr != Repr::RefMut && !mutated {
             // `Option<i64>`: by value.
             match x.repr {
                 Repr::Ref => (format!("*{}", Self::paren(&x, PREC_UNARY)), Repr::Owned),
@@ -1061,6 +1095,9 @@ impl<'a> Gen<'a> {
     }
 
     fn opt_ref_param(&self, x: &E) -> bool {
+        if x.repr == Repr::OptRef {
+            return true;
+        }
         x.var.is_some_and(|(b, _)| {
             let v = self.p.var(b);
             v.role == Role::Param
@@ -1114,8 +1151,8 @@ impl<'a> Gen<'a> {
                     "Math.LOG10E" => "std::f64::consts::LOG10_E",
                     "Math.SQRT2" => "std::f64::consts::SQRT_2",
                     "Math.SQRT1_2" => "std::f64::consts::FRAC_1_SQRT_2",
-                    "Number.MAX_SAFE_INTEGER" => "9007199254740991",
-                    "Number.MIN_SAFE_INTEGER" => "-9007199254740991",
+                    "Number.MAX_SAFE_INTEGER" => "9007199254740991_i64",
+                    "Number.MIN_SAFE_INTEGER" => "-9007199254740991_i64",
                     "Number.MAX_VALUE" => "f64::MAX",
                     "Number.MIN_VALUE" => "5e-324",
                     "Number.EPSILON" => "f64::EPSILON",
@@ -1228,6 +1265,7 @@ impl<'a> Gen<'a> {
         let o = self.expr(obj)?;
         let is_param_ref = self.opt_ref_param(&o);
         let source = match o.repr {
+            Repr::OptRef => o.code.clone(),
             Repr::Owned if is_param_ref || self.can_move(&o) => o.code.clone(),
             Repr::Owned | Repr::Place | Repr::Ref | Repr::RefMut => {
                 format!("{}.as_ref()", Self::paren(&o, PREC_POSTFIX))
@@ -1250,6 +1288,24 @@ impl<'a> Gen<'a> {
                     }
                     None => return self.err(format!("unknown property `{prop}`"), obj.span),
                 }
+            }
+            Ty::Str if prop == "length" => {
+                return Ok(E::owned(
+                    format!("{source}.map(|v| v.chars().count() as i64)"),
+                    PREC_POSTFIX,
+                ));
+            }
+            Ty::Array(_) if prop == "length" => {
+                return Ok(E::owned(
+                    format!("{source}.map(|v| v.len() as i64)"),
+                    PREC_POSTFIX,
+                ));
+            }
+            Ty::Map(..) | Ty::Set(_) if prop == "size" => {
+                return Ok(E::owned(
+                    format!("{source}.map(|v| v.len() as i64)"),
+                    PREC_POSTFIX,
+                ));
             }
             _ => return self.err("`?.` is only supported on objects", obj.span),
         };
@@ -1450,6 +1506,7 @@ pub(super) fn format_call(name: &str, fmt: &str, args: &[String]) -> String {
 
 fn is_plain_ident(code: &str) -> bool {
     !code.is_empty()
+        && !matches!(code, "true" | "false" | "self" | "Self")
         && code
             .chars()
             .next()
@@ -1505,10 +1562,16 @@ fn paren_logical(code: &str, op: &str) -> String {
 
 /// A numeric literal receiving a method call needs a type suffix.
 pub(super) fn num_recv(code: &str, float: bool) -> String {
-    if super::is_int_literal(code) {
-        format!("{code}_i64")
-    } else if float && code.chars().all(|c| c.is_ascii_digit() || c == '.') && code.contains('.') {
-        format!("{code}_f64")
+    let (open, inner, close) = match code.strip_prefix("(-").and_then(|c| c.strip_suffix(')')) {
+        Some(inner) => ("(-", inner, ")"),
+        None => ("", code, ""),
+    };
+    let is_float_literal =
+        inner.chars().all(|c| c.is_ascii_digit() || c == '.') && inner.contains('.');
+    if super::is_int_literal(inner) {
+        format!("{open}{inner}_i64{close}")
+    } else if float && is_float_literal {
+        format!("{open}{inner}_f64{close}")
     } else {
         code.to_string()
     }

@@ -192,14 +192,13 @@ impl<'a> Gen<'a> {
                         Mode::Slice => self.coerce(x, &at, Want::Slice),
                         Mode::OptRef => {
                             if matches!(self.resolve(&at), Ty::Option(_)) {
-                                let inner_str =
-                                    matches!(self.resolve(pt), Ty::Option(ref i) if self.is_str(i));
+                                let deref = matches!(self.resolve(pt), Ty::Option(ref i) if self.is_str(i) || self.is_boxed(i));
                                 match x.repr {
                                     Repr::Owned if self.opt_ref_param_e(&x) => x.code,
                                     _ => format!(
                                         "{}.{}()",
                                         Self::paren(&x, PREC_POSTFIX),
-                                        if inner_str { "as_deref" } else { "as_ref" }
+                                        if deref { "as_deref" } else { "as_ref" }
                                     ),
                                 }
                             } else if matches!(self.resolve(&at), Ty::Null) {
@@ -252,6 +251,9 @@ impl<'a> Gen<'a> {
     }
 
     fn opt_ref_param_e(&self, x: &E) -> bool {
+        if x.repr == Repr::OptRef {
+            return true;
+        }
         x.var.is_some_and(|(b, _)| {
             let v = self.p.var(b);
             v.role == crate::infer::Role::Param
@@ -511,7 +513,10 @@ impl<'a> Gen<'a> {
                         }
                     }
                     let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    let call = format!("{}.{method}()", paren_num(&x));
+                    let call = format!(
+                        "{}.{method}()",
+                        super::exprs::num_recv(&paren_num(&x), true)
+                    );
                     if self.is_int(&ty) {
                         E::owned(format!("{call} as i64"), PREC_CAST)
                     } else {
@@ -524,6 +529,7 @@ impl<'a> Gen<'a> {
             "Math.sign" => {
                 let at = self.ty_of(&args[0].expr);
                 let x = self.expr_as(&args[0].expr, Want::Owned)?;
+                let x = super::exprs::num_recv(&paren_num(&x), self.is_float(&at));
                 if self.is_float(&at) {
                     E::owned(format!("{}.signum() as i64", paren_num(&x)), PREC_CAST)
                 } else {
@@ -618,7 +624,8 @@ impl<'a> Gen<'a> {
                 let at = self.ty_of(&args[0].expr);
                 if self.is_float(&at) {
                     let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    E::owned(format!("{}.fract() == 0.0", paren_num(&x)), super::PREC_CMP)
+                    let x = super::exprs::num_recv(&paren_num(&x), true);
+                    E::owned(format!("{x}.fract() == 0.0"), super::PREC_CMP)
                 } else {
                     self.expr(&args[0].expr)?;
                     E::atom("true", Repr::Owned)
@@ -769,7 +776,7 @@ impl<'a> Gen<'a> {
         let at = self.ty_of(a);
         let x = self.expr_as(a, Want::Owned)?;
         Ok(if self.is_float(&at) {
-            paren_num(&x)
+            super::exprs::num_recv(&paren_num(&x), true)
         } else if super::is_int_literal(&x) {
             format!("{x}.0_f64")
         } else {

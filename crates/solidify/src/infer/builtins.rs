@@ -264,7 +264,7 @@ impl<'m> Infer<'m> {
                         self.arg_typed(args, 1, Some(v.clone()), &full, span)?;
                         self.mark_stored(&args[0].expr);
                         self.mark_stored(&args[1].expr);
-                        self.mark_mutated(obj);
+                        self.mark_receiver_mutated(obj);
                         self.done(e, full, Ty::Map(Box::new(k), Box::new(v)))
                     }
                     "has" => {
@@ -273,11 +273,11 @@ impl<'m> Infer<'m> {
                     }
                     "delete" => {
                         self.arg_typed(args, 0, Some(k), &full, span)?;
-                        self.mark_mutated(obj);
+                        self.mark_receiver_mutated(obj);
                         self.done(e, full, Ty::Bool)
                     }
                     "clear" => {
-                        self.mark_mutated(obj);
+                        self.mark_receiver_mutated(obj);
                         self.done(e, full, Ty::Void)
                     }
                     "keys" => self.done(e, full, Ty::Array(Box::new(k))),
@@ -297,7 +297,7 @@ impl<'m> Infer<'m> {
                     "add" => {
                         self.arg_typed(args, 0, Some(item.clone()), &full, span)?;
                         self.mark_stored(&args[0].expr);
-                        self.mark_mutated(obj);
+                        self.mark_receiver_mutated(obj);
                         self.done(e, full, Ty::Set(Box::new(item)))
                     }
                     "has" => {
@@ -306,11 +306,11 @@ impl<'m> Infer<'m> {
                     }
                     "delete" => {
                         self.arg_typed(args, 0, Some(item), &full, span)?;
-                        self.mark_mutated(obj);
+                        self.mark_receiver_mutated(obj);
                         self.done(e, full, Ty::Bool)
                     }
                     "clear" => {
-                        self.mark_mutated(obj);
+                        self.mark_receiver_mutated(obj);
                         self.done(e, full, Ty::Void)
                     }
                     "values" | "keys" => self.done(e, full, Ty::Array(Box::new(item))),
@@ -484,13 +484,13 @@ impl<'m> Infer<'m> {
                         self.mark_stored(&a.expr);
                     }
                 }
-                self.mark_mutated(obj);
+                self.mark_receiver_mutated(obj);
                 let i = self.types.int();
                 self.done(e, full, i)
             }
             "pop" | "shift" => {
                 self.no_more_than(args, 0, &full, span)?;
-                self.mark_mutated(obj);
+                self.mark_receiver_mutated(obj);
                 self.done(e, full, Ty::Option(Box::new(item)))
             }
             "indexOf" | "lastIndexOf" => {
@@ -596,7 +596,7 @@ impl<'m> Infer<'m> {
                     self.arg_typed(args, i, Some(item.clone()), &full, span)?;
                     self.mark_stored(&args[i].expr);
                 }
-                self.mark_mutated(obj);
+                self.mark_receiver_mutated(obj);
                 self.done(e, full, arr)
             }
             "concat" => {
@@ -633,7 +633,7 @@ impl<'m> Infer<'m> {
                     _ => self.no_more_than(args, 0, &full, span)?,
                 }
                 if matches!(prop, "reverse" | "sort" | "fill") {
-                    self.mark_mutated(obj);
+                    self.mark_receiver_mutated(obj);
                 }
                 self.done(e, full, arr)
             }
