@@ -1,11 +1,10 @@
-//! Interface texts in English and French.
+//! Interface texts in English, French and Spanish.
 
 use crate::routes::Lang;
 
 pub struct Dict {
     pub lang_name: &'static str,
     pub locale: &'static str,
-    pub other_lang: &'static str,
     pub title: &'static str,
     pub description: &'static str,
     pub nav: Nav,
@@ -85,13 +84,13 @@ pub fn t(lang: Lang) -> &'static Dict {
     match lang {
         Lang::En => &EN,
         Lang::Fr => &FR,
+        Lang::Es => &ES,
     }
 }
 
 static EN: Dict = Dict {
     lang_name: "English",
     locale: "en_US",
-    other_lang: "Français",
     title: "Solidify, TypeScript to Rust",
     description: "Write TypeScript or JavaScript, get the Rust you would have written by hand: structs, enums, Option, Result, iterators and ownership. A transpiler in Rust, with no dependency, running here in your browser.",
     nav: Nav {
@@ -288,7 +287,6 @@ static EN: Dict = Dict {
 static FR: Dict = Dict {
     lang_name: "Français",
     locale: "fr_FR",
-    other_lang: "English",
     title: "Solidify, de TypeScript à Rust",
     description: "Écrivez du TypeScript ou du JavaScript, obtenez le Rust que vous auriez écrit à la main : structs, enums, Option, Result, itérateurs et propriété. Un transpileur en Rust, sans dépendance, qui tourne ici dans votre navigateur.",
     nav: Nav {
@@ -482,5 +480,204 @@ static FR: Dict = Dict {
         family: "au sein d'une même famille de projets Rust :",
         license: "Logiciel propriétaire, tous droits réservés. Libre d'utilisation comme dépendance de vos programmes.",
         source: "Source sur GitHub",
+    },
+};
+
+static ES: Dict = Dict {
+    lang_name: "Español",
+    locale: "es_ES",
+    title: "Solidify, de TypeScript a Rust",
+    description: "Escribe TypeScript o JavaScript y obtén el Rust que habrías escrito a mano: structs, enums, Option, Result, iteradores y propiedad. Un transpilador en Rust, sin dependencias, que se ejecuta aquí en tu navegador.",
+    nav: Nav {
+        playground: "Zona de pruebas",
+        how: "Cómo funciona",
+        supported: "Qué se traduce",
+        install: "Instalar",
+        github: "GitHub",
+        skip: "Ir al contenido",
+    },
+    hero: Hero {
+        eyebrow: "Un transpilador escrito en Rust, sin dependencias",
+        title: "Escribe *TypeScript*. Entrega *Rust*.",
+        lead: "Solidify lee TypeScript o JavaScript y escribe el Rust que habrías escrito a mano: structs, enums, Option, Result, iteradores, propiedad. Sin máquina virtual ni recolector de basura en la salida, un programa Rust normal.",
+        cta: "Probar en el navegador",
+        cta2: "Instalar la línea de comandos",
+        facts: [
+            ("0", "dependencias"),
+            ("33", "programas verificados contra Node.js"),
+            (
+                "1",
+                "archivo Rust de salida, tantos archivos de entrada como quieras",
+            ),
+        ],
+    },
+    play: Play {
+        title: "Zona de pruebas",
+        lead: "Edita el TypeScript de la izquierda. El Rust de la derecha lo produce el propio Solidify, compilado a WebAssembly y ejecutado en tu navegador.",
+        ts: "TypeScript",
+        rust: "Rust",
+        examples: "Ejemplos",
+        copy: "Copiar",
+        copied: "Copiado",
+        server: "traducido en el servidor",
+        browser: "traducido en tu navegador",
+        lines: "líneas",
+        error: "Solidify todavía no sabe traducir esto",
+    },
+    how: How {
+        title: "Cómo funciona",
+        lead: "Tres pasadas, todas en Rust, todas deterministas. El mismo código se ejecuta en la línea de comandos y en esta página.",
+        steps: [
+            (
+                "Analizar",
+                "Un analizador escrito a mano lee TypeScript moderno: clases, interfaces, enums, funciones flecha, plantillas de cadenas, desestructuración, async/await. JavaScript es TypeScript sin anotaciones.",
+            ),
+            (
+                "Inferir",
+                "Los tipos salen de las anotaciones y del uso, por unificación. Los números siguen siendo enteros mientras un literal decimal o una división no digan lo contrario. `T | null` se convierte en `Option<T>`. Una función que lanza un error devuelve `Result`.",
+            ),
+            (
+                "Generar",
+                "Cada valor recibe una propiedad: prestado, movido en su último uso, clonado si no. Los bucles se vuelven rangos e iteradores, `switch` se vuelve `match`, `if (x !== null)` se vuelve `if let Some(x)`.",
+            ),
+        ],
+        rules_title: "Cuatro reglas que conviene conocer",
+        rules: [
+            (
+                "Primero los enteros",
+                "`let n = 0` es un `i64`. Escribe `2.0`, divide o lee el número desde JSON, y toda la familia de ese número pasa a `f64`. `parseInt` da un `Option<i64>`: `NaN` es `None`.",
+            ),
+            (
+                "Null es Option",
+                "`T | null`, `T | undefined` y `x?: T` son `Option<T>`. Compruébalos con `!== null` o `??`, y el Rust usa `if let`, `let … else` y `unwrap_or`.",
+            ),
+            (
+                "Throw es Result",
+                "Una función que lanza un error, o que llama a otra que lo hace, devuelve `Result<T, String>`. Las llamadas reciben `?`, un bloque `try` se vuelve una closure, `catch (e)` recibe el mensaje.",
+            ),
+            (
+                "Prestar por defecto",
+                "Los parámetros son `&str`, `&[T]` y `&T` salvo que la función los modifique o los guarde. Una variable se mueve en su último uso y se clona antes.",
+            ),
+        ],
+    },
+    supported: Supported {
+        title: "Qué se traduce, y a qué",
+        lead: "El subconjunto admitido es aquel del que están hechos la mayoría de los programas. Lo demás se rechaza con un mensaje que explica por qué y qué escribir en su lugar.",
+        head: ("TypeScript", "Rust"),
+        rows: &[
+            ("number", "i64, o f64 en cuanto interviene un decimal"),
+            (
+                "string, plantillas de cadenas",
+                "String, &str para los parámetros, format!",
+            ),
+            ("T[], [A, B]", "Vec<T>, &[T] para los parámetros, tuplas"),
+            (
+                "T | null, x?: T, ??, ?.",
+                "Option<T>, if let, unwrap_or, map",
+            ),
+            (
+                "interface, objeto literal",
+                "struct con Debug, Clone, PartialEq",
+            ),
+            (
+                "class, get, set, static",
+                "struct, impl, new(), &self o &mut self, consts",
+            ),
+            ("enum, \"a\" | \"b\"", "enum con Display, match"),
+            ("Map, Set, Record<K, V>", "HashMap, HashSet"),
+            (
+                "throw, try / catch / finally",
+                "Result<T, String>, ?, una closure para el bloque try",
+            ),
+            ("map, filter, reduce, find, some…", "cadenas de iteradores"),
+            (
+                "for … of, for (;;), while, etiquetas",
+                "for x in &v, for i in a..b, loop, 'label",
+            ),
+            ("switch", "match, con casos agrupados"),
+            (
+                "async, await",
+                "async fn, .await, un pequeño ejecutor para main",
+            ),
+            (
+                "function f<T>(x: T)",
+                "fn f<T: Clone + PartialEq>(x: T), cotas deducidas del uso",
+            ),
+            (
+                "console.log, Math, parseInt, …",
+                "println!, métodos de f64, pequeñas utilidades",
+            ),
+            ("clases recursivas", "Option<Box<T>>"),
+            (
+                "class B extends A, abstract, super, instanceof",
+                "structs aplanados, un trait por clase base, Box<dyn ALike> donde se espera un A",
+            ),
+            (
+                "interface Shape { area(): number }, class C implements Shape",
+                "un trait por interfaz, impl para cada clase, Box<dyn ShapeLike>",
+            ),
+            (
+                "A | B, [1, \"two\"], uniones discriminadas, typeof",
+                "enum con una variante por miembro, match",
+            ),
+            ("function*, yield, yield*", "JsGenerator<T>, for x in gen"),
+            (
+                "setTimeout, setInterval, new Promise",
+                "un bucle de eventos lanzado por main, JsPromise",
+            ),
+            (
+                "/regex/, test, exec, match, replace, split, lastIndex",
+                "JsRegex, un motor con retroceso incluido en el archivo, while let Some(m) = re.exec(&s)",
+            ),
+            (
+                "JSON.stringify, JSON.parse",
+                "la JsValue del valor, JsFromJson para el tipo leído",
+            ),
+            (
+                "import, export, import * as ns",
+                "un mod por archivo, pub para las exportaciones",
+            ),
+            (
+                "console.log de objetos, arrays, maps",
+                "el texto exacto que imprime Node.js",
+            ),
+            ("any, unknown", "deducidos del uso"),
+            (
+                "...rest, f(...xs), { ...base, z }, [a, ...rest], ({ x, y }) =>",
+                "slices, vec!, literales de struct campo a campo, xs[1..].to_vec()",
+            ),
+            (
+                "new Date(…), getFullYear, toISOString, despues - antes",
+                "JsDate en milisegundos (UTC), PartialOrd, diferencias de get_time()",
+            ),
+            (
+                "f?.(), obj?.method(), campos de tipo función",
+                "if let Some(f) = …, .map(|o| o.method()), campos Rc<dyn Fn(…)>",
+            ),
+            (
+                "class Stack<T>, interface Page<T>, <T extends HasId>, f<number>(x)",
+                "struct Stack<T> + impl<T: …>, cotas encontradas en todo el programa, traits de restricción",
+            ),
+            (
+                "interface Listener<T> { notify(v: T): void }",
+                "trait ListenerLike<T>, Box<dyn ListenerLike<String>>",
+            ),
+        ],
+        limits_title: "Qué sigue siendo distinto",
+        limits: "Los valores Rust no son referencias JavaScript: un objeto guardado en dos sitios se copia, y modificar una copia no toca la otra (las variables modificadas en closures que les sobreviven se comparten). Los números son `i64` mientras no intervenga un decimal: un entero que desborda provoca un pánico donde JavaScript perdería precisión. Los imports van entre tus propios archivos, no hacia paquetes. Los replacers y revivers de `JSON`, `Symbol`, `Proxy`, `eval`, los prototipos y `arguments` no tienen equivalente en Rust y se rechazan con un mensaje claro.",
+    },
+    install: Install {
+        title: "Instalar",
+        lead: "Un crate, ninguna dependencia, un solo binario. Traduce un archivo y los que importa, o pasa un archivo por la entrada estándar.",
+        cli: "Línea de comandos",
+        library: "Como biblioteca",
+        check: "Comprobar sin escribir",
+    },
+    footer: Footer {
+        made: "Diseñado y desarrollado por",
+        family: "dentro de una misma familia de proyectos Rust:",
+        license: "Software propietario, todos los derechos reservados. Libre de usar como dependencia de tus programas.",
+        source: "Código en GitHub",
     },
 };
