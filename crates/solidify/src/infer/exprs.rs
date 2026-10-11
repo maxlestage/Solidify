@@ -59,6 +59,7 @@ impl<'m> Infer<'m> {
             } else {
                 self.types.float()
             }),
+            ExprKind::BigInt(_) => Ok(Ty::named("bigint")),
             ExprKind::Str(s) => {
                 if let Some(Ty::Named(n, ..)) = &expected_res
                     && let Some(en) = self.enum_by_name(n)
@@ -215,6 +216,11 @@ impl<'m> Infer<'m> {
                     match self.types.resolve(&t) {
                         Ty::Str if *op == UnaryOp::Pos => Ok(self.types.float()),
                         d if d.is_dynamic() => Ok(self.types.float()),
+                        Ty::Named(n, _) if n == "bigint" && *op == UnaryOp::Neg => Ok(t),
+                        Ty::Named(n, _) if n == "bigint" => self.err(
+                            "Cannot convert a BigInt value to a number: use Number(x)",
+                            e.span,
+                        ),
                         _ => {
                             let n = self.types.num(Flavor::Unknown);
                             self.expect(&t, &n, arg.span)?;
@@ -233,7 +239,9 @@ impl<'m> Infer<'m> {
             },
             ExprKind::Update { arg, .. } => {
                 let t = self.expr(arg, None)?;
-                if self.types.resolve(&t).is_dynamic() {
+                if self.types.resolve(&t).is_dynamic()
+                    || matches!(self.types.resolve(&t), Ty::Named(ref n, _) if n == "bigint")
+                {
                     self.mark_mutated(arg);
                     return Ok(t);
                 }
@@ -627,6 +635,9 @@ impl<'m> Infer<'m> {
                 if self.dyn_operands(left, &lt, right, &rt) {
                     return Ok(Ty::dynamic());
                 }
+                if self.big_operands(&lt, &rt, span)? {
+                    return Ok(Ty::named("bigint"));
+                }
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&lt, &n, left.span)?;
                 self.expect(&rt, &n, right.span)?;
@@ -639,6 +650,9 @@ impl<'m> Infer<'m> {
                 let lt = self.expr(left, Some(&a))?;
                 let b = self.types.num(Flavor::Unknown);
                 let rt = self.expr(right, Some(&b))?;
+                if self.big_operands(&lt, &rt, span)? {
+                    return Ok(Ty::named("bigint"));
+                }
                 if !self.dyn_operands(left, &lt, right, &rt) {
                     self.expect(&lt, &a, left.span)?;
                     self.expect(&rt, &b, right.span)?;
@@ -666,6 +680,9 @@ impl<'m> Infer<'m> {
                 if self.dyn_operands(left, &lt, right, &rt) {
                     return Ok(self.types.float());
                 }
+                if self.big_operands(&lt, &rt, span)? {
+                    return Ok(Ty::named("bigint"));
+                }
                 self.expect(&lt, &n, left.span)?;
                 self.expect(&rt, &n, right.span)?;
                 if op != BinOp::Mod {
@@ -677,6 +694,10 @@ impl<'m> Infer<'m> {
                 let n = self.types.num(Flavor::Unknown);
                 let lt = self.expr(left, Some(&n))?;
                 let rt = self.expr(right, Some(&n))?;
+                // Integer division for big integers.
+                if self.big_operands(&lt, &rt, span)? {
+                    return Ok(Ty::named("bigint"));
+                }
                 if !self.dyn_operands(left, &lt, right, &rt) {
                     self.expect(&lt, &n, left.span)?;
                     self.expect(&rt, &n, right.span)?;
@@ -687,6 +708,14 @@ impl<'m> Infer<'m> {
                 let lt = self.expr(left, None)?;
                 let rt = self.expr(right, Some(&lt))?;
                 if self.dyn_operands(left, &lt, right, &rt) {
+                    return Ok(Ty::Bool);
+                }
+                // A big integer compared with a number: by value.
+                let big = |t: &Ty| matches!(t, Ty::Named(n, _) if n == "bigint");
+                let (lr, rr) = (self.types.resolve(&lt), self.types.resolve(&rt));
+                if (big(&lr) && (big(&rr) || matches!(rr, Ty::Num(_))))
+                    || (big(&rr) && matches!(lr, Ty::Num(_)))
+                {
                     return Ok(Ty::Bool);
                 }
                 if self.types.unify(&lt, &rt).is_err() {
@@ -731,10 +760,25 @@ impl<'m> Infer<'m> {
             | BinOp::BitAnd
             | BinOp::BitOr
             | BinOp::BitXor => {
+                // Two big integers: a big integer (`>>>` has none).
+                let lt0 = self.expr(left, None)?;
+                if matches!(self.types.resolve(&lt0), Ty::Named(ref n, _) if n == "bigint") {
+                    let rt0 = self.expr(right, None)?;
+                    if op == BinOp::UShr {
+                        return self
+                            .err("BigInts have no unsigned right shift, use >> instead", span);
+                    }
+                    self.big_operands(&lt0, &rt0, span)?;
+                    return Ok(Ty::named("bigint"));
+                }
                 // Any numbers, taken as 32-bit integers; the result is one.
-                for side in [left, right] {
+                for (i, side) in [left, right].into_iter().enumerate() {
                     let n = self.types.num(Flavor::Unknown);
-                    let t = self.expr(side, Some(&n))?;
+                    let t = if i == 0 {
+                        lt0.clone()
+                    } else {
+                        self.expr(side, Some(&n))?
+                    };
                     if !self.types.resolve(&t).is_dynamic() {
                         self.expect(&t, &n, side.span)?;
                     }
@@ -881,6 +925,11 @@ impl<'m> Infer<'m> {
                     _ => {
                         let bin = op.binary().expect("compound");
                         let vt = self.expr(value, Some(&tt))?;
+                        if matches!(self.types.resolve(&tt), Ty::Named(ref n, _) if n == "bigint") {
+                            self.big_operands(&tt, &vt, span)?;
+                            self.mark_mutated(t);
+                            return Ok(tt);
+                        }
                         // `total += item.price`: the value read as a text or a number.
                         let vt = if self.types.resolve(&vt).is_dynamic() {
                             let read = match self.types.resolve(&tt) {
@@ -2217,6 +2266,7 @@ impl<'m> Infer<'m> {
                 let t = self.arg_typed(args, 0, None, name, span)?;
                 match self.types.resolve(&t) {
                     Ty::Str | Ty::Bool => self.types.float(),
+                    Ty::Named(n, _) if n == "bigint" => self.types.float(),
                     Ty::Num(_) => t,
                     d if d.is_dynamic() => {
                         let f = self.types.float();
@@ -2253,6 +2303,18 @@ impl<'m> Infer<'m> {
                 Ty::named("Symbol")
             }
             "structuredClone" => self.arg_typed(args, 0, None, name, span)?,
+            "BigInt" => {
+                let t = self.arg_typed(args, 0, None, name, span)?;
+                match self.types.resolve(&t) {
+                    Ty::Num(_) | Ty::Str | Ty::Bool => {}
+                    Ty::Named(n, _) if n == "bigint" => {}
+                    other => {
+                        let d = self.describe(&other);
+                        return self.err(format!("cannot convert {d} to a BigInt"), span);
+                    }
+                }
+                Ty::named("bigint")
+            }
             "eval" => return self.eval_call(e, args),
             "Function" => return self.function_call(e, args),
             "require" => {
@@ -2510,6 +2572,7 @@ impl<'m> Infer<'m> {
                     && n != "RegExpMatch"
                     && n != "Date"
                     && n != "Symbol"
+                    && n != "bigint"
                     && !self.is_type_param(n) =>
             {
                 let Some(s) = self.struct_by_name(n) else {

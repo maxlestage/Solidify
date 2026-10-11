@@ -94,6 +94,16 @@ impl<'a> Gen<'a> {
         }
         match &e.kind {
             ExprKind::Num { value, raw, int } => Ok(self.number(*value, raw, *int, &ty)),
+            ExprKind::BigInt(digits) => {
+                let h = self.helper(super::Helper::BigInt);
+                Ok(match digits.parse::<i64>() {
+                    Ok(n) => E::owned(format!("{h}::from_i64({n})"), PREC_POSTFIX),
+                    Err(_) => E::owned(
+                        format!("{h}::parse({})", string_literal(digits)),
+                        PREC_POSTFIX,
+                    ),
+                })
+            }
             ExprKind::Str(s) => {
                 if let Some((en, variant)) = self.p.enum_literal.get(&e.id) {
                     return Ok(E::atom(format!("{}::{}", pascal(en), variant), Repr::Owned));
@@ -373,6 +383,7 @@ impl<'a> Gen<'a> {
                 Ty::Func(_) => "function",
                 Ty::Void | Ty::Null => "undefined",
                 Ty::Named(n, _) if n == "Symbol" => "symbol",
+                Ty::Named(n, _) if n == "bigint" => "bigint",
                 _ => "object",
             }
         };
@@ -566,6 +577,12 @@ impl<'a> Gen<'a> {
     /// Node does; the rest prints as in a template string.
     pub(super) fn log_arg(&mut self, x: &'a Expr) -> GResult<(String, Option<String>)> {
         let ty = self.ty_of(x);
+        // A big integer is shown with its `n`.
+        if self.is_big(&ty) {
+            let x = self.expr(x)?;
+            let code = self.coerce(x, &ty, Want::Display);
+            return Ok(("{}n".into(), Some(code)));
+        }
         // A value known at run time: a string is shown as it is.
         if self.is_dynamic(&ty) {
             let v = self.dyn_ref(x)?;
@@ -1014,6 +1031,13 @@ impl<'a> Gen<'a> {
                 let c = if c.contains(' ') { format!("({c})") } else { c };
                 Ok(E::owned(format!("!{c}"), PREC_UNARY))
             }
+            UnaryOp::Neg if self.is_big(&self.ty_of(arg)) => {
+                let x = self.expr(arg)?;
+                Ok(E::owned(
+                    format!("{}.negated()", Self::paren(&x, PREC_POSTFIX)),
+                    PREC_POSTFIX,
+                ))
+            }
             UnaryOp::Neg | UnaryOp::Pos if self.is_dynamic(&self.ty_of(arg)) => {
                 let x = self.float_operand(arg)?;
                 Ok(if op == UnaryOp::Neg {
@@ -1134,6 +1158,9 @@ impl<'a> Gen<'a> {
         }
         if self.is_dynamic(&lt) || self.is_dynamic(&rt) {
             return self.dyn_binary(op, left, right);
+        }
+        if self.is_big(&lt) || self.is_big(&rt) {
+            return self.big_binary(op, left, right);
         }
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {

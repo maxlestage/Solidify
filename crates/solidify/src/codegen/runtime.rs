@@ -62,6 +62,8 @@ pub enum Helper {
     Shared,
     /// The native side of the Node modules (`fs`, `os`).
     Node,
+    /// `JsBigInt`: `bigint`.
+    BigInt,
 }
 
 /// The regular expression engine, compiled into Solidify too: patterns are checked when
@@ -414,6 +416,7 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Eval => include_str!("runtime/eval.rs"),
             Helper::Shared => include_str!("runtime/shared.rs"),
             Helper::Node => include_str!("runtime/node.rs"),
+            Helper::BigInt => include_str!("runtime/bigint.rs"),
             Helper::BlockOn => {
                 r#"/// Runs a future to completion, running the timers it waits on.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

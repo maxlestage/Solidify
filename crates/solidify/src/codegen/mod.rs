@@ -906,6 +906,10 @@ impl<'a> Gen<'a> {
         if h == Helper::Eval {
             self.helper(Helper::Dynamic);
         }
+        if h == Helper::BigInt {
+            self.helpers.insert(Helper::Inspect);
+            self.helpers.insert(Helper::NumText);
+        }
         if h == Helper::Shared {
             self.helpers.insert(Helper::Inspect);
             self.helpers.insert(Helper::NumText);
@@ -966,6 +970,7 @@ impl<'a> Gen<'a> {
             Helper::Eval => "js_eval",
             Helper::Shared => "Shared",
             Helper::Node => "js_node_os_info",
+            Helper::BigInt => "JsBigInt",
         }
     }
 
@@ -1781,6 +1786,8 @@ impl<'a> Gen<'a> {
                     self.helper(Helper::Date).into()
                 } else if n == "Symbol" {
                     self.helper(Helper::Symbol).into()
+                } else if n == "bigint" {
+                    self.helper(Helper::BigInt).into()
                 } else if n == crate::types::DYNAMIC {
                     self.helper(Helper::Dynamic).into()
                 } else if self.is_type_param(&n) {
@@ -2017,6 +2024,7 @@ impl<'a> Gen<'a> {
             Ty::Named(n, ..) => {
                 let prints = n == "Error"
                     || n == crate::types::DYNAMIC
+                    || n == "bigint"
                     || n == "Symbol"
                     || n == "RegExp"
                     || self.is_type_param(&n)
