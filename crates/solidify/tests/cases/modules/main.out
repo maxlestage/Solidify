@@ -6,3 +6,6 @@ HELLO!  |  ababab
 AGAIN! a (1) b (2)
 3.142 314.2
 Circle { center: { x: 0, y: 0 }, radius: 1 }
+12.57 1.414
+1 light true light
+true true
