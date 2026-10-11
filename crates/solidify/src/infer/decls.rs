@@ -48,6 +48,7 @@ impl<'m> Infer<'m> {
                 method_of: None,
                 method_kind: None,
                 is_static: false,
+                is_abstract: false,
                 mutates_self: false,
                 captures: Vec::new(),
                 escapes: false,
@@ -99,6 +100,8 @@ impl<'m> Infer<'m> {
                         exported: i.exported,
                         span: i.span,
                         statics: Vec::new(),
+                        parent: None,
+                        is_abstract: false,
                     });
                 }
                 StmtKind::Class(c) => {
@@ -112,6 +115,8 @@ impl<'m> Infer<'m> {
                         exported: c.exported,
                         span: c.span,
                         statics: Vec::new(),
+                        parent: None,
+                        is_abstract: false,
                     });
                 }
                 StmtKind::Enum(e) => {
@@ -133,6 +138,8 @@ impl<'m> Infer<'m> {
                             exported: a.exported,
                             span: a.span,
                             statics: Vec::new(),
+                            parent: None,
+                            is_abstract: false,
                         }),
                         TypeAnn::Union(members, span)
                             if members.len() > 1
@@ -178,6 +185,11 @@ impl<'m> Infer<'m> {
             }
         }
         // Fields and signatures.
+        for s in stmts {
+            if let StmtKind::Class(c) = &s.kind {
+                self.class_asts.insert(c.name.clone(), c);
+            }
+        }
         for s in stmts {
             match &s.kind {
                 StmtKind::Interface(i) => {
@@ -284,11 +296,8 @@ impl<'m> Infer<'m> {
 
     /// Fields, methods and the constructor of a class (signatures only).
     fn collect_class(&mut self, c: &'m Class) -> IResult<()> {
-        if c.extends.is_some() {
-            return self.err(
-                "`extends` is not supported: Rust has no inheritance, prefer a field holding the base (composition)",
-                c.span,
-            );
+        if !self.collected_classes.insert(c.name.clone()) {
+            return Ok(());
         }
         if !c.type_params.is_empty() {
             return self.err("generic classes are not supported", c.span);
@@ -296,11 +305,39 @@ impl<'m> Infer<'m> {
         if c.name.is_empty() {
             return self.err("classes need a name", c.span);
         }
-        self.this_class_stack.push(c.name.clone());
+        // The base class first: its fields come first, its methods are inherited.
+        let mut parent = None;
         let mut fields = Vec::new();
+        if let Some(base) = &c.extends {
+            let ExprKind::Ident(base_name) = &base.kind else {
+                return self.err(
+                    "a class can only extend a class declared in the program",
+                    base.span,
+                );
+            };
+            if base_name == "Error" {
+                return self.err(
+                    "custom error classes are not supported: throw `new Error(message)`",
+                    base.span,
+                );
+            }
+            let Some(base_ast) = self.class_asts.get(base_name.as_str()).copied() else {
+                return self.err(format!("unknown base class `{base_name}`"), base.span);
+            };
+            if self.is_subclass(base_name, &c.name) && base_name != &c.name {
+                return self.err("classes cannot extend each other in a cycle", c.span);
+            }
+            self.collect_class(base_ast)?;
+            let base_info = self.struct_by_name(base_name).expect("base").clone();
+            fields.extend(base_info.fields.iter().cloned());
+            parent = Some(base_name.clone());
+        }
+        self.this_class_stack.push(c.name.clone());
         let mut methods = Vec::new();
         let mut statics = Vec::new();
         let mut ctor = None;
+        // Parameter properties are set before the field initializers run: they come first.
+        let mut declared: Vec<FieldInfo> = Vec::new();
         for m in &c.members {
             match m {
                 ClassMember::Field(f) => {
@@ -327,7 +364,7 @@ impl<'m> Infer<'m> {
                         ) if f.readonly => Some(s.clone()),
                         _ => None,
                     };
-                    fields.push(FieldInfo {
+                    let field = FieldInfo {
                         name: f.name.clone(),
                         ty,
                         optional,
@@ -336,7 +373,8 @@ impl<'m> Infer<'m> {
                         has_init: f.init.is_some(),
                         literal,
                         span: f.span,
-                    });
+                    };
+                    declared.push(field);
                 }
                 ClassMember::Method(m) => {
                     if m.kind == MethodKind::Constructor {
@@ -369,7 +407,49 @@ impl<'m> Infer<'m> {
                         }
                         ctor = Some(m.func.id);
                     }
-                    let info = self.signature(&m.func, Some(&c.name), Some(m.kind), m.is_static)?;
+                    let mut info =
+                        self.signature(&m.func, Some(&c.name), Some(m.kind), m.is_static)?;
+                    info.is_abstract = m.is_abstract;
+                    // A parameter property has the type of its field.
+                    if m.kind == MethodKind::Constructor {
+                        for (i, p) in m.func.params.iter().enumerate() {
+                            if (p.access.is_some() || p.readonly)
+                                && let Pattern::Ident { name, .. } = &p.pat
+                                && let Some(f) = fields.iter().find(|f| f.name == *name)
+                            {
+                                let fty = if f.optional {
+                                    Ty::Option(Box::new(f.ty.clone()))
+                                } else {
+                                    f.ty.clone()
+                                };
+                                self.unify(&info.sig.params[i], &fty, p.span)?;
+                            }
+                        }
+                    }
+                    if m.is_abstract && !c.is_abstract {
+                        return self.err("abstract methods belong in an abstract class", m.span);
+                    }
+                    // An override: same signature as the base method.
+                    if let Some(p) = &parent
+                        && m.kind != MethodKind::Constructor
+                        && let Some((_, base_m)) = self.find_method(p, &m.name, m.kind)
+                    {
+                        let base_sig = self.funcs[&base_m.fn_id].sig.clone();
+                        if base_sig.params.len() != info.sig.params.len() {
+                            return self.err(
+                                format!("`{}` takes a different number of parameters than in the base class", m.name),
+                                m.span,
+                            );
+                        }
+                        for (a, b) in base_sig.params.iter().zip(&info.sig.params) {
+                            self.unify(a, b, m.span)?;
+                        }
+                        self.unify(&base_sig.ret, &info.sig.ret, m.span)?;
+                        self.overrides
+                            .entry(base_m.fn_id)
+                            .or_default()
+                            .push(m.func.id);
+                    }
                     self.funcs.insert(m.func.id, info);
                     if m.kind != MethodKind::Constructor {
                         methods.push(MethodInfo {
@@ -377,6 +457,8 @@ impl<'m> Infer<'m> {
                             fn_id: m.func.id,
                             kind: m.kind,
                             is_static: m.is_static,
+                            is_abstract: m.is_abstract,
+                            access: m.access,
                         });
                     }
                 }
@@ -385,12 +467,24 @@ impl<'m> Infer<'m> {
                 }
             }
         }
+        for field in declared {
+            // A field declared again in a subclass keeps its place.
+            match fields.iter().position(|g: &FieldInfo| g.name == field.name) {
+                Some(i) => {
+                    self.unify(&fields[i].ty, &field.ty, field.span)?;
+                    fields[i] = field;
+                }
+                None => fields.push(field),
+            }
+        }
         self.this_class_stack.pop();
         let s = self.struct_mut(&c.name).expect("class");
         s.fields = fields;
         s.methods = methods;
         s.ctor = ctor;
         s.statics = statics;
+        s.parent = parent;
+        s.is_abstract = c.is_abstract;
         Ok(())
     }
 
@@ -484,6 +578,7 @@ impl<'m> Infer<'m> {
             method_of: method_of.map(str::to_string),
             method_kind,
             is_static,
+            is_abstract: false,
             mutates_self: false,
             captures: Vec::new(),
             escapes: false,

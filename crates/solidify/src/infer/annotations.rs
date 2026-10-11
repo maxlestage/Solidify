@@ -337,6 +337,8 @@ impl<'m> Infer<'m> {
             exported,
             span,
             statics: Vec::new(),
+            parent: None,
+            is_abstract: false,
         });
         let fields = self.fields_from_members(name, members)?;
         self.struct_mut(name).expect("struct").fields = fields;

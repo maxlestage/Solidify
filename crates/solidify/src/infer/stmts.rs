@@ -1,6 +1,8 @@
 //! Statements, function bodies, conditions and narrowing, mutation marks.
 
-use super::{ActiveNarrow, FnCtx, FnInfo, IResult, Infer, NarrowTest, Path, Role, Root};
+use super::{
+    ActiveNarrow, FnCtx, FnInfo, IResult, Infer, NarrowTest, Path, Role, Root, StructKind,
+};
 use crate::ast::*;
 use crate::types::Ty;
 
@@ -430,6 +432,11 @@ impl<'m> Infer<'m> {
             }
             if let Some(v) = self.vars.get_mut(&param_ids[i]) {
                 v.param_of = Some((f.id, i));
+                // A parameter property is kept in the instance.
+                if in_ctor && (p.access.is_some() || p.readonly) {
+                    v.stored = true;
+                    self.param_stored.insert((f.id, i));
+                }
             }
             if let Some(d) = &p.default {
                 let inner = match self.types.resolve(&ty) {
@@ -441,6 +448,12 @@ impl<'m> Infer<'m> {
             }
         }
         self.funcs.get_mut(&f.id).expect("fn").params = param_ids;
+        if info.is_abstract {
+            // A signature only.
+            self.pop_scope();
+            self.fns.pop();
+            return Ok(());
+        }
         match &f.body {
             FnBody::Block(b) => {
                 self.collect_values(&b.stmts, false)?;
@@ -603,6 +616,48 @@ impl<'m> Infer<'m> {
                 self.set_ty(e.id, Ty::Bool);
                 Ok((Vec::new(), neg))
             }
+            // `x instanceof C` on a value of a base class: `x` is a `C` when true.
+            ExprKind::Binary {
+                op: BinOp::InstanceOf,
+                left,
+                right,
+            } if self.path_of(left).is_some() && self.instance_test(left, right)?.is_some() => {
+                let Some((class, sub)) = self.instance_test(left, right)? else {
+                    unreachable!()
+                };
+                let _ = class;
+                let path = self.path_of(left).expect("path");
+                let name = match (&path.root, path.fields.last()) {
+                    (Root::Var(id), None) => self.vars[id].name.clone(),
+                    (_, Some(last)) => last.clone(),
+                    (Root::This, None) => "this".into(),
+                };
+                self.set_ty(e.id, Ty::Bool);
+                self.narrow_tests.insert(
+                    e.id,
+                    NarrowTest {
+                        root: path.root.clone(),
+                        path: path.fields.clone(),
+                        name: name.clone(),
+                        positive: true,
+                        union: None,
+                        complement: None,
+                        instance_of: Some(sub.clone()),
+                        mutated: false,
+                        inner: Ty::Named(sub.clone()),
+                        let_else: false,
+                        unwrap: false,
+                    },
+                );
+                let n = ActiveNarrow {
+                    root: path.root,
+                    path: path.fields,
+                    name,
+                    inner: Ty::Named(sub),
+                    test_id: e.id,
+                };
+                Ok((vec![n], Vec::new()))
+            }
             // Tests of a union member: `typeof x === "string"`, `x.kind === "circle"`,
             // `x instanceof C`, `"field" in x`, `Array.isArray(x)`.
             _ if self.is_union_test_shape(e) => {
@@ -678,6 +733,41 @@ impl<'m> Infer<'m> {
                 Ok((Vec::new(), Vec::new()))
             }
         }
+    }
+
+    /// `x instanceof C` where `x` is of a base class of `C`: (base, C). Marks the base
+    /// as dynamically dispatched.
+    fn instance_test(
+        &mut self,
+        value: &'m Expr,
+        class: &Expr,
+    ) -> IResult<Option<(String, String)>> {
+        let ExprKind::Ident(sub) = &class.kind else {
+            return Ok(None);
+        };
+        if self
+            .struct_by_name(sub)
+            .is_none_or(|s| s.kind != StructKind::Class)
+        {
+            return Ok(None);
+        }
+        let vt = self.expr(value, None)?;
+        let Ty::Named(base) = self.types.resolve(&vt) else {
+            return Ok(None);
+        };
+        if self.union_by_name(&base).is_some() || base == *sub || !self.is_subclass(sub, &base) {
+            return Ok(None);
+        }
+        self.polymorphic.insert(base.clone());
+        // Instances of the subclasses of `sub` are seen as `sub` too.
+        if self
+            .structs
+            .iter()
+            .any(|s| s.name != *sub && self.is_subclass(&s.name, sub))
+        {
+            self.polymorphic.insert(sub.clone());
+        }
+        Ok(Some((base, sub.clone())))
     }
 
     /// Whether an expression has the shape of a union member test (the union itself is
@@ -782,6 +872,7 @@ impl<'m> Infer<'m> {
                 positive,
                 union: None,
                 complement: None,
+                instance_of: None,
                 mutated: false,
                 inner: (*inner).clone(),
                 let_else: false,

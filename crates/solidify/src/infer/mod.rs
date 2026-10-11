@@ -88,6 +88,8 @@ pub struct FnInfo {
     pub method_of: Option<String>,
     pub method_kind: Option<MethodKind>,
     pub is_static: bool,
+    /// `abstract m(): T;`: no body; the subclasses implement it.
+    pub is_abstract: bool,
     pub mutates_self: bool,
     /// Outer bindings read by this closure.
     pub captures: Vec<NodeId>,
@@ -179,19 +181,26 @@ pub struct MethodInfo {
     pub fn_id: NodeId,
     pub kind: MethodKind,
     pub is_static: bool,
+    pub is_abstract: bool,
+    pub access: Option<Access>,
 }
 
 #[derive(Clone, Debug)]
 pub struct StructInfo {
     pub name: String,
     pub kind: StructKind,
+    /// The fields, inherited ones first.
     pub fields: Vec<FieldInfo>,
+    /// The methods declared in the class itself.
     pub methods: Vec<MethodInfo>,
     pub ctor: Option<NodeId>,
     pub exported: bool,
     pub span: Span,
     /// Static fields, with the id of their initializer.
     pub statics: Vec<(String, Ty, Option<NodeId>)>,
+    /// `class C extends P`: the base class.
+    pub parent: Option<String>,
+    pub is_abstract: bool,
 }
 
 impl StructInfo {
@@ -263,6 +272,14 @@ pub enum Callee {
     Ctor(String),
     /// `"Math.floor"`, `"array.push"`, `"string.split"`, `"map.get"`…
     Builtin(&'static str),
+    /// `super(…)` in a constructor: the class whose constructor runs.
+    SuperCtor(String),
+    /// `super.m(…)`: the class declaring the method.
+    SuperMethod {
+        class: String,
+        name: String,
+        fn_id: NodeId,
+    },
     /// Any other callee of function type.
     Dynamic,
 }
@@ -282,6 +299,8 @@ pub struct NarrowTest {
     /// What the value is on the other side of the test: the other variant of a union of
     /// two, or the union of the remaining members.
     pub complement: Option<Complement>,
+    /// `x instanceof C` on a value of a base class: the subclass bound.
+    pub instance_of: Option<String>,
     /// The content is changed in the narrowed region: bind it mutably.
     pub mutated: bool,
     pub inner: Ty,
@@ -332,9 +351,69 @@ pub struct Program {
     pub has_main: bool,
     /// Structs that contain themselves: held through a `Box` inside `Option`.
     pub boxed: HashSet<String>,
+    /// Base classes whose values may be instances of a subclass: a trait and `dyn`.
+    pub polymorphic: HashSet<String>,
+    /// Base method → the methods overriding it in subclasses.
+    pub overrides: HashMap<NodeId, Vec<NodeId>>,
 }
 
 impl Program {
+    /// The class and its ancestors, nearest first.
+    pub fn ancestry(&self, class: &str) -> Vec<String> {
+        let mut out = vec![class.to_string()];
+        let mut current = class.to_string();
+        while let Some(p) = self.struct_info(&current).and_then(|s| s.parent.clone()) {
+            if out.contains(&p) {
+                break;
+            }
+            out.push(p.clone());
+            current = p;
+        }
+        out
+    }
+
+    /// Whether `class` is `base` or descends from it.
+    pub fn is_subclass(&self, class: &str, base: &str) -> bool {
+        self.ancestry(class).iter().any(|c| c == base)
+    }
+
+    /// The classes descending from `base` (not `base` itself).
+    pub fn descendants(&self, base: &str) -> Vec<String> {
+        self.structs
+            .iter()
+            .filter(|s| s.name != base && self.is_subclass(&s.name, base))
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    /// A method of the class or of an ancestor, with the class declaring it.
+    pub fn find_method(
+        &self,
+        class: &str,
+        name: &str,
+        kind: MethodKind,
+    ) -> Option<(String, MethodInfo)> {
+        for c in self.ancestry(class) {
+            if let Some(m) = self.struct_info(&c).and_then(|s| s.method(name, kind)) {
+                return Some((c, m.clone()));
+            }
+        }
+        None
+    }
+
+    /// Whether a method, or any override of it in a subclass, changes `this`.
+    pub fn method_mutates(&self, fn_id: NodeId) -> bool {
+        self.funcs.get(&fn_id).is_some_and(|f| f.mutates_self)
+            || self
+                .overrides
+                .get(&fn_id)
+                .is_some_and(|os| os.iter().any(|o| self.method_mutates(*o)))
+    }
+
+    /// Whether values of the class are held as `dyn`.
+    pub fn is_dyn(&self, name: &str) -> bool {
+        self.polymorphic.contains(name)
+    }
     pub fn ty(&self, id: NodeId) -> Ty {
         self.expr_ty.get(&id).cloned().unwrap_or(Ty::Any)
     }
@@ -472,6 +551,13 @@ pub(super) struct Infer<'m> {
     pub(super) hints: HashMap<NodeId, String>,
     /// Variables initialized from a narrowed value: (binding, test).
     pub(super) alias_of_narrow: Vec<(NodeId, NodeId)>,
+    /// Base classes whose values may be instances of a subclass.
+    pub(super) polymorphic: HashSet<String>,
+    /// Base method → overriding methods.
+    pub(super) overrides: HashMap<NodeId, Vec<NodeId>>,
+    /// The class declarations, by name (for base classes collected on demand).
+    pub(super) class_asts: HashMap<String, &'m Class>,
+    pub(super) collected_classes: HashSet<String>,
 }
 
 /// A use of a variable: the expression, the loop depth, the function and the branch path.
@@ -558,6 +644,10 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         this_class_stack: Vec::new(),
         hints: HashMap::new(),
         alias_of_narrow: Vec::new(),
+        polymorphic: HashSet::new(),
+        overrides: HashMap::new(),
+        class_asts: HashMap::new(),
+        collected_classes: HashSet::new(),
     };
     inf.run(module)?;
     inf.finish()
@@ -591,10 +681,11 @@ impl<'m> Infer<'m> {
     }
 
     /// Unifies the type of a value with what is expected of it. A value of a member type
-    /// is accepted where a union is expected (the generator wraps it in the variant).
+    /// is accepted where a union is expected (the generator wraps it in the variant), and
+    /// an instance of a subclass where its base class is expected.
     pub(super) fn expect(&mut self, found: &Ty, expected: &Ty, span: Span) -> IResult<()> {
         if self.types.unify(found, expected).is_err() {
-            if self.union_accepts(expected, found) {
+            if self.union_accepts(expected, found) || self.class_accepts(expected, found) {
                 return Ok(());
             }
             return self.err(
@@ -793,6 +884,88 @@ impl<'m> Infer<'m> {
 
     pub(super) fn union_by_name(&self, name: &str) -> Option<&UnionInfo> {
         self.unions.iter().find(|u| u.name == name)
+    }
+
+    /// The class and its ancestors, nearest first.
+    pub(super) fn ancestry(&self, class: &str) -> Vec<String> {
+        let mut out = vec![class.to_string()];
+        let mut current = class.to_string();
+        while let Some(p) = self.struct_by_name(&current).and_then(|s| s.parent.clone()) {
+            if out.contains(&p) {
+                break;
+            }
+            out.push(p.clone());
+            current = p;
+        }
+        out
+    }
+
+    pub(super) fn is_subclass(&self, class: &str, base: &str) -> bool {
+        self.ancestry(class).iter().any(|c| c == base)
+    }
+
+    /// A method of the class or of an ancestor, with the class declaring it.
+    pub(super) fn find_method(
+        &self,
+        class: &str,
+        name: &str,
+        kind: MethodKind,
+    ) -> Option<(String, MethodInfo)> {
+        for c in self.ancestry(class) {
+            if let Some(m) = self.struct_by_name(&c).and_then(|s| s.method(name, kind)) {
+                return Some((c, m.clone()));
+            }
+        }
+        None
+    }
+
+    /// A static field of the class or of an ancestor.
+    pub(super) fn find_static(&self, class: &str, name: &str) -> Option<(String, Ty)> {
+        for c in self.ancestry(class) {
+            if let Some((_, t, _)) = self
+                .struct_by_name(&c)
+                .and_then(|s| s.statics.iter().find(|(n, _, _)| n == name))
+            {
+                return Some((c, t.clone()));
+            }
+        }
+        None
+    }
+
+    /// The constructor a class runs: its own, or the nearest inherited one.
+    pub(super) fn nearest_ctor(&self, class: &str) -> Option<(String, NodeId)> {
+        for c in self.ancestry(class) {
+            if let Some(ctor) = self.struct_by_name(&c).and_then(|s| s.ctor) {
+                return Some((c, ctor));
+            }
+        }
+        None
+    }
+
+    /// Whether a value of class `found` can go where `expected` (a base class of it,
+    /// possibly nullable) is wanted; the base class then needs dynamic dispatch.
+    pub(super) fn class_accepts(&mut self, expected: &Ty, found: &Ty) -> bool {
+        let target = match self.types.resolve(expected) {
+            Ty::Option(inner) => self.types.resolve(&inner),
+            other => other,
+        };
+        let found = match self.types.resolve(found) {
+            Ty::Option(inner) => self.types.resolve(&inner),
+            other => other,
+        };
+        let (Ty::Named(base), Ty::Named(class)) = (target, found) else {
+            return false;
+        };
+        if base == class
+            || self
+                .struct_by_name(&base)
+                .is_none_or(|s| s.kind != StructKind::Class)
+            || !self.is_subclass(&class, &base)
+        {
+            return false;
+        }
+        self.polymorphic.insert(base);
+        true
     }
 
     /// The union a type names, if any.

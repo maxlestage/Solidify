@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+#[allow(unused_imports)]
+use super::MethodInfo;
 use super::finish::{leak, same_shape_ty, substitute};
 use super::{
     Callee, EnumKind, FieldInfo, FnInfo, GLOBALS, IResult, Infer, Path, Role, Root, StructInfo,
@@ -79,7 +81,9 @@ impl<'m> Infer<'m> {
                 }
                 Ok(Ty::Named(class))
             }
-            ExprKind::Super => self.err("`super` is not supported", e.span),
+            ExprKind::Super => {
+                self.err("`super` is used as `super(…)` or `super.method(…)`", e.span)
+            }
             ExprKind::Ident(name) => self.ident(name, e),
             ExprKind::Array(elems) => {
                 let elem_expected = match &expected_res {
@@ -518,7 +522,20 @@ impl<'m> Infer<'m> {
                     _ => self.err("`in` is only supported on a Map or a Record", span),
                 }
             }
-            BinOp::InstanceOf => self.err("`instanceof` is not supported", span),
+            BinOp::InstanceOf => {
+                // Outside a condition: decided by the types.
+                self.expr(left, None)?;
+                let ExprKind::Ident(class) = &right.kind else {
+                    return self.err("`instanceof` needs a class name", right.span);
+                };
+                if self
+                    .struct_by_name(class)
+                    .is_none_or(|s| s.kind != StructKind::Class)
+                {
+                    return self.err(format!("`{class}` is not a class"), right.span);
+                }
+                Ok(Ty::Bool)
+            }
         }
     }
 
@@ -861,6 +878,8 @@ impl<'m> Infer<'m> {
             exported: false,
             span: e.span,
             statics: Vec::new(),
+            parent: None,
+            is_abstract: false,
         });
         self.literal_struct.insert(e.id, name.clone());
         Ok(Ty::Named(name))
@@ -955,11 +974,10 @@ impl<'m> Infer<'m> {
                 Role::Class => {
                     self.refs.insert(obj.id, id);
                     self.set_ty(obj.id, Ty::Named(name.clone()));
-                    let s = self.struct_by_name(name).expect("class");
-                    if let Some((_, t, _)) = s.statics.iter().find(|(n, _, _)| n == prop) {
-                        return Ok(t.clone());
+                    if let Some((_, t)) = self.find_static(name, prop) {
+                        return Ok(t);
                     }
-                    if let Some(m) = s.method(prop, MethodKind::Get)
+                    if let Some((_, m)) = self.find_method(name, prop, MethodKind::Get)
                         && m.is_static
                     {
                         return Ok(self.funcs[&m.fn_id].sig.ret.clone());
@@ -1036,10 +1054,10 @@ impl<'m> Infer<'m> {
                         f.ty.clone()
                     });
                 }
-                if let Some(m) = s.method(prop, MethodKind::Get) {
+                if let Some((_, m)) = self.find_method(n, prop, MethodKind::Get) {
                     return Ok(self.funcs[&m.fn_id].sig.ret.clone());
                 }
-                if s.method(prop, MethodKind::Method).is_some() {
+                if self.find_method(n, prop, MethodKind::Method).is_some() {
                     return self.err(
                         format!(
                             "`{prop}` is a method: call it, `{}.{prop}()`",
@@ -1142,8 +1160,14 @@ impl<'m> Infer<'m> {
             self.refs.insert(callee.id, id);
             self.set_ty(callee.id, Ty::Named(name.clone()));
             let s = self.struct_by_name(name).expect("class");
-            match s.ctor {
-                Some(ctor) => {
+            if s.is_abstract {
+                return self.err(
+                    format!("{name} is abstract: `new` one of its subclasses"),
+                    e.span,
+                );
+            }
+            match self.nearest_ctor(name) {
+                Some((_, ctor)) => {
                     let info = self.funcs[&ctor].clone();
                     self.args(args, &info, ctor, e.span)?;
                     let caller = self.ctx().id;
@@ -1287,6 +1311,10 @@ impl<'m> Infer<'m> {
             self.calls_in_try.insert(e.id);
         }
         match &callee.kind {
+            ExprKind::Super => return self.super_call(e, args),
+            ExprKind::Member { obj, prop, .. } if matches!(obj.kind, ExprKind::Super) => {
+                return self.super_method_call(e, prop, args);
+            }
             ExprKind::Ident(name) => {
                 if let Some(id) = self.lookup(name) {
                     self.refs.insert(callee.id, id);
@@ -1362,6 +1390,85 @@ impl<'m> Infer<'m> {
                 Ok(f.ret.clone())
             }
         }
+    }
+
+    /// `super(args)`: the constructor of the base class runs first.
+    fn super_call(&mut self, e: &'m Expr, args: &'m [Arg]) -> IResult<Ty> {
+        let Some(class) = self.ctx().this.clone() else {
+            return self.err("`super(…)` outside a class", e.span);
+        };
+        if !self.ctx().in_ctor {
+            return self.err("`super(…)` belongs in the constructor", e.span);
+        }
+        let Some(parent) = self.struct_by_name(&class).and_then(|s| s.parent.clone()) else {
+            return self.err(format!("{class} has no base class"), e.span);
+        };
+        match self.nearest_ctor(&parent) {
+            Some((owner, ctor)) => {
+                let info = self.funcs[&ctor].clone();
+                self.args(args, &info, ctor, e.span)?;
+                let caller = self.ctx().id;
+                self.funcs
+                    .get_mut(&caller)
+                    .expect("fn")
+                    .calls
+                    .push((ctor, e.id));
+                self.calls.insert(e.id, Callee::SuperCtor(owner));
+            }
+            None => {
+                if !args.is_empty() {
+                    return self.err(
+                        format!("{parent} has no constructor: `super()` takes no arguments"),
+                        e.span,
+                    );
+                }
+                self.calls.insert(e.id, Callee::SuperCtor(parent));
+            }
+        }
+        Ok(Ty::Void)
+    }
+
+    /// `super.m(args)`: the base class's version of a method.
+    fn super_method_call(&mut self, e: &'m Expr, prop: &str, args: &'m [Arg]) -> IResult<Ty> {
+        let Some(class) = self.ctx().this.clone() else {
+            return self.err("`super` outside a class", e.span);
+        };
+        let Some(parent) = self.struct_by_name(&class).and_then(|s| s.parent.clone()) else {
+            return self.err(format!("{class} has no base class"), e.span);
+        };
+        let Some((owner, m)) = self.find_method(&parent, prop, MethodKind::Method) else {
+            return self.err(
+                format!("no method `{prop}` in the base classes of {class}"),
+                e.span,
+            );
+        };
+        if m.is_abstract {
+            return self.err(
+                format!("`{prop}` is abstract in {owner}: nothing to call"),
+                e.span,
+            );
+        }
+        let info = self.funcs[&m.fn_id].clone();
+        self.args(args, &info, m.fn_id, e.span)?;
+        let caller = self.ctx().this_fn;
+        if !self.ctx().in_ctor {
+            self.this_calls.push((m.fn_id, caller));
+        }
+        let caller = self.ctx().id;
+        self.funcs
+            .get_mut(&caller)
+            .expect("fn")
+            .calls
+            .push((m.fn_id, e.id));
+        self.calls.insert(
+            e.id,
+            Callee::SuperMethod {
+                class: owner,
+                name: prop.to_string(),
+                fn_id: m.fn_id,
+            },
+        );
+        Ok(info.sig.ret.clone())
     }
 
     fn instantiate_ret(&mut self, info: &FnInfo, args: &'m [Arg]) -> IResult<Ty> {
@@ -1529,11 +1636,13 @@ impl<'m> Infer<'m> {
         {
             self.refs.insert(obj.id, id);
             self.set_ty(obj.id, Ty::Named(name.clone()));
-            let s = self.struct_by_name(name).expect("class");
-            let Some(m) = s.method(prop, MethodKind::Method).filter(|m| m.is_static) else {
+            let Some((owner, m)) = self
+                .find_method(name, prop, MethodKind::Method)
+                .filter(|(_, m)| m.is_static)
+            else {
                 return self.err(format!("{name} has no static method `{prop}`"), e.span);
             };
-            let (fn_id, class) = (m.fn_id, name.clone());
+            let (fn_id, class) = (m.fn_id, owner);
             let info = self.funcs[&fn_id].clone();
             self.args(args, &info, fn_id, e.span)?;
             self.calls.insert(
@@ -1579,7 +1688,7 @@ impl<'m> Infer<'m> {
                     self.calls.insert(e.id, Callee::Dynamic);
                     return Ok(fun.ret.clone());
                 }
-                let Some(m) = s.method(prop, MethodKind::Method) else {
+                let Some((_, m)) = self.find_method(n, prop, MethodKind::Method) else {
                     return self.err(format!("{n} has no method `{prop}`"), e.span);
                 };
                 if m.is_static {

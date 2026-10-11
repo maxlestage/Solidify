@@ -27,8 +27,8 @@ struct Dog {
 }
 
 impl Dog {
-    pub fn new(name: &str, age: i64, nickname: Option<&str>) -> Self {
-        Self { name: name.to_string(), age, nickname: nickname.map(|v| v.to_string()) }
+    pub fn new(name: String, age: i64, nickname: Option<String>) -> Self {
+        Self { name, age, nickname }
     }
 }
 
@@ -68,7 +68,7 @@ pub struct Object2 {
 fn main() {
     let points = vec![Point { x: 1, y: 2 }, Point { x: 3, y: 4 }];
     println!("{} {} {} {} []", js_inspect(&points.js_value()), js_inspect(&points[0].js_value()), js_inspect(&(vec![1, 2, 3]).js_value()), js_inspect(&(vec!["a".to_string(), "it's".to_string()]).js_value()));
-    println!("{} {}", js_inspect(&(Dog::new("Rex", 3, None)).js_value()), js_inspect(&(vec![Dog::new("a", 1, None), Dog::new("b", 2, Some("bee"))]).js_value()));
+    println!("{} {}", js_inspect(&(Dog::new("Rex".to_string(), 3, None)).js_value()), js_inspect(&(vec![Dog::new("a".to_string(), 1, None), Dog::new("b".to_string(), 2, Some("bee".to_string()))]).js_value()));
     let user = User { id: 7, tags: vec!["x".to_string(), "y".to_string()], status: Status::Active, home: None };
     println!("{} {}", js_inspect(&user.js_value()), js_inspect(&(Object { nested: Nested { deep: NestedDeep { deeper: NestedDeepDeeper { deepest: 1 } } } }).js_value()));
     let mut scores: JsMap<String, i64> = JsMap::new();

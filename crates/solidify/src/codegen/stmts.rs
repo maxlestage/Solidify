@@ -102,7 +102,7 @@ impl<'a> Gen<'a> {
                     return Ok(());
                 }
                 self.blank();
-                self.function_item(f, None)?;
+                self.function_item(f, None, None)?;
                 Ok(())
             }
             StmtKind::Class(c) => self.err(
@@ -719,12 +719,29 @@ impl<'a> Gen<'a> {
             self.line(&format!("*{base}.{}_mut() = {val};", snake(prop)));
             return Ok(());
         }
+        // A field of a value held dynamically: through its mutable accessor.
+        if let ExprKind::Member { obj, prop, .. } = &t.kind
+            && !matches!(obj.kind, ExprKind::This)
+            && let Ty::Named(n) = self.ty_of(obj)
+            && self.p.is_dyn(&n)
+            && self
+                .p
+                .struct_info(&n)
+                .is_some_and(|s| s.field(prop).is_some())
+        {
+            self.dyn_setters.insert((n.clone(), prop.to_string()));
+            let o = self.expr(obj)?;
+            let base = Self::paren(&o, PREC_POSTFIX);
+            let place = format!("*{base}.{}_mut()", snake(prop));
+            let x = E::new(place, PREC_UNARY, Repr::Owned);
+            return self.assign_to(op, x, value, &tt, &vt, e);
+        }
         // A setter.
         if let ExprKind::Member { obj, prop, .. } = &t.kind
             && let Ty::Named(n) = self.ty_of(obj)
             && let Some(info) = self.p.struct_info(&n)
             && info.field(prop).is_none()
-            && info.method(prop, MethodKind::Set).is_some()
+            && self.p.find_method(&n, prop, MethodKind::Set).is_some()
         {
             let o = self.expr(obj)?;
             let base = Self::paren(&o, PREC_POSTFIX);
@@ -777,6 +794,20 @@ impl<'a> Gen<'a> {
             }
             _ => self.expr(t)?,
         };
+        self.assign_to(op, x, value, &tt, &vt, e)
+    }
+
+    /// `place op= value`.
+    fn assign_to(
+        &mut self,
+        op: AssignOp,
+        x: E,
+        value: &'a Expr,
+        tt: &Ty,
+        vt: &Ty,
+        e: &'a Expr,
+    ) -> GResult<()> {
+        let (tt, vt) = (tt.clone(), vt.clone());
         let place = self.place(x);
         match op {
             AssignOp::Assign => {

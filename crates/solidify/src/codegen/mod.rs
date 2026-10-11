@@ -163,6 +163,15 @@ pub(super) struct Gen<'a> {
     pub union_accessors: BTreeSet<(String, String, bool)>,
     /// Unions whose `typeof` is taken.
     pub union_typeof: BTreeSet<String>,
+    /// The class whose `impl` is being written (methods inherited from a base class are
+    /// written again for each subclass).
+    pub current_class: Option<String>,
+    /// Fields written through a `dyn` value: (class, field).
+    pub dyn_setters: BTreeSet<(String, String)>,
+    /// `x instanceof Sub` on a `dyn Base` value: (base, sub, mutable).
+    pub instance_tests: BTreeSet<(String, String, bool)>,
+    /// `super.m()` helpers to write: class → (declaring class, method).
+    pub super_helpers: BTreeMap<String, BTreeSet<(String, String)>>,
     /// Binding → Rust name.
     pub names: HashMap<NodeId, String>,
     /// Binding → how the variable holds its value.
@@ -193,6 +202,10 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         inspected: BTreeSet::new(),
         union_accessors: BTreeSet::new(),
         union_typeof: BTreeSet::new(),
+        current_class: None,
+        dyn_setters: BTreeSet::new(),
+        instance_tests: BTreeSet::new(),
+        super_helpers: BTreeMap::new(),
         names: HashMap::new(),
         reprs: HashMap::new(),
         fn_asts: HashMap::new(),
@@ -1106,6 +1119,8 @@ impl<'a> Gen<'a> {
                     "String".into()
                 } else if self.is_type_param(&n) {
                     n
+                } else if self.p.is_dyn(&n) {
+                    format!("Box<dyn {}Like>", pascal(&n))
                 } else {
                     pascal(&n)
                 }
@@ -1198,13 +1213,38 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `dyn CLike` for a class held dynamically, else `None`.
+    pub(super) fn dyn_name(&self, ty: &Ty) -> Option<String> {
+        match self.resolve(ty) {
+            Ty::Named(n) if self.p.is_dyn(&n) => Some(format!("dyn {}Like", pascal(&n))),
+            _ => None,
+        }
+    }
+
+    /// Whether a value of this type holds a `dyn` class somewhere (no `PartialEq` then).
+    pub(super) fn contains_dyn(&self, ty: &Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Named(n) => self.p.is_dyn(&n),
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.contains_dyn(&t),
+            Ty::Map(k, v, _) => self.contains_dyn(&k) || self.contains_dyn(&v),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.contains_dyn(t)),
+            _ => false,
+        }
+    }
+
     /// The Rust type of a parameter passed in `mode`.
     pub(super) fn mode_ty(&mut self, ty: &Ty, mode: Mode, span: Span) -> GResult<String> {
         Ok(match mode {
             Mode::Value => self.rust_ty(ty, span)?,
             Mode::FnImpl => self.fn_param_ty(ty, span)?,
-            Mode::Ref => format!("&{}", self.rust_ty(ty, span)?),
-            Mode::RefMut => format!("&mut {}", self.rust_ty(ty, span)?),
+            Mode::Ref => match self.dyn_name(ty) {
+                Some(d) => format!("&{d}"),
+                None => format!("&{}", self.rust_ty(ty, span)?),
+            },
+            Mode::RefMut => match self.dyn_name(ty) {
+                Some(d) => format!("&mut {d}"),
+                None => format!("&mut {}", self.rust_ty(ty, span)?),
+            },
             Mode::StrRef => "&str".into(),
             Mode::Slice => match self.resolve(ty) {
                 Ty::Array(t) => format!("&[{}]", self.rust_ty(&t, span)?),
@@ -1212,7 +1252,10 @@ impl<'a> Gen<'a> {
             },
             Mode::OptRef => match self.resolve(ty) {
                 Ty::Option(inner) if self.is_str(&inner) => "Option<&str>".into(),
-                Ty::Option(inner) => format!("Option<&{}>", self.rust_ty(&inner, span)?),
+                Ty::Option(inner) => match self.dyn_name(&inner) {
+                    Some(d) => format!("Option<&{d}>"),
+                    None => format!("Option<&{}>", self.rust_ty(&inner, span)?),
+                },
                 _ => self.rust_ty(ty, span)?,
             },
         })
@@ -1239,8 +1282,8 @@ impl<'a> Gen<'a> {
                     || self.p.is_enum(&n)
                     || self
                         .p
-                        .struct_info(&n)
-                        .is_some_and(|s| s.method("toString", MethodKind::Method).is_some());
+                        .find_method(&n, "toString", MethodKind::Method)
+                        .is_some();
                 if prints { "{}" } else { "{:?}" }
             }
             _ => "{:?}",
@@ -1481,6 +1524,19 @@ impl<'a> Gen<'a> {
         };
         if let Some((en, variant)) = self.union_variant(&from_r, &target) {
             code = format!("{en}::{variant}({code})");
+        }
+        // An instance of a subclass where the base class is held dynamically.
+        if let (Ty::Named(from_class), Ty::Named(base)) = (&from_r, &target)
+            && from_class != base
+            && self.p.is_dyn(base)
+            && self.p.is_subclass(from_class, base)
+        {
+            let trait_name = format!("Box<dyn {}Like>", pascal(base));
+            code = if self.p.is_dyn(from_class) {
+                format!("{code} as {trait_name}")
+            } else {
+                format!("Box::new({code}) as {trait_name}")
+            };
         }
         if let Ty::Option(inner) = &to_r
             && !matches!(from_r, Ty::Option(_))
