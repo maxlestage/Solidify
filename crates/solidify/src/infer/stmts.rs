@@ -191,10 +191,18 @@ impl<'m> Infer<'m> {
                             self.unify(&it, &Ty::Array(Box::new(t.clone())), iter.span)?;
                             t
                         }
-                        other => {
-                            let d = self.describe(other);
-                            return self.err(format!("cannot iterate over {d}"), iter.span);
-                        }
+                        other => match self.struct_iteration(other) {
+                            Some(t) => t,
+                            None => {
+                                let d = self.describe(other);
+                                return self.err(
+                                    format!(
+                                        "cannot iterate over {d}: give it a `[Symbol.iterator]()` method"
+                                    ),
+                                    iter.span,
+                                );
+                            }
+                        },
                     }
                 };
                 self.push_scope();

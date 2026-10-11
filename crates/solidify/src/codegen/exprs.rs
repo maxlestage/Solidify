@@ -108,8 +108,36 @@ impl<'a> Gen<'a> {
             ExprKind::Object(props) => self.object(e, props, &ty),
             ExprKind::Func(f) | ExprKind::Arrow(f) => self.closure(f, &[], false),
             ExprKind::Unary { op, arg } => self.unary(*op, arg),
-            ExprKind::Update { .. } | ExprKind::Assign { .. } => self.err(
-                "an assignment cannot be used as a value here: write it on its own line",
+            // `arr[i++]`, `return n--`: the update, then the old (or new) value.
+            ExprKind::Update { inc, prefix, arg } => {
+                let text = self.update_text(*inc, arg)?;
+                let read = self.expr_as(arg, Want::Owned)?;
+                Ok(E::atom(
+                    if *prefix {
+                        format!("{{ {text}; {read} }}")
+                    } else {
+                        format!("{{ let old = {read}; {text}; old }}")
+                    },
+                    Repr::Owned,
+                ))
+            }
+            // `a = b = 0`, `f(x = 2)`: the assignment, then the value assigned.
+            ExprKind::Assign {
+                target: AssignTarget::Expr(t),
+                ..
+            } => {
+                let lines = self.capture(|g| g.expr_stmt(e))?;
+                let stmt = lines
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let read = self.expr_as(t, Want::Owned)?;
+                Ok(E::atom(format!("{{ {stmt} {read} }}"), Repr::Owned))
+            }
+            ExprKind::Assign { .. } => self.err(
+                "a destructuring assignment cannot be used as a value here: write it on its own line",
                 e.span,
             ),
             ExprKind::Binary { op, left, right } => self.binary(*op, left, right, e),
@@ -327,14 +355,21 @@ impl<'a> Gen<'a> {
                 Ty::Bool => "boolean",
                 Ty::Func(_) => "function",
                 Ty::Void | Ty::Null => "undefined",
+                Ty::Named(n, _) if n == "Symbol" => "symbol",
                 _ => "object",
             }
         };
         if let Ty::Option(t) = self.resolve(&ty) {
             let x = self.recv(inner)?;
             let some = word(self, &t);
+            // `typeof null` is "object", `typeof undefined` is "undefined".
+            let none = if self.p.undefinedish(inner) {
+                "undefined"
+            } else {
+                "object"
+            };
             return Ok(E::owned(
-                format!("if {x}.is_some() {{ \"{some}\" }} else {{ \"object\" }}"),
+                format!("if {x}.is_some() {{ \"{some}\" }} else {{ \"{none}\" }}"),
                 PREC_ATOM,
             ));
         }
@@ -476,6 +511,8 @@ impl<'a> Gen<'a> {
         }
         let mut fmt = String::new();
         let mut args = Vec::new();
+        let before = self.inline_names;
+        self.inline_names = !exprs.iter().any(super::changes_something);
         for (i, q) in quasis.iter().enumerate() {
             fmt.push_str(&format_text(q));
             if let Some(x) = exprs.get(i) {
@@ -486,7 +523,12 @@ impl<'a> Gen<'a> {
                 }
             }
         }
-        Ok(E::owned(format_call("format!", &fmt, &args), PREC_ATOM))
+        let in_order = !self.inline_names;
+        self.inline_names = before;
+        Ok(E::owned(
+            super::calls::in_order_call("format!", &fmt, &args, in_order),
+            PREC_ATOM,
+        ))
     }
 
     /// `x` (a Rust expression of type `ty`) as JavaScript's `String(x)`.
@@ -628,7 +670,7 @@ impl<'a> Gen<'a> {
             return Ok(("{}".into(), Some(format!("{h}({code})"))));
         }
         let code = self.coerce(e, &ty, Want::Display);
-        if is_plain_ident(&code) && !code.starts_with("r#") {
+        if is_plain_ident(&code) && !code.starts_with("r#") && self.inline_names {
             let inline = if spec == "{}" {
                 format!("{{{code}}}")
             } else {
@@ -686,6 +728,12 @@ impl<'a> Gen<'a> {
                             // A borrowed array (a slice parameter): a copy.
                             Ty::Array(_) if matches!(s.repr, Repr::Ref | Repr::RefMut) => {
                                 format!("{recv}.to_vec()")
+                            }
+                            ref other if self.struct_iteration(other).is_some() => {
+                                let (_, generator) =
+                                    self.struct_iteration(other).expect("iterable");
+                                let source = self.iteration_source(&recv, generator);
+                                format!("{source}.collect::<Vec<_>>()")
                             }
                             _ => self.owned(s, &xt),
                         });
@@ -1772,6 +1820,9 @@ impl<'a> Gen<'a> {
                     E::owned(format!("{base}.flags().contains('{flag}')"), PREC_POSTFIX)
                 }
             }),
+            Ty::Named(n, ..) if n == "Symbol" => {
+                Ok(E::owned(format!("{base}.description()"), PREC_POSTFIX))
+            }
             Ty::Named(n, ..) if n == "RegExpMatch" => Ok(match prop {
                 "index" => E::new(format!("{base}.index"), PREC_POSTFIX, Repr::Place),
                 "input" => E::new(format!("{base}.input"), PREC_POSTFIX, Repr::Place),

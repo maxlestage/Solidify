@@ -151,6 +151,10 @@ impl<'m> Infer<'m> {
                                     self.expect(&Ty::Tuple(vec![*k, *v]), &item, x.span)?
                                 }
                                 Ty::Str => self.expect(&Ty::Str, &item, x.span)?,
+                                ref other if self.struct_iteration(other).is_some() => {
+                                    let t = self.struct_iteration(other).expect("iterable");
+                                    self.expect(&t, &item, x.span)?
+                                }
                                 _ => self.expect(&xt, &arr, x.span)?,
                             }
                         }
@@ -1328,6 +1332,13 @@ impl<'m> Infer<'m> {
                         _ => self.err(format!("RegExp has no property `{prop}`"), span),
                     };
                 }
+                if n == "Symbol" {
+                    return match prop {
+                        // `undefined` for `Symbol()`.
+                        "description" => Ok(Ty::Option(Box::new(Ty::Str))),
+                        _ => self.err(format!("a symbol has no property `{prop}`"), span),
+                    };
+                }
                 if n == "RegExpMatch" {
                     return match prop {
                         "index" | "length" => Ok(self.types.int()),
@@ -2088,6 +2099,14 @@ impl<'m> Infer<'m> {
                 self.nan_test_arg(args, name, span)?;
                 Ty::Bool
             }
+            // `Symbol("id")`: a value equal only to itself.
+            "Symbol" => {
+                if !args.is_empty() {
+                    self.arg_typed(args, 0, Some(Ty::Str), name, span)?;
+                }
+                self.no_more_than(args, 1, name, span)?;
+                Ty::named("Symbol")
+            }
             "structuredClone" => self.arg_typed(args, 0, None, name, span)?,
             "require" => {
                 return self.err(
@@ -2338,6 +2357,7 @@ impl<'m> Infer<'m> {
                     && n != "RegExp"
                     && n != "RegExpMatch"
                     && n != "Date"
+                    && n != "Symbol"
                     && !self.is_type_param(n) =>
             {
                 let Some(s) = self.struct_by_name(n) else {

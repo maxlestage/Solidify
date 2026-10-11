@@ -214,6 +214,9 @@ pub(super) struct Gen<'a> {
     pub class_subst: HashMap<String, Ty>,
     /// The array being shown has `undefined` (not `null`) for its missing elements.
     pub elems_undefined: bool,
+    /// Plain variables may be written inside a format string (`{x}`): no other value of
+    /// the same call changes them.
+    pub inline_names: bool,
     /// Fields written through a constrained type parameter: (constraint, field).
     pub bound_setters: BTreeSet<(String, String)>,
     /// The bounds of the generic items found by the previous pass (`fn:<id>`,
@@ -254,6 +257,7 @@ fn generate_with(
         known_bounds: known.clone(),
         bound_setters: BTreeSet::new(),
         elems_undefined: false,
+        inline_names: true,
         class_subst: HashMap::new(),
         found_bounds: HashMap::new(),
         m: module,
@@ -727,6 +731,10 @@ const RUST_KEYWORDS: &[&str] = &[
 
 /// `userName` → `user_name`; keywords get a `r#` prefix.
 pub fn snake(name: &str) -> String {
+    // `[Symbol.iterator]()` is `js_iterator()`.
+    if let Some(rest) = name.strip_prefix("@@") {
+        return format!("js_{}", snake(rest));
+    }
     let mut out = String::new();
     let chars: Vec<char> = name.chars().filter(|c| *c != '#').collect();
     for (i, &c) in chars.iter().enumerate() {
@@ -911,6 +919,7 @@ impl<'a> Gen<'a> {
             Helper::ParseFloat => "js_parse_float",
             Helper::ToInt32 => "js_to_int32",
             Helper::NumText => "js_number_text",
+            Helper::Symbol => "JsSymbol",
             Helper::NumFormat => "js_to_fixed",
             Helper::ToNumber => "js_number",
             Helper::Random => "js_random",
@@ -1427,6 +1436,40 @@ impl<'a> Gen<'a> {
             })
     }
 
+    /// What `for … of` gives for an object with `[Symbol.iterator]()`, and whether that
+    /// method is a generator (else it returns an object with `next()`).
+    pub(super) fn struct_iteration(&self, ty: &Ty) -> Option<(Ty, bool)> {
+        let Ty::Named(n, _) = self.resolve(ty) else {
+            return None;
+        };
+        let (_, m) = self.p.find_method(&n, "@@iterator", MethodKind::Method)?;
+        match self.resolve(&self.p.funcs[&m.fn_id].sig.ret) {
+            Ty::Gen(t) => Some((*t, true)),
+            Ty::Named(it, _) => {
+                let next = self.p.struct_info(&it)?.field("next")?.ty.clone();
+                let Ty::Func(f) = self.resolve(&next) else {
+                    return None;
+                };
+                let Ty::Named(r, _) = self.resolve(&f.ret) else {
+                    return None;
+                };
+                Some((self.p.struct_info(&r)?.field("value")?.ty.clone(), false))
+            }
+            _ => None,
+        }
+    }
+
+    /// An iterator over an object with `[Symbol.iterator]()`.
+    pub(super) fn iteration_source(&self, recv: &str, generator: bool) -> String {
+        if generator {
+            format!("{recv}.js_iterator()")
+        } else {
+            format!(
+                "{{ let it = {recv}.js_iterator(); std::iter::from_fn(move || {{ let r = (it.next)(); if r.done {{ None }} else {{ Some(r.value) }} }}) }}"
+            )
+        }
+    }
+
     /// `T extends HasId`: the struct a type parameter in scope is constrained to.
     pub(super) fn constraint_of(&self, param: &str) -> Option<String> {
         for ctx in self.fns.iter().rev() {
@@ -1697,6 +1740,8 @@ impl<'a> Gen<'a> {
                     "JsMatch".into()
                 } else if n == "Date" {
                     self.helper(Helper::Date).into()
+                } else if n == "Symbol" {
+                    self.helper(Helper::Symbol).into()
                 } else if self.is_type_param(&n) {
                     n
                 } else if self.p.is_dyn(&n) {
@@ -1920,6 +1965,7 @@ impl<'a> Gen<'a> {
             Ty::Num(_) | Ty::Str | Ty::Bool => "{}",
             Ty::Named(n, ..) => {
                 let prints = n == "Error"
+                    || n == "Symbol"
                     || n == "RegExp"
                     || self.is_type_param(&n)
                     || self.p.is_enum(&n)
@@ -2190,6 +2236,8 @@ impl<'a> Gen<'a> {
         // A function kept in a field or a collection is shared: behind an `Rc`.
         let fresh_fn = e.code.starts_with('|')
             || e.code.starts_with("move |")
+            // A closure after the copies of what it captures: `{ let k = k.clone(); move || … }`.
+            || (e.code.starts_with("{ let ") && e.code.contains("; move |"))
             || e.var.is_some_and(|(b, _)| {
                 let v = self.p.var(b);
                 v.role == Role::Func || v.closure_fn.is_some()
@@ -2314,4 +2362,18 @@ fn is_int_literal_code(code: &str) -> bool {
     let c = code.trim_end_matches("_i64");
     let c = c.strip_prefix('-').unwrap_or(c);
     !c.is_empty() && c.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether an expression changes a variable (`i++`, `x = 1`): the values around it must
+/// be read in order.
+pub(super) fn changes_something(e: &Expr) -> bool {
+    let mut found = false;
+    let mut copy = e.clone();
+    crate::desugar::expr_mut(&mut copy, &mut |x| {
+        if matches!(x.kind, ExprKind::Update { .. } | ExprKind::Assign { .. }) {
+            found = true;
+        }
+        !found
+    });
+    found
 }

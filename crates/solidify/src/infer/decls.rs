@@ -744,12 +744,6 @@ impl<'m> Infer<'m> {
         if f.is_generator && f.is_async {
             return self.err("async generators are not supported", f.span);
         }
-        if f.is_generator && method_of.is_some() {
-            return self.err(
-                "generator methods are not supported: use a function",
-                f.span,
-            );
-        }
         let type_params: Vec<String> = f.type_params.iter().map(|t| t.name.clone()).collect();
         // Type parameters are visible while reading the annotations.
         self.fns.push(FnCtx {

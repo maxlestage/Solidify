@@ -1209,7 +1209,19 @@ impl<'a> Parser<'a> {
                 s
             }
             Tok::Punct("[") => {
-                return Err(Error::new("computed member names are not supported", start));
+                // `[Symbol.iterator]()`, `["name"]`.
+                self.next();
+                let key = self.assignment()?;
+                self.expect_punct("]")?;
+                match computed_name(&key) {
+                    Some(n) => n,
+                    None => {
+                        return Err(Error::new(
+                            "a computed member name must be `Symbol.iterator`, `Symbol.asyncIterator` or a string",
+                            key.span,
+                        ));
+                    }
+                }
             }
             _ => return self.unexpected("a member name"),
         };
@@ -2793,6 +2805,20 @@ impl<'a> Parser<'a> {
         self.no_in = was;
         self.expect_punct("}")?;
         Ok(self.expr(ExprKind::Object(props), start))
+    }
+}
+
+/// The name a computed key stands for: `"@@iterator"` for `[Symbol.iterator]`.
+pub fn computed_name(key: &Expr) -> Option<String> {
+    match &key.kind {
+        ExprKind::Str(s) => Some(s.clone()),
+        ExprKind::Member { obj, prop, .. }
+            if matches!(&obj.kind, ExprKind::Ident(o) if o == "Symbol")
+                && matches!(prop.as_str(), "iterator" | "asyncIterator") =>
+        {
+            Some(format!("@@{prop}"))
+        }
+        _ => None,
     }
 }
 
