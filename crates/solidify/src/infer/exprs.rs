@@ -29,6 +29,12 @@ impl<'m> Infer<'m> {
             ) => Some(self.types.resolve(&inner)),
             (_, other) => other,
         };
+        if expected_res.as_ref().is_some_and(Ty::is_dynamic)
+            && matches!(e.kind, ExprKind::Array(_) | ExprKind::Object(_))
+        {
+            self.dyn_literals.insert(e.id);
+            return self.dyn_literal(e);
+        }
         match &e.kind {
             ExprKind::Num { int, .. } => Ok(if *int {
                 self.types.int_literal()
@@ -190,6 +196,7 @@ impl<'m> Infer<'m> {
                     let t = self.expr(arg, None)?;
                     match self.types.resolve(&t) {
                         Ty::Str if *op == UnaryOp::Pos => Ok(self.types.float()),
+                        d if d.is_dynamic() => Ok(self.types.float()),
                         _ => {
                             let n = self.types.num(Flavor::Unknown);
                             self.expect(&t, &n, arg.span)?;
@@ -199,13 +206,19 @@ impl<'m> Infer<'m> {
                 }
                 UnaryOp::BitNot => {
                     let t = self.expr(arg, None)?;
-                    let n = self.types.num(Flavor::Unknown);
-                    self.expect(&t, &n, arg.span)?;
+                    if !self.types.resolve(&t).is_dynamic() {
+                        let n = self.types.num(Flavor::Unknown);
+                        self.expect(&t, &n, arg.span)?;
+                    }
                     Ok(self.types.int())
                 }
             },
             ExprKind::Update { arg, .. } => {
                 let t = self.expr(arg, None)?;
+                if self.types.resolve(&t).is_dynamic() {
+                    self.mark_mutated(arg);
+                    return Ok(t);
+                }
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&t, &n, arg.span)?;
                 self.mark_mutated(arg);
@@ -217,6 +230,12 @@ impl<'m> Infer<'m> {
                     let lt = self.expr(left, None)?;
                     let inner = match self.types.resolve(&lt) {
                         Ty::Option(t) => *t,
+                        // `data.port ?? 8080`: the value, or the default.
+                        d if d.is_dynamic() => {
+                            let rt = self.expr(right, None)?;
+                            self.dyn_cast(right, &rt, &d);
+                            return Ok(d);
+                        }
                         Ty::Var(_) => {
                             let t = self.types.fresh();
                             self.unify(&lt, &Ty::Option(Box::new(t.clone())), left.span)?;
@@ -252,6 +271,11 @@ impl<'m> Infer<'m> {
                             let rt = self.expr(right, Some(&inner))?;
                             self.expect(&rt, &inner, right.span)?;
                             Ok(*inner)
+                        }
+                        d if d.is_dynamic() => {
+                            let rt = self.expr(right, None)?;
+                            self.dyn_cast(right, &rt, &d);
+                            Ok(d)
                         }
                         _ => {
                             let rt = self.expr(right, Some(&lt))?;
@@ -307,6 +331,17 @@ impl<'m> Infer<'m> {
                     self.expect(&at, &u, alt.span)?;
                     return Ok(u);
                 }
+                // One branch known at run time: both are.
+                let (cr, ar) = (self.types.resolve(&ct), self.types.resolve(&at));
+                if cr.is_dynamic() || ar.is_dynamic() {
+                    for (x, t) in [(cons, &ct), (alt, &at)] {
+                        if matches!(self.types.resolve(t), Ty::Var(_)) {
+                            self.unify(t, &Ty::dynamic(), x.span)?;
+                        }
+                        self.dyn_cast(x, t, &Ty::dynamic());
+                    }
+                    return Ok(Ty::dynamic());
+                }
                 // `c ? x : undefined`: a value or nothing.
                 match (self.types.resolve(&ct), self.types.resolve(&at)) {
                     (Ty::Null, Ty::Null) => return Ok(Ty::Null),
@@ -343,7 +378,9 @@ impl<'m> Infer<'m> {
                 }
                 let before = self.type_args.take();
                 self.type_args = (!given.is_empty()).then_some((e.span, given));
+                let expected_before = std::mem::replace(&mut self.call_expected, expected_res);
                 let r = self.call(e, callee, args, *optional);
+                self.call_expected = expected_before;
                 self.type_args = before;
                 r
             }
@@ -411,6 +448,9 @@ impl<'m> Infer<'m> {
                 }
                 let target = self.ann(ty, "")?;
                 let it = self.expr(inner, Some(&target))?;
+                if self.dyn_cast(inner, &it, &target) {
+                    return Ok(target);
+                }
                 if self.types.unify(&it, &target).is_err() {
                     let (a, b) = (self.describe(&it), self.describe(&target));
                     return self.err(format!("cannot convert {a} to {b} with `as`"), e.span);
@@ -568,6 +608,10 @@ impl<'m> Infer<'m> {
                 if matches!(lr, Ty::Str) || matches!(rr, Ty::Str) {
                     return Ok(Ty::Str);
                 }
+                // A number or a text, decided when the program runs.
+                if self.dyn_operands(left, &lt, right, &rt) {
+                    return Ok(Ty::dynamic());
+                }
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&lt, &n, left.span)?;
                 self.expect(&rt, &n, right.span)?;
@@ -578,10 +622,12 @@ impl<'m> Infer<'m> {
             BinOp::Pow => {
                 let a = self.types.num(Flavor::Unknown);
                 let lt = self.expr(left, Some(&a))?;
-                self.expect(&lt, &a, left.span)?;
                 let b = self.types.num(Flavor::Unknown);
                 let rt = self.expr(right, Some(&b))?;
-                self.expect(&rt, &b, right.span)?;
+                if !self.dyn_operands(left, &lt, right, &rt) {
+                    self.expect(&lt, &a, left.span)?;
+                    self.expect(&rt, &b, right.span)?;
+                }
                 Ok(self.types.float())
             }
             BinOp::Sub | BinOp::Mul | BinOp::Mod => {
@@ -600,8 +646,12 @@ impl<'m> Infer<'m> {
                     self.expect(&rt, &date, right.span)?;
                     return Ok(self.types.int());
                 }
-                self.expect(&lt, &n, left.span)?;
                 let rt = self.expr(right, Some(&n))?;
+                // Numbers, whatever the operands are.
+                if self.dyn_operands(left, &lt, right, &rt) {
+                    return Ok(self.types.float());
+                }
+                self.expect(&lt, &n, left.span)?;
                 self.expect(&rt, &n, right.span)?;
                 if op != BinOp::Mod {
                     self.beyond_safe(left, right, &n);
@@ -611,14 +661,19 @@ impl<'m> Infer<'m> {
             BinOp::Div => {
                 let n = self.types.num(Flavor::Unknown);
                 let lt = self.expr(left, Some(&n))?;
-                self.expect(&lt, &n, left.span)?;
                 let rt = self.expr(right, Some(&n))?;
-                self.expect(&rt, &n, right.span)?;
+                if !self.dyn_operands(left, &lt, right, &rt) {
+                    self.expect(&lt, &n, left.span)?;
+                    self.expect(&rt, &n, right.span)?;
+                }
                 Ok(self.types.float())
             }
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 let lt = self.expr(left, None)?;
                 let rt = self.expr(right, Some(&lt))?;
+                if self.dyn_operands(left, &lt, right, &rt) {
+                    return Ok(Ty::Bool);
+                }
                 if self.types.unify(&lt, &rt).is_err() {
                     let (a, b) = (self.describe(&lt), self.describe(&rt));
                     return self.err(format!("cannot compare {a} with {b}"), span);
@@ -635,6 +690,9 @@ impl<'m> Infer<'m> {
             BinOp::Eq | BinOp::NotEq | BinOp::StrictEq | BinOp::StrictNotEq => {
                 let lt = self.expr(left, None)?;
                 let rt = self.expr(right, Some(&lt))?;
+                if self.dyn_operands(left, &lt, right, &rt) {
+                    return Ok(Ty::Bool);
+                }
                 if self.types.unify(&lt, &rt).is_err()
                     && !self.union_accepts(&lt, &rt)
                     && !self.union_accepts(&rt, &lt)
@@ -654,13 +712,19 @@ impl<'m> Infer<'m> {
                 for side in [left, right] {
                     let n = self.types.num(Flavor::Unknown);
                     let t = self.expr(side, Some(&n))?;
-                    self.expect(&t, &n, side.span)?;
+                    if !self.types.resolve(&t).is_dynamic() {
+                        self.expect(&t, &n, side.span)?;
+                    }
                 }
                 Ok(self.types.int())
             }
             BinOp::In => {
                 let rt = self.expr(right, None)?;
                 match self.types.resolve(&rt) {
+                    d if d.is_dynamic() => {
+                        self.expr(left, None)?;
+                        Ok(Ty::Bool)
+                    }
                     Ty::Map(k, _, _) => {
                         let lt = self.expr(left, Some(&k))?;
                         self.expect(&lt, &k, left.span)?;
@@ -756,7 +820,7 @@ impl<'m> Infer<'m> {
                 match op {
                     AssignOp::Assign => {
                         let vt = self.expr(value, Some(&tt))?;
-                        self.expect_flow(&vt, &tt, value.span)?;
+                        self.expect_flow(&vt, &tt, value)?;
                         if !matches!(t.kind, ExprKind::Ident(_)) {
                             self.mark_stored(value);
                         } else if !super::stmts::is_place(value)
@@ -765,6 +829,12 @@ impl<'m> Infer<'m> {
                         {
                             v.alias = false;
                         }
+                        self.mark_mutated(t);
+                        Ok(tt)
+                    }
+                    _ if self.types.resolve(&tt).is_dynamic() => {
+                        let vt = self.expr(value, None)?;
+                        self.dyn_cast(value, &vt, &tt);
                         self.mark_mutated(t);
                         Ok(tt)
                     }
@@ -785,6 +855,21 @@ impl<'m> Infer<'m> {
                     _ => {
                         let bin = op.binary().expect("compound");
                         let vt = self.expr(value, Some(&tt))?;
+                        // `total += item.price`: the value read as a text or a number.
+                        let vt = if self.types.resolve(&vt).is_dynamic() {
+                            let read = match self.types.resolve(&tt) {
+                                Ty::Str if bin == BinOp::Add => Ty::Str,
+                                _ if bin.is_bitwise() => self.types.int(),
+                                _ => self.types.float(),
+                            };
+                            self.dyn_cast(value, &vt, &read);
+                            if matches!(read, Ty::Num(_)) {
+                                self.types.flow(&read, &tt);
+                            }
+                            read
+                        } else {
+                            vt
+                        };
                         match (bin, self.types.resolve(&tt)) {
                             (BinOp::Add, Ty::Str) => {}
                             (BinOp::Div, _) => {
@@ -1046,7 +1131,7 @@ impl<'m> Infer<'m> {
     }
 
     /// `{ x }`: the variable named like the key.
-    fn shorthand(&mut self, key: &str, id: NodeId, span: Span) -> IResult<Ty> {
+    pub(super) fn shorthand(&mut self, key: &str, id: NodeId, span: Span) -> IResult<Ty> {
         let Some(binding) = self.lookup(key) else {
             return self.err(format!("unknown name `{key}`"), span);
         };
@@ -1302,6 +1387,9 @@ impl<'m> Infer<'m> {
             }
             _ => (ot, false),
         };
+        if ot.is_dynamic() {
+            return Ok(ot);
+        }
         let t = self.member_of(&ot, prop, e.span, obj)?;
         Ok(if lifted {
             match self.types.resolve(&t) {
@@ -1435,6 +1523,11 @@ impl<'m> Infer<'m> {
     /// The type of `obj[index]` for a value of type `ot`.
     fn index_of(&mut self, ot: &Ty, index: &'m Expr, span: Span) -> IResult<Ty> {
         let ot = self.types.resolve(ot);
+        if ot.is_dynamic() {
+            // Any key: a property name or a position.
+            self.expr(index, None)?;
+            return Ok(ot);
+        }
         match &ot {
             Ty::Array(t) => {
                 let it = self.expr(index, None)?;
@@ -1818,7 +1911,7 @@ impl<'m> Infer<'m> {
                     self.expect(&at, &pt, a.expr.span)?;
                 } else {
                     let at = self.expr(&a.expr, Some(&item))?;
-                    self.expect_flow(&at, &item, a.expr.span)?;
+                    self.expect_flow(&at, &item, &a.expr)?;
                     self.mark_stored(&a.expr);
                 }
                 continue;
@@ -1835,7 +1928,7 @@ impl<'m> Infer<'m> {
                 _ => None,
             };
             let at = self.expr(&a.expr, Some(inner.as_ref().unwrap_or(&pt)))?;
-            self.expect_flow(&at, &pt, a.expr.span)?;
+            self.expect_flow(&at, &pt, &a.expr)?;
             if let ExprKind::Ident(name) = &a.expr.kind
                 && let Some(b) = self.lookup(name)
             {
@@ -2048,7 +2141,7 @@ impl<'m> Infer<'m> {
             }
             let pt = f.params[i].clone();
             let at = self.expr(&a.expr, Some(&pt))?;
-            self.expect_flow(&at, &pt, a.expr.span)?;
+            self.expect_flow(&at, &pt, &a.expr)?;
         }
         Ok(())
     }
@@ -2078,6 +2171,11 @@ impl<'m> Infer<'m> {
                 match self.types.resolve(&t) {
                     Ty::Str | Ty::Bool => self.types.float(),
                     Ty::Num(_) => t,
+                    d if d.is_dynamic() => {
+                        let f = self.types.float();
+                        self.dyn_cast(&args[0].expr, &t, &f);
+                        f
+                    }
                     other => {
                         let d = self.describe(&other);
                         return self.err(format!("cannot convert {d} to a number"), span);
@@ -2219,7 +2317,7 @@ impl<'m> Infer<'m> {
         }
         let t = self.expr(&a.expr, expected.as_ref())?;
         if let Some(ex) = expected {
-            self.expect(&t, &ex, a.expr.span)?;
+            self.expect_flow(&t, &ex, &a.expr)?;
         }
         Ok(t)
     }
@@ -2351,6 +2449,9 @@ impl<'m> Infer<'m> {
             }
             _ => ot,
         };
+        if ot.is_dynamic() {
+            return self.dyn_method_call(e, obj, prop, args);
+        }
         match &ot {
             Ty::Named(n, ..)
                 if n != "Error"

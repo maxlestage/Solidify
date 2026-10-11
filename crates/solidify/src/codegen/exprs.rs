@@ -11,6 +11,14 @@ use crate::types::Ty;
 
 impl<'a> Gen<'a> {
     pub(super) fn expr(&mut self, e: &'a Expr) -> GResult<E> {
+        if let Some((from, to)) = self.p.dyn_casts.get(&e.id).cloned()
+            && !self.casting.contains(&e.id)
+        {
+            self.casting.insert(e.id);
+            let r = self.dyn_converted(e, &from, &to);
+            self.casting.remove(&e.id);
+            return r;
+        }
         if let Some((name, test_id)) = self.p.narrowed_uses.get(&e.id) {
             let test = self.p.narrow_tests.get(test_id);
             if test.is_some_and(|t| t.unwrap) {
@@ -81,6 +89,9 @@ impl<'a> Gen<'a> {
     /// An expression, ignoring narrowing of the expression itself.
     fn expr_plain(&mut self, e: &'a Expr) -> GResult<E> {
         let ty = self.ty_of(e);
+        if self.p.dyn_literals.contains(&e.id) {
+            return self.dyn_literal(e);
+        }
         match &e.kind {
             ExprKind::Num { value, raw, int } => Ok(self.number(*value, raw, *int, &ty)),
             ExprKind::Str(s) => {
@@ -342,6 +353,10 @@ impl<'a> Gen<'a> {
     /// `typeof x`: known at compile time, except for a union, which asks its value.
     fn typeof_expr(&mut self, inner: &'a Expr) -> GResult<E> {
         let ty = self.ty_of(inner);
+        if self.is_dynamic(&ty) {
+            let x = self.dyn_ref(inner)?;
+            return Ok(E::new(format!("js_typeof({x})"), PREC_POSTFIX, Repr::Str));
+        }
         if let Some(u) = self.union_of(&ty) {
             let name = u.name.clone();
             self.union_typeof.insert(name);
@@ -549,6 +564,11 @@ impl<'a> Gen<'a> {
     /// Node does; the rest prints as in a template string.
     pub(super) fn log_arg(&mut self, x: &'a Expr) -> GResult<(String, Option<String>)> {
         let ty = self.ty_of(x);
+        // A value known at run time: a string is shown as it is.
+        if self.is_dynamic(&ty) {
+            let v = self.dyn_ref(x)?;
+            return Ok(("{}".into(), Some(format!("js_show({v})"))));
+        }
         if !self.is_inspect_ty(&ty) {
             return self.format_arg(x);
         }
@@ -946,6 +966,14 @@ impl<'a> Gen<'a> {
                 let c = if c.contains(' ') { format!("({c})") } else { c };
                 Ok(E::owned(format!("!{c}"), PREC_UNARY))
             }
+            UnaryOp::Neg | UnaryOp::Pos if self.is_dynamic(&self.ty_of(arg)) => {
+                let x = self.float_operand(arg)?;
+                Ok(if op == UnaryOp::Neg {
+                    E::owned(format!("-{x}"), PREC_UNARY)
+                } else {
+                    E::owned(x, PREC_POSTFIX)
+                })
+            }
             UnaryOp::Neg => {
                 let ty = self.ty_of(arg);
                 let x = self.expr(arg)?;
@@ -1055,6 +1083,9 @@ impl<'a> Gen<'a> {
                 args.extend(arg);
             }
             return Ok(E::owned(format_call("format!", &fmt, &args), PREC_ATOM));
+        }
+        if self.is_dynamic(&lt) || self.is_dynamic(&rt) {
+            return self.dyn_binary(op, left, right);
         }
         match op {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Mod => {
@@ -1209,6 +1240,10 @@ impl<'a> Gen<'a> {
             return Ok(format!("{v:?}"));
         }
         let t = self.ty_of(e);
+        if self.is_dynamic(&t) {
+            let x = self.expr(e)?;
+            return Ok(format!("{}.to_number()", Self::paren(&x, PREC_POSTFIX)));
+        }
         let x = self.expr(e)?;
         let owned = self.coerce(x, &t, Want::Owned);
         if self.is_float(&t) {
@@ -1225,6 +1260,11 @@ impl<'a> Gen<'a> {
             return Ok(js_to_int32(v).to_string());
         }
         let t = self.ty_of(e);
+        if self.is_dynamic(&t) {
+            let x = self.float_operand(e)?;
+            let h = self.helper(super::Helper::ToInt32);
+            return Ok(format!("{h}({x})"));
+        }
         let x = self.expr(e)?;
         let prec = x.prec;
         let owned = self.coerce(x, &t, Want::Owned);
@@ -1316,6 +1356,20 @@ impl<'a> Gen<'a> {
     ) -> GResult<E> {
         let ty = self.ty_of(e);
         let lt = self.ty_of(left);
+        // `v ?? d`, `v || d` on a value known at run time.
+        if self.is_dynamic(&lt) && op != LogicalOp::And {
+            let l = self.expr_as(left, Want::Owned)?;
+            let r = self.expr_as(right, Want::Owned)?;
+            let keep = if op == LogicalOp::Nullish {
+                "!v.is_nullish()"
+            } else {
+                "v.truthy()"
+            };
+            return Ok(E::owned(
+                format!("{{ let v = {l}; if {keep} {{ v }} else {{ {r} }} }}"),
+                PREC_ATOM,
+            ));
+        }
         match op {
             LogicalOp::Nullish => {
                 let l = self.expr(left)?;
@@ -1562,6 +1616,9 @@ impl<'a> Gen<'a> {
                         format!("{} != {zero}", paren_cmp(&code))
                     }
                     Ty::Array(_) => "true".into(),
+                    ref d if d.is_dynamic() => {
+                        format!("{}.truthy()", Self::paren(&x, PREC_POSTFIX))
+                    }
                     _ => return self.err("this value cannot be used as a condition", e.span),
                 })
             }
@@ -1714,6 +1771,9 @@ impl<'a> Gen<'a> {
         // `ns.x` for `import * as ns`: the name itself.
         if self.p.refs.contains_key(&e.id) {
             return self.ident(e);
+        }
+        if !self.p.calls.contains_key(&e.id) && self.is_dynamic(&self.ty_of(obj)) {
+            return self.dyn_member(obj, prop, optional);
         }
         let ty = self.ty_of(e);
         if let Some(Callee::Builtin(name)) = self.p.calls.get(&e.id) {
@@ -2020,6 +2080,9 @@ impl<'a> Gen<'a> {
 
     fn index(&mut self, e: &'a Expr, obj: &'a Expr, index: &'a Expr) -> GResult<E> {
         let ot = self.ty_of(obj);
+        if self.is_dynamic(&ot) {
+            return self.dyn_index(obj, index);
+        }
         let o = self.expr(obj)?;
         let base = Self::paren(&o, PREC_POSTFIX);
         match self.resolve(&ot) {
@@ -2326,7 +2389,7 @@ fn is_simple(code: &str) -> bool {
         && !code.contains("..")
 }
 
-fn paren_unless_simple(code: &str) -> String {
+pub(super) fn paren_unless_simple(code: &str) -> String {
     if is_simple(code) {
         code.to_string()
     } else {

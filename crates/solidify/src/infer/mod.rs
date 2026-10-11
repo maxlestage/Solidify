@@ -9,6 +9,7 @@
 mod annotations;
 mod builtins;
 mod decls;
+mod dynamic;
 mod exprs;
 mod files;
 mod finish;
@@ -372,6 +373,11 @@ pub struct Program {
     pub literal_struct: HashMap<NodeId, String>,
     /// String literal typed as a union enum → (enum, variant).
     pub enum_literal: HashMap<NodeId, (String, String)>,
+    /// A value converted between a type known when translating and a value known at
+    /// run time (`JsValue`): its type, and the type its place takes.
+    pub dyn_casts: HashMap<NodeId, (Ty, Ty)>,
+    /// Object and array literals built as values known at run time.
+    pub dyn_literals: HashSet<NodeId>,
     /// Test expression → what it narrows.
     pub narrow_tests: HashMap<NodeId, NarrowTest>,
     /// Expression inside a narrowed region → the bound name to use instead, and the
@@ -742,6 +748,10 @@ pub(super) struct Infer<'m> {
     pub(super) calls: HashMap<NodeId, Callee>,
     pub(super) literal_struct: HashMap<NodeId, String>,
     pub(super) enum_literal: HashMap<NodeId, (String, String)>,
+    pub(super) dyn_casts: HashMap<NodeId, (Ty, Ty)>,
+    pub(super) dyn_literals: HashSet<NodeId>,
+    /// The type expected of the call being inferred (`JSON.parse` reads it).
+    pub(super) call_expected: Option<Ty>,
     pub(super) narrow_tests: HashMap<NodeId, NarrowTest>,
     pub(super) narrowed_uses: HashMap<NodeId, (String, NodeId)>,
     pub(super) calls_in_try: HashSet<NodeId>,
@@ -884,6 +894,9 @@ pub fn infer<'m>(
         calls: HashMap::new(),
         literal_struct: HashMap::new(),
         enum_literal: HashMap::new(),
+        dyn_casts: HashMap::new(),
+        dyn_literals: HashSet::new(),
+        call_expected: None,
         narrow_tests: HashMap::new(),
         narrowed_uses: HashMap::new(),
         calls_in_try: HashSet::new(),
@@ -982,8 +995,12 @@ impl<'m> Infer<'m> {
 
     /// Like [`Self::expect`] where a value goes somewhere (an argument, a returned or
     /// assigned value): an integer may go into a double, converted.
-    pub(super) fn expect_flow(&mut self, found: &Ty, expected: &Ty, span: Span) -> IResult<()> {
+    pub(super) fn expect_flow(&mut self, found: &Ty, expected: &Ty, e: &Expr) -> IResult<()> {
+        let span = e.span;
         if self.types.flow(found, expected) {
+            return Ok(());
+        }
+        if self.dyn_cast(e, found, expected) {
             return Ok(());
         }
         if let (Ty::Num(_), Ty::Option(inner)) =
@@ -993,6 +1010,25 @@ impl<'m> Infer<'m> {
             return Ok(());
         }
         self.expect(found, expected, span)
+    }
+
+    /// A value known at run time going where a type is known, or the other way: converted
+    /// there (`false` when neither or both are dynamic, or a type is not known yet).
+    pub(super) fn dyn_cast(&mut self, e: &Expr, found: &Ty, expected: &Ty) -> bool {
+        let (f, x) = (self.types.resolve(found), self.types.resolve(expected));
+        if f.is_dynamic() == x.is_dynamic() {
+            return false;
+        }
+        if matches!(f, Ty::Var(_)) || matches!(x, Ty::Var(_)) {
+            return false;
+        }
+        // Read as the expected type: through its JSON reading.
+        if f.is_dynamic() {
+            self.json_targets.push(x.clone());
+        }
+        self.dyn_casts
+            .insert(e.id, (found.clone(), expected.clone()));
+        true
     }
 
     pub(super) fn set_ty(&mut self, id: NodeId, ty: Ty) -> Ty {

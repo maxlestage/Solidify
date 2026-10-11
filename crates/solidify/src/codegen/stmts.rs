@@ -813,6 +813,11 @@ impl<'a> Gen<'a> {
     /// `x++` as `x += 1`.
     pub(super) fn update_text(&mut self, inc: bool, arg: &'a Expr) -> GResult<String> {
         let ty = self.ty_of(arg);
+        if self.is_dynamic(&ty) {
+            let place = self.dyn_place_mut(arg)?;
+            let sym = if inc { "+" } else { "-" };
+            return Ok(format!("js_op_assign({place}, \"{sym}\", JsValue::Int(1))"));
+        }
         let x = self.expr_mut_root(arg)?;
         let target = self.place(x);
         let one = if self.is_float(&ty) { "1.0" } else { "1" };
@@ -866,6 +871,18 @@ impl<'a> Gen<'a> {
         };
         let tt = self.ty_of(t);
         let vt = self.ty_of(value);
+        // A property of a value known at run time, or such a value changed by an operator.
+        let in_dynamic = match &t.kind {
+            ExprKind::Member { obj, .. } | ExprKind::Index { obj, .. } => {
+                self.is_dynamic(&self.ty_of(obj))
+            }
+            _ => self.is_dynamic(&tt) && op != AssignOp::Assign,
+        };
+        if in_dynamic {
+            let line = self.dyn_assign(op, t, value)?;
+            self.line(&line);
+            return Ok(());
+        }
         // `re.lastIndex = i`
         if let ExprKind::Member { obj, prop, .. } = &t.kind
             && prop == "lastIndex"
@@ -1992,6 +2009,7 @@ impl<'a> Gen<'a> {
             let base = Self::paren(&o, PREC_POSTFIX);
             match self.resolve(&it) {
                 Ty::Map(..) => (format!("{base}.keys()"), Repr::Ref, false),
+                ref d if d.is_dynamic() => (format!("js_keys(&{base})"), Repr::Owned, false),
                 _ => (format!("0..{base}.len()"), Repr::Usize, false),
             }
         } else {
@@ -1999,6 +2017,7 @@ impl<'a> Gen<'a> {
             let base = Self::paren(&o, PREC_POSTFIX);
             match self.resolve(&it) {
                 Ty::Str => (format!("{base}.chars()"), Repr::Char, false),
+                ref d if d.is_dynamic() => (format!("js_items(&{base})"), Repr::Owned, false),
                 // A generator is consumed.
                 Ty::Gen(_) => (o.code.clone(), Repr::Owned, false),
                 Ty::Array(ref item) | Ty::Set(ref item) => {
