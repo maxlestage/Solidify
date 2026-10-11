@@ -110,6 +110,7 @@ Trois passes, toutes déterministes :
 | `console.log`, `Math`, `parseInt`… | `println!`, méthodes de `f64`, petits utilitaires ajoutés au fichier |
 | classes récursives | `Option<Box<T>>` |
 | `class B extends A`, `abstract`, `super`, `protected`, `instanceof` | structs aplaties, un trait par classe de base, `Box<dyn ALike>` là où un `A` est attendu |
+| `interface Shape { area(): number }`, `class C implements Shape`, `interface A extends B` | un trait par interface, `impl ShapeLike for C`, `Box<dyn ShapeLike>` / `&dyn ShapeLike` là où un `Shape` est attendu |
 | `A \| B`, `[1, "two"]`, unions discriminées, `typeof x === "string"`, `"kind" in x` | `enum` avec une variante par membre, `match` |
 | `function*`, `yield`, `yield*` | `JsGenerator<T>`, `for x in gen` |
 | `setTimeout`, `setInterval`, `clearTimeout`, `new Promise`, `Promise.all` | une boucle d'événements lancée par `main`, `JsPromise` |
@@ -137,7 +138,7 @@ Quatre règles à connaître :
 | Dossier | Contenu |
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | Le transpileur : lexeur, parseur, inférence de types, génération de code, ligne de commande |
-| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 27 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
+| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 28 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
 | [`site`](site) | Le site web : un bac à sable qui exécute Solidify en WebAssembly, écrit avec [active](https://github.com/maxlestage/Active) |
 
 ## Développement

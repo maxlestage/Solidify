@@ -110,7 +110,7 @@ static EN: Dict = Dict {
         cta2: "Install the CLI",
         facts: [
             ("0", "dependencies"),
-            ("27", "programs checked against Node.js"),
+            ("28", "programs checked against Node.js"),
             ("1", "Rust file out, however many files in"),
         ],
     },
@@ -217,6 +217,10 @@ static EN: Dict = Dict {
                 "flattened structs, a trait per base class, Box<dyn ALike> where an A is expected",
             ),
             (
+                "interface Shape { area(): number }, class C implements Shape",
+                "a trait per interface, impl for each class, Box<dyn ShapeLike>",
+            ),
+            (
                 "A | B, [1, \"two\"], discriminated unions, typeof",
                 "enum with one variant per member, match",
             ),
@@ -287,7 +291,7 @@ static FR: Dict = Dict {
         cta2: "Installer la ligne de commande",
         facts: [
             ("0", "dépendance"),
-            ("27", "programmes vérifiés contre Node.js"),
+            ("28", "programmes vérifiés contre Node.js"),
             (
                 "1",
                 "fichier Rust en sortie, autant de fichiers en entrée que voulu",
@@ -395,6 +399,10 @@ static FR: Dict = Dict {
             (
                 "class B extends A, abstract, super, instanceof",
                 "structs aplaties, un trait par classe de base, Box<dyn ALike> là où un A est attendu",
+            ),
+            (
+                "interface Shape { area(): number }, class C implements Shape",
+                "un trait par interface, impl pour chaque classe, Box<dyn ShapeLike>",
             ),
             (
                 "A | B, [1, \"two\"], unions discriminées, typeof",

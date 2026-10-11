@@ -1936,7 +1936,7 @@ fn regex_escape(s: &str) -> String {
 }
 
 fn paren_num(code: &str) -> String {
-    if code.starts_with('-') || code.contains(' ') {
+    if code.starts_with(['-', '*', '!']) || code.contains(' ') {
         format!("({code})")
     } else {
         code.to_string()

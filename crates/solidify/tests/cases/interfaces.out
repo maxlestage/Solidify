@@ -1,0 +1,7 @@
+square 4.00
+circle 3.14
+7.14 square: 9.00
+16 2 Ci { r: 1, name: 'circle' }
+12.566 circle: 12.57
+0 7 2
+[ 0, 1, 10 ]
