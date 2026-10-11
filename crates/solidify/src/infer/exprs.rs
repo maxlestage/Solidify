@@ -472,10 +472,7 @@ impl<'m> Infer<'m> {
                 self.expr(inner, None)?;
                 Ok(Ty::Void)
             }
-            ExprKind::Delete(_) => self.err(
-                "`delete` is not supported: use `Map.delete` or `Option`",
-                e.span,
-            ),
+            ExprKind::Delete(target) => self.delete(target),
             ExprKind::Await(inner) => {
                 let id = self.ctx().id;
                 let is_async = self.funcs.get(&id).is_some_and(|f| f.is_async);
@@ -1269,7 +1266,7 @@ impl<'m> Infer<'m> {
         None
     }
 
-    fn closure(&mut self, f: &'m Function, expected: Option<&Ty>) -> IResult<Ty> {
+    pub(super) fn closure(&mut self, f: &'m Function, expected: Option<&Ty>) -> IResult<Ty> {
         let mut info = self.signature(f, None, None, false)?;
         if let Some(Ty::Func(ex)) = expected {
             for (i, p) in ex.params.iter().enumerate() {
@@ -1669,6 +1666,8 @@ impl<'m> Infer<'m> {
         let targ =
             |this: &mut Self, i: usize| given.get(i).cloned().unwrap_or_else(|| this.types.fresh());
         match name.as_str() {
+            "Function" => self.function_call(e, args),
+            "Proxy" => self.new_proxy(e, args),
             "Error" | "TypeError" | "RangeError" => {
                 if let Some(a) = args.first() {
                     let t = self.expr(&a.expr, Some(&Ty::Str))?;
@@ -2206,6 +2205,8 @@ impl<'m> Infer<'m> {
                 Ty::named("Symbol")
             }
             "structuredClone" => self.arg_typed(args, 0, None, name, span)?,
+            "eval" => return self.eval_call(e, args),
+            "Function" => return self.function_call(e, args),
             "require" => {
                 return self.err(
                     "`require` is not supported: Solidify translates one file",

@@ -502,6 +502,44 @@ enum JsValue {
     Raw(String),
     /// A date: its ISO text, and its `toString()` text.
     Date(String, String),
+    /// An object held in several places: changed through one, changed for all.
+    Ref(std::rc::Rc<std::cell::RefCell<JsValue>>),
+    /// `new Proxy(target, handler)`.
+    Proxy(std::rc::Rc<JsProxy>),
+}
+
+/// The traps of a proxy, and the object it stands for.
+#[allow(dead_code, clippy::type_complexity)]
+struct JsProxy {
+    target: JsValue,
+    get: Option<Box<dyn Fn(JsValue, String, JsValue) -> JsValue>>,
+    set: Option<Box<dyn Fn(JsValue, String, JsValue, JsValue) -> bool>>,
+    has: Option<Box<dyn Fn(JsValue, String) -> bool>>,
+    delete: Option<Box<dyn Fn(JsValue, String) -> bool>>,
+}
+
+impl std::fmt::Debug for JsProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Proxy({:?})", self.target)
+    }
+}
+
+impl PartialEq for JsProxy {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+#[allow(dead_code)]
+impl JsValue {
+    /// What a shared object or a proxy holds, to be shown.
+    fn shown(&self) -> Option<JsValue> {
+        match self {
+            JsValue::Ref(cell) => Some(cell.borrow().clone()),
+            JsValue::Proxy(p) => p.target.shown().or_else(|| Some(p.target.clone())),
+            _ => None,
+        }
+    }
 }
 
 /// Implemented by every type that `console.log` can show.
@@ -622,6 +660,9 @@ impl<T: JsInspect> JsInspect for std::collections::HashSet<T> {
 /// `String(value)`: what a value becomes in a string.
 #[allow(dead_code)]
 fn js_to_string(v: &JsValue) -> String {
+    if let Some(inner) = v.shown() {
+        return js_to_string(&inner);
+    }
     match v {
         JsValue::Int(n) => n.to_string(),
         JsValue::Float(x) => js_number_text(*x),
@@ -643,6 +684,7 @@ fn js_to_string(v: &JsValue) -> String {
         JsValue::Func(name) => format!("function {name}() {{ [native code] }}"),
         JsValue::Raw(text) => text.clone(),
         JsValue::Date(_, text) => text.clone(),
+        JsValue::Ref(_) | JsValue::Proxy(_) => unreachable!("shown above"),
     }
 }
 
@@ -713,6 +755,9 @@ fn js_inspect(v: &JsValue) -> String {
 
 #[allow(dead_code)]
 fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> String {
+    if let Some(inner) = v.shown() {
+        return js_format(&inner, recurse_times, ctx);
+    }
     let (open, close) = match v {
         JsValue::Int(n) => return n.to_string(),
         JsValue::Float(x) => {
@@ -731,6 +776,7 @@ fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> Strin
         }
         JsValue::Raw(text) => return text.clone(),
         JsValue::Date(iso, _) => return iso.clone(),
+        JsValue::Ref(_) | JsValue::Proxy(_) => unreachable!("shown above"),
         JsValue::Array(items) => {
             if items.is_empty() {
                 return "[]".into();

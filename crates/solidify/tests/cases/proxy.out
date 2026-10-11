@@ -1,0 +1,9 @@
+37 37 { name: 'Ada', age: 37 }
+read: x
+read: y
+3
+0 0
+ada no age PARIS PARIS
+true false [ 'name', 'city' ]
+{ b: 2 }
+{ y: 2 }

@@ -22,6 +22,9 @@ fn js_json_write(v: &JsValue, indent: &str, depth: usize, out: &mut String) -> b
             }
         }
     };
+    if let Some(inner) = v.shown() {
+        return js_json_write(&inner, indent, depth, out);
+    }
     match v {
         JsValue::Int(n) => out.push_str(&n.to_string()),
         JsValue::Float(x) => {
@@ -84,6 +87,7 @@ fn js_json_write(v: &JsValue, indent: &str, depth: usize, out: &mut String) -> b
         }
         JsValue::Map(_) | JsValue::Set(_) | JsValue::Raw(_) => out.push_str("{}"),
         JsValue::Date(iso, _) => js_json_quote(iso, out),
+        JsValue::Ref(_) | JsValue::Proxy(_) => unreachable!("shown above"),
     }
     true
 }

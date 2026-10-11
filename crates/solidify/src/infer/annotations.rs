@@ -135,6 +135,8 @@ impl<'m> Infer<'m> {
             // `any` and `unknown` are inferred from their uses, like a missing annotation.
             "any" | "unknown" | "object" => self.types.fresh(),
             "const" => Ty::Any,
+            // Given by `desugar` to the target of a proxy.
+            crate::types::DYNAMIC => Ty::dynamic(),
             "never" => Ty::Never,
             "bigint" => return self.err("bigint is not supported", span),
             "symbol" => Ty::named("Symbol"),

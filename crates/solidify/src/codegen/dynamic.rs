@@ -57,6 +57,19 @@ impl<'a> Gen<'a> {
         if self.is_dynamic(&ty) {
             return self.expr_as(e, Want::Owned);
         }
+        let mut inner = e;
+        while let ExprKind::As(x, _) = &inner.kind {
+            inner = x;
+        }
+        match &inner.kind {
+            ExprKind::Object(props) if props.is_empty() => {
+                return Ok("JsValue::Object(None, Vec::new())".into());
+            }
+            ExprKind::Array(items) if items.is_empty() => {
+                return Ok("JsValue::Array(Vec::new())".into());
+            }
+            _ => {}
+        }
         Ok(match &e.kind {
             ExprKind::Undefined => "JsValue::Undefined".into(),
             ExprKind::Null => "JsValue::Null".into(),
@@ -160,32 +173,67 @@ impl<'a> Gen<'a> {
         }
     }
 
-    /// A `&mut JsValue` to the place an expression names: `data.items[0]`.
-    pub(super) fn dyn_place_mut(&mut self, e: &'a Expr) -> GResult<String> {
+    /// The variable at the root of a path into values known at run time
+    /// (`&mut data`), and the keys down from it (`items`, `0`).
+    pub(super) fn dyn_path(&mut self, e: &'a Expr) -> GResult<(String, Vec<String>)> {
         match &e.kind {
             ExprKind::Member { obj, prop, .. } if self.is_dynamic(&self.ty_of(obj)) => {
-                let o = self.dyn_place_mut(obj)?;
-                Ok(format!("js_get_mut({o}, {})", super::string_literal(prop)))
+                let (root, mut keys) = self.dyn_path(obj)?;
+                keys.push(format!("{}.to_string()", super::string_literal(prop)));
+                Ok((root, keys))
             }
             ExprKind::Index { obj, index, .. } if self.is_dynamic(&self.ty_of(obj)) => {
-                let o = self.dyn_place_mut(obj)?;
+                let (root, mut keys) = self.dyn_path(obj)?;
                 let k = if self.is_str(&self.ty_of(index)) {
-                    self.expr_as(index, Want::StrRef)?
+                    self.expr_as(index, Want::Owned)?
                 } else {
                     let k = self.dyn_ref(index)?;
-                    format!("&js_key_text({k})")
+                    format!("js_key_text({k})")
                 };
-                Ok(format!("js_get_mut({o}, {k})"))
+                keys.push(k);
+                Ok((root, keys))
             }
             _ => {
                 let x = self.expr_as(e, Want::RefMut)?;
-                Ok(if x.starts_with("&mut ") {
-                    x
-                } else {
-                    format!("&mut {x}")
-                })
+                Ok((
+                    if x.starts_with("&mut ") {
+                        x
+                    } else {
+                        format!("&mut {x}")
+                    },
+                    Vec::new(),
+                ))
             }
         }
+    }
+
+    /// `body` run on the place `e` names (`o` in it), its keys and the values in `lets`
+    /// computed first.
+    pub(super) fn dyn_with_mut(
+        &mut self,
+        e: &'a Expr,
+        lets: &[(&str, String)],
+        body: &str,
+    ) -> GResult<String> {
+        self.helper(Helper::Dynamic);
+        let (root, keys) = self.dyn_path(e)?;
+        let mut pre: Vec<String> = Vec::new();
+        if !keys.is_empty() {
+            pre.push(format!("let path = [{}];", keys.join(", ")));
+        }
+        for (name, code) in lets {
+            pre.push(format!("let {name} = {code};"));
+        }
+        let call = if keys.is_empty() {
+            format!("{{ let o = {root}; {body} }}")
+        } else {
+            format!("js_with_mut({root}, &path, move |o| {body})")
+        };
+        Ok(if pre.is_empty() {
+            call
+        } else {
+            format!("{{ {} {call} }}", pre.join(" "))
+        })
     }
 
     /// `place op= value` on a value known at run time.
@@ -196,15 +244,78 @@ impl<'a> Gen<'a> {
         value: &'a Expr,
     ) -> GResult<String> {
         self.helper(Helper::Dynamic);
-        let place = self.dyn_place_mut(t)?;
         let v = self.dyn_owned(value)?;
-        Ok(match op {
-            AssignOp::Assign => format!("*{place} = {v};"),
+        let (obj, key) = match &t.kind {
+            ExprKind::Member { obj, prop, .. } if self.is_dynamic(&self.ty_of(obj)) => {
+                (obj, super::string_literal(prop))
+            }
+            ExprKind::Index { obj, index, .. } if self.is_dynamic(&self.ty_of(obj)) => {
+                let k = if self.is_str(&self.ty_of(index)) {
+                    self.expr_as(index, Want::Owned)?
+                } else {
+                    let k = self.dyn_ref(index)?;
+                    format!("js_key_text({k})")
+                };
+                (obj, k)
+            }
+            // A variable holding a value known at run time.
             _ => {
                 let sym = assign_symbol(op);
-                format!("js_op_assign({place}, \"{sym}\", {v});")
+                let place =
+                    self.dyn_with_mut(t, &[("v", v)], &format!("js_op_assign(o, \"{sym}\", v)"))?;
+                return Ok(format!("{place};"));
             }
-        })
+        };
+        let body = match op {
+            AssignOp::Assign => "js_set(o, &key, v)".to_string(),
+            _ => format!("js_op_assign_prop(o, &key, \"{}\", v)", assign_symbol(op)),
+        };
+        let code = self.dyn_with_mut(obj, &[("key", key), ("v", v)], &body)?;
+        Ok(format!("{code};"))
+    }
+
+    /// `x++` on a value known at run time: its new value.
+    pub(super) fn dyn_update(&mut self, inc: bool, arg: &'a Expr) -> GResult<String> {
+        let sym = if inc { "+" } else { "-" };
+        match &arg.kind {
+            ExprKind::Member { obj, prop, .. } if self.is_dynamic(&self.ty_of(obj)) => {
+                let key = format!("{}.to_string()", super::string_literal(prop));
+                self.dyn_with_mut(
+                    obj,
+                    &[("key", key)],
+                    &format!("js_op_assign_prop(o, &key, \"{sym}\", JsValue::Int(1))"),
+                )
+            }
+            ExprKind::Index { obj, index, .. } if self.is_dynamic(&self.ty_of(obj)) => {
+                let k = self.dyn_ref(index)?;
+                let key = format!("js_key_text({k})");
+                self.dyn_with_mut(
+                    obj,
+                    &[("key", key)],
+                    &format!("js_op_assign_prop(o, &key, \"{sym}\", JsValue::Int(1))"),
+                )
+            }
+            _ => self.dyn_with_mut(
+                arg,
+                &[],
+                &format!("js_op_assign(o, \"{sym}\", JsValue::Int(1))"),
+            ),
+        }
+    }
+
+    /// `delete v.key`.
+    pub(super) fn dyn_delete(&mut self, target: &'a Expr) -> GResult<String> {
+        let (obj, key) = match &target.kind {
+            ExprKind::Member { obj, prop, .. } => {
+                (obj, format!("{}.to_string()", super::string_literal(prop)))
+            }
+            ExprKind::Index { obj, index, .. } => {
+                let k = self.dyn_ref(index)?;
+                (obj, format!("js_key_text({k})"))
+            }
+            _ => return self.err("`delete` needs a property", target.span),
+        };
+        self.dyn_with_mut(obj, &[("key", key)], "js_delete(o, &key)")
     }
 
     /// `v.prop`, `v?.prop`.
@@ -329,11 +440,12 @@ impl<'a> Gen<'a> {
             let name = super::string_literal(method);
             let list = list.join(", ");
             if is_mutating(method) {
-                let o = self.dyn_place_mut(obj)?;
-                return Ok(E::owned(
-                    format!("js_call_method_mut({o}, {name}, vec![{list}])"),
-                    PREC_POSTFIX,
-                ));
+                let code = self.dyn_with_mut(
+                    obj,
+                    &[("args", format!("vec![{list}]"))],
+                    &format!("js_call_method_mut(o, {name}, args)"),
+                )?;
+                return Ok(E::owned(code, PREC_ATOM));
             }
             let o = self.dyn_ref(obj)?;
             return Ok(E::owned(
@@ -392,13 +504,231 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 // `sort(compare)`: in place, like JavaScript.
-                let o = self.dyn_place_mut(obj)?;
-                format!(
-                    "{{ let v = {o}; if let JsValue::Array(items) = &mut *v {{ items.sort_by(|a, b| f(a.clone(), b.clone()).partial_cmp(&0.0).unwrap_or(std::cmp::Ordering::Equal)); }} v.clone() }}"
-                )
+                self.dyn_with_mut(obj, &[], "js_sort_by(o, &f)")?
             }
         };
         Ok(E::owned(format!("{{ let f = {f}; {code} }}"), PREC_ATOM))
+    }
+
+    /// `delete target`: always `true`, like JavaScript.
+    pub(super) fn delete_expr(&mut self, target: &'a Expr) -> GResult<E> {
+        let (ExprKind::Member { obj, .. } | ExprKind::Index { obj, .. }) = &target.kind else {
+            return self.err("`delete` needs a property", target.span);
+        };
+        let ot = self.ty_of(obj);
+        if self.is_dynamic(&ot) {
+            let code = self.dyn_delete(target)?;
+            return Ok(E::owned(code, PREC_ATOM));
+        }
+        match (&target.kind, self.resolve(&ot)) {
+            (ExprKind::Index { index, .. }, Ty::Map(k, ..)) => {
+                let m = self.expr_as(obj, Want::RefMut)?;
+                let m = m.trim_start_matches("&mut ").to_string();
+                let key = self.expr_to(index, &k)?;
+                Ok(E::owned(
+                    format!("{{ {m}.remove(&{key}); true }}"),
+                    PREC_ATOM,
+                ))
+            }
+            _ => {
+                let place = self.expr_as(target, Want::RefMut)?;
+                let place = place.trim_start_matches("&mut ").to_string();
+                Ok(E::owned(format!("{{ {place} = None; true }}"), PREC_ATOM))
+            }
+        }
+    }
+
+    /// `eval(code)` with code known at run time: evaluated with the variables in scope.
+    pub(super) fn eval_code(&mut self, e: &'a Expr, args: &'a [Arg]) -> GResult<E> {
+        let Some(a) = args.first() else {
+            return Ok(E::atom("None", super::Repr::Owned));
+        };
+        if !self.p.eval_scopes.contains_key(&e.id) {
+            // `eval(42)`: the value itself.
+            return self.expr(&a.expr);
+        }
+        let code = self.expr_as(&a.expr, Want::StrRef)?;
+        let p = self.p;
+        let mut entries = Vec::new();
+        for (name, x) in &p.eval_scopes[&e.id] {
+            let t = self.ty_of(x);
+            if matches!(
+                self.resolve(&t),
+                Ty::Func(_) | Ty::Var(_) | Ty::Void | Ty::Never | Ty::Any | Ty::Gen(_)
+            ) {
+                continue;
+            }
+            // Read, not moved: the code may be run again.
+            let read = self.expr(x)?;
+            let read = self.coerce(read, &t, Want::Display);
+            let v = if self.is_dynamic(&t) {
+                format!("{}.clone()", super::exprs::paren_unless_simple(&read))
+            } else {
+                self.js_value_of(&read, &t)
+            };
+            entries.push(format!("({}, {v})", super::string_literal(name)));
+        }
+        let h = self.helper(Helper::Eval);
+        Ok(E::owned(
+            format!("{h}({code}, vec![{}])", entries.join(", ")),
+            PREC_POSTFIX,
+        ))
+    }
+
+    /// `new Function("a", "b", body)` with a body known at run time.
+    pub(super) fn new_function(&mut self, args: &'a [Arg]) -> GResult<E> {
+        let h = self.helper(Helper::Eval);
+        let (body, params) = args.split_last().expect("a body");
+        let names: Vec<String> = params
+            .iter()
+            .map(|p| match &p.expr.kind {
+                ExprKind::Str(s) => s.clone(),
+                _ => String::new(),
+            })
+            .collect();
+        let body = self.expr_as(&body.expr, Want::Owned)?;
+        let typed: Vec<String> = (0..names.len()).map(|i| format!("a{i}: JsValue")).collect();
+        let scope: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("({}, a{i})", super::string_literal(n)))
+            .collect();
+        self.uses_rc = true;
+        Ok(E::owned(
+            format!(
+                "{{ let body: String = {body}; Rc::new(move |{}| {h}(&body, vec![{}])) }}",
+                typed.join(", "),
+                scope.join(", ")
+            ),
+            PREC_ATOM,
+        ))
+    }
+
+    /// `new Proxy(target, handler)`.
+    pub(super) fn new_proxy(&mut self, args: &'a [Arg]) -> GResult<E> {
+        self.helper(Helper::Dynamic);
+        let target = &args[0].expr;
+        // A variable holding a value known at run time is shared with the proxy.
+        let target_code = if self.is_dynamic(&self.ty_of(target))
+            && matches!(
+                target.kind,
+                ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::Index { .. }
+            ) {
+            self.dyn_with_mut(target, &[], "js_share(o)")?
+        } else {
+            let v = self.dyn_owned(target)?;
+            format!("JsValue::Ref(std::rc::Rc::new(std::cell::RefCell::new({v})))")
+        };
+        let ExprKind::Object(props) = &args[1].expr.kind else {
+            return self.err(
+                "the handler of a `Proxy` is written in place",
+                args[1].expr.span,
+            );
+        };
+        let mut traps = [
+            ("get", "None".to_string()),
+            ("set", "None".to_string()),
+            ("has", "None".to_string()),
+            ("delete", "None".to_string()),
+        ];
+        for p in props {
+            let name = p.key.name().unwrap_or_default();
+            let (f, arity) = match &p.value {
+                PropValue::Expr(x) => {
+                    let ty = self.ty_of(x);
+                    (
+                        self.callback_code(x)?,
+                        callback_arity(x, &self.resolve(&ty)),
+                    )
+                }
+                PropValue::Method(func) => (self.closure(func, &[], true)?.code, func.params.len()),
+                _ => continue,
+            };
+            let (slot, params, given) = match name.as_str() {
+                "get" => (
+                    "get",
+                    "t: JsValue, k: String, r: JsValue",
+                    vec!["t", "k", "r"],
+                ),
+                "set" => (
+                    "set",
+                    "t: JsValue, k: String, v: JsValue, r: JsValue",
+                    vec!["t", "k", "v", "r"],
+                ),
+                "has" => ("has", "t: JsValue, k: String", vec!["t", "k"]),
+                _ => ("delete", "t: JsValue, k: String", vec!["t", "k"]),
+            };
+            let used: Vec<&str> = given.iter().take(arity).copied().collect();
+            let unused: Vec<String> = given
+                .iter()
+                .skip(arity)
+                .map(|n| format!("let _ = {n};"))
+                .collect();
+            let code = format!(
+                "Some(Box::new({{ let f = {f}; move |{params}| {{ {} f({}) }} }}))",
+                unused.join(" "),
+                used.join(", ")
+            );
+            if let Some(t) = traps.iter_mut().find(|(n, _)| *n == slot) {
+                t.1 = code;
+            }
+        }
+        let fields: Vec<String> = traps.iter().map(|(n, c)| format!("{n}: {c}")).collect();
+        Ok(E::owned(
+            format!(
+                "JsValue::Proxy(std::rc::Rc::new(JsProxy {{ target: {target_code}, {} }}))",
+                fields.join(", ")
+            ),
+            PREC_POSTFIX,
+        ))
+    }
+
+    /// `Reflect.get(target, key)` and the others.
+    pub(super) fn reflect_code(&mut self, name: &str, args: &'a [Arg]) -> GResult<E> {
+        self.helper(Helper::Dynamic);
+        let key = |g: &mut Self| -> GResult<String> {
+            let k = &args[1].expr;
+            if g.is_str(&g.ty_of(k)) {
+                g.expr_as(k, Want::StrRef)
+            } else {
+                let k = g.dyn_ref(k)?;
+                Ok(format!("&js_key_text({k})"))
+            }
+        };
+        let code = match name {
+            "Reflect.get" => {
+                let t = self.dyn_ref(&args[0].expr)?;
+                let k = key(self)?;
+                format!("js_get({t}, {k})")
+            }
+            "Reflect.has" => {
+                let t = self.dyn_ref(&args[0].expr)?;
+                let k = key(self)?;
+                format!("js_has({t}, {k})")
+            }
+            "Reflect.ownKeys" => {
+                let t = self.dyn_ref(&args[0].expr)?;
+                format!("js_keys({t})")
+            }
+            "Reflect.set" => {
+                let k = key(self)?;
+                let v = self.dyn_owned(&args[2].expr)?;
+                self.dyn_with_mut(
+                    &args[0].expr,
+                    &[("key", format!("({k}).to_string()")), ("v", v)],
+                    "{ js_set(o, &key, v); true }",
+                )?
+            }
+            _ => {
+                let k = key(self)?;
+                self.dyn_with_mut(
+                    &args[0].expr,
+                    &[("key", format!("({k}).to_string()"))],
+                    "js_delete(o, &key)",
+                )?
+            }
+        };
+        Ok(E::owned(code, PREC_ATOM))
     }
 }
 

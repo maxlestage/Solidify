@@ -14,6 +14,14 @@ use crate::error::Span;
 
 /// Rewrites the statements of a file; new nodes take their ids from `next_id`.
 pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
+    eval_declarations(body, next_id);
+    for_each_function(body, &mut |f| {
+        if let FnBody::Block(b) = &mut f.body {
+            eval_declarations(&mut b.stmts, next_id);
+        }
+    });
+    literal_code(body, next_id);
+    proxy_targets(body);
     let mut ids = Ids(next_id);
     constructor_functions(body, &mut ids);
     omitted_parameters(body);
@@ -803,4 +811,191 @@ pub fn expr_mut(e: &mut Expr, f: &mut dyn FnMut(&mut Expr) -> bool) {
         ExprKind::Seq(xs) => xs.iter_mut().for_each(|x| expr_mut(x, f)),
         _ => {}
     }
+}
+
+/// `eval("1 + x")` and `new Function("a", "b", "return a + b")` with code written in the
+/// program: the code itself, translated with the rest (`eval` of an expression is that
+/// expression; of statements, a function called at once that gives the value of the last
+/// one; `new Function` is an arrow function).
+fn literal_code(body: &mut [Stmt], next_id: &mut NodeId) {
+    for_each_expr_mut(body, &mut |e| {
+        if let Some(code) = literal_code_of(e)
+            && let Ok(mut stmts) = crate::parser::parse_snippet(&code, e.span, next_id)
+        {
+            literal_code(&mut stmts, next_id);
+            // An immediately called arrow function: `(() => { … })()`.
+            if let Some(Stmt {
+                kind: StmtKind::Expr(x),
+                ..
+            }) = stmts.first_mut()
+                && let ExprKind::Call { callee, .. } = &mut x.kind
+                && let ExprKind::Arrow(f) = &mut callee.kind
+                && let FnBody::Block(b) = &mut f.body
+                && let Some(last) = b.stmts.last_mut()
+                && let StmtKind::Expr(v) = &mut last.kind
+            {
+                let v = std::mem::replace(v, placeholder());
+                last.kind = StmtKind::Return(Some(v));
+            }
+            if let [
+                Stmt {
+                    kind: StmtKind::Expr(x),
+                    ..
+                },
+            ] = stmts.as_mut_slice()
+            {
+                *e = std::mem::replace(x, placeholder());
+                return true;
+            }
+        }
+        true
+    });
+}
+
+/// `eval("var x = 1; function f() { … }")` as a statement: its `var`s and functions are
+/// declared where the `eval` is, like in JavaScript.
+fn eval_declarations(stmts: &mut Vec<Stmt>, next_id: &mut NodeId) {
+    let mut i = 0;
+    while i < stmts.len() {
+        let code = match &stmts[i].kind {
+            StmtKind::Expr(Expr {
+                kind: ExprKind::Call { callee, args, .. },
+                ..
+            }) if matches!(&callee.kind, ExprKind::Ident(n) if n == "eval") && args.len() == 1 => {
+                match &args[0].expr.kind {
+                    ExprKind::Str(s) => Some(s.clone()),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let parsed =
+            code.and_then(|c| crate::parser::parse_snippet(&c, stmts[i].span, next_id).ok());
+        let declares = |s: &Stmt| {
+            matches!(
+                s.kind,
+                StmtKind::Var(VarDecl {
+                    kind: VarKind::Var,
+                    ..
+                }) | StmtKind::Func(_)
+            )
+        };
+        let block_scoped = |s: &Stmt| {
+            matches!(
+                s.kind,
+                StmtKind::Var(VarDecl {
+                    kind: VarKind::Let | VarKind::Const,
+                    ..
+                }) | StmtKind::Class(_)
+            )
+        };
+        match parsed {
+            Some(new) if new.iter().any(declares) && !new.iter().any(block_scoped) => {
+                let n = new.len();
+                stmts.splice(i..=i, new);
+                i += n;
+            }
+            _ => i += 1,
+        }
+    }
+}
+
+/// The code of `eval("…")` (as a function called at once when it is not a single
+/// expression) or of `new Function(…)` (as an arrow function), all of it written in the
+/// program.
+fn literal_code_of(e: &Expr) -> Option<String> {
+    let strings = |args: &[Arg]| -> Option<Vec<String>> {
+        args.iter()
+            .map(|a| match &a.expr.kind {
+                ExprKind::Str(s) if !a.spread => Some(s.clone()),
+                ExprKind::Template { quasis, exprs } if exprs.is_empty() && !a.spread => {
+                    Some(quasis.concat())
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    match &e.kind {
+        ExprKind::Call { callee, args, .. }
+            if matches!(&callee.kind, ExprKind::Ident(n) if n == "eval") && args.len() == 1 =>
+        {
+            let code = strings(args)?.pop()?;
+            // A single expression stays one; statements run in a function.
+            let trimmed = code.trim().trim_end_matches(';');
+            let mut probe_id = 0;
+            let single = matches!(
+                crate::parser::parse_snippet(trimmed, e.span, &mut probe_id).as_deref(),
+                Ok([Stmt {
+                    kind: StmtKind::Expr(_),
+                    ..
+                }])
+            ) && !trimmed.starts_with('{');
+            Some(if single {
+                format!("({trimmed})")
+            } else {
+                format!("(() => {{\n{code}\n}})()")
+            })
+        }
+        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args, .. } if matches!(&callee.kind, ExprKind::Ident(n) if n == "Function") =>
+        {
+            let mut parts = strings(args)?;
+            let body = parts.pop().unwrap_or_default();
+            Some(format!("(({}) => {{\n{body}\n}})", parts.join(", ")))
+        }
+        _ => None,
+    }
+}
+
+fn placeholder() -> Expr {
+    Expr {
+        kind: ExprKind::Undefined,
+        span: Span::default(),
+        id: 0,
+    }
+}
+
+/// A variable given to `new Proxy(…)` is shared with the proxy: it holds a value known at
+/// run time (changed through the proxy, changed for it too).
+fn proxy_targets(body: &mut [Stmt]) {
+    let mut names = Vec::new();
+    for_each_expr(body, &mut |e| {
+        if let ExprKind::New { callee, args, .. } = &e.kind
+            && matches!(&callee.kind, ExprKind::Ident(n) if n == "Proxy")
+            && let Some(ExprKind::Ident(target)) = args.first().map(|a| &a.expr.kind)
+        {
+            names.push(target.clone());
+        }
+        true
+    });
+    if names.is_empty() {
+        return;
+    }
+    fn mark(stmts: &mut [Stmt], names: &[String]) {
+        for s in stmts {
+            match &mut s.kind {
+                StmtKind::Var(v) => {
+                    for d in &mut v.decls {
+                        if let Pattern::Ident { name, span, .. } = &d.pat
+                            && names.contains(name)
+                            && d.ty.is_none()
+                        {
+                            d.ty = Some(TypeAnn::Named {
+                                name: crate::types::DYNAMIC.to_string(),
+                                args: Vec::new(),
+                                span: *span,
+                            });
+                        }
+                    }
+                }
+                StmtKind::Block(b) => mark(&mut b.stmts, names),
+                StmtKind::Func(f) => {
+                    if let FnBody::Block(b) = &mut f.body {
+                        mark(&mut b.stmts, names);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    mark(body, &names);
 }
