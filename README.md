@@ -49,15 +49,18 @@ fn main() {
 
 ## Install
 
+Nothing to install but Node.js 20 or later: `npx` runs Solidify, compiled to WebAssembly, on your files.
+
 ```sh
-cargo install --git https://github.com/maxlestage/Solidify solidify
-solidify main.ts -o app.rs     # follows the imports of main.ts, one Rust file out
-solidify < app.ts > app.rs     # or one file through the standard input
-solidify --check main.ts       # only report errors
+npx solidify-rs main.ts -o app.rs     # follows the imports of main.ts, one Rust file out
+npx solidify-rs < app.ts > app.rs     # or one file through the standard input
+npx solidify-rs --check main.ts       # only report errors
 rustc --edition 2024 app.rs && ./app
 ```
 
-As a library:
+The website is also an app: open it in Chrome, Edge or Safari and install it (the **Install the app** button, or *Add to Home Screen*); the playground then works offline.
+
+As a Rust library:
 
 ```toml
 [dependencies]
@@ -149,6 +152,7 @@ Four rules worth knowing:
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | The transpiler: lexer, parser, type inference, code generation, CLI |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
+| [`npm`](npm) | The `solidify-rs` package for `npx`: a Node.js launcher for the transpiler compiled to WebAssembly (WASI), checked against the test programs by `node npm/test.js` |
 | [`site`](site) | The website: a playground running Solidify as WebAssembly, written with [active](https://github.com/maxlestage/Active) |
 
 ## Development
@@ -175,6 +179,17 @@ cargo run -p solidify-site -- export dist  # static files for any host
 ## Publish the site on GitHub Pages
 
 Every branch whose CI is green is merged into `master` by the [`ci.yml`](.github/workflows/ci.yml) workflow (branches named `wip/…` excepted). After every green CI run on `master`, the [`pages.yml`](.github/workflows/pages.yml) workflow switches GitHub Pages on if needed, exports the site with `solidify-site export` and publishes it at `https://maxlestage.github.io/Solidify/`. To publish right away: **Actions → Pages → Run workflow**.
+
+## Publish on npm
+
+The [`npm.yml`](.github/workflows/npm.yml) workflow builds the package after every merge into `master` and publishes it when its version (in [`npm/package.json`](npm/package.json)) is not yet on npm. It needs an npm token in the repository secret `NPM_TOKEN` (**Settings → Secrets and variables → Actions**). To try the package locally:
+
+```sh
+cargo build -p solidify --bin solidify --target wasm32-wasip1 --profile wasm-release
+cp target/wasm32-wasip1/wasm-release/solidify.wasm LICENSE npm/
+node npm/test.js                     # every test program, as the native build translates it
+node npm/bin/solidify.js main.ts     # what `npx solidify-rs main.ts` runs
+```
 
 ## License
 

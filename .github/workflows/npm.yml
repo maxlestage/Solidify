@@ -1,0 +1,59 @@
+name: npm
+
+# Publishes the `solidify-rs` package, so that `npx solidify-rs main.ts` works anywhere
+# Node.js 20+ runs: the transpiler compiled to WebAssembly (WASI) and a small launcher.
+#
+# Runs after every merge into master (started by ci.yml) and by hand from the Actions tab.
+# A version already on npm is not published again: raise `version` in npm/package.json to
+# publish a new one. Needs the repository secret NPM_TOKEN (an npm "Automation" token):
+# Settings → Secrets and variables → Actions → New repository secret.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: npm
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Build the package
+        run: |
+          cargo build -p solidify --bin solidify --target wasm32-wasip1 --profile wasm-release
+          cp target/wasm32-wasip1/wasm-release/solidify.wasm LICENSE npm/
+          node npm/test.js
+      - name: Publish
+        working-directory: npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::warning::No NPM_TOKEN secret: the package is built and checked, not published."
+            exit 0
+          fi
+          name=$(node -p "require('./package.json').name")
+          version=$(node -p "require('./package.json').version")
+          if npm view "$name@$version" version >/dev/null 2>&1; then
+            echo "$name@$version is already on npm."
+            exit 0
+          fi
+          npm publish --access public --provenance

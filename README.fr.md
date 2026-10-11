@@ -49,15 +49,18 @@ fn main() {
 
 ## Installer
 
+Rien à installer d'autre que Node.js 20 ou plus récent : `npx` lance Solidify, compilé en WebAssembly, sur vos fichiers.
+
 ```sh
-cargo install --git https://github.com/maxlestage/Solidify solidify
-solidify main.ts -o app.rs     # suit les imports de main.ts, un seul fichier Rust en sortie
-solidify < app.ts > app.rs     # ou un fichier par l'entrée standard
-solidify --check main.ts       # seulement signaler les erreurs
+npx solidify-rs main.ts -o app.rs     # suit les imports de main.ts, un seul fichier Rust en sortie
+npx solidify-rs < app.ts > app.rs     # ou un fichier par l'entrée standard
+npx solidify-rs --check main.ts       # signale seulement les erreurs
 rustc --edition 2024 app.rs && ./app
 ```
 
-Comme bibliothèque :
+Le site est aussi une application : ouvrez-le dans Chrome, Edge ou Safari et installez-le (le bouton **Installer l'app**, ou *Sur l'écran d'accueil*) ; le bac à sable marche alors hors ligne.
+
+Comme bibliothèque Rust :
 
 ```toml
 [dependencies]
@@ -149,6 +152,7 @@ Quatre règles à connaître :
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | Le transpileur : lexeur, parseur, inférence de types, génération de code, ligne de commande |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
+| [`npm`](npm) | Le paquet `solidify-rs` pour `npx` : un lanceur Node.js du transpileur compilé en WebAssembly (WASI), vérifié contre les programmes de test par `node npm/test.js` |
 | [`site`](site) | Le site web : un bac à sable qui exécute Solidify en WebAssembly, écrit avec [active](https://github.com/maxlestage/Active) |
 
 ## Développement
@@ -175,6 +179,17 @@ cargo run -p solidify-site -- export dist  # des fichiers statiques pour n'impor
 ## Publier le site sur GitHub Pages
 
 Chaque branche dont la CI est verte est fusionnée dans `master` par le workflow [`ci.yml`](.github/workflows/ci.yml) (sauf les branches nommées `wip/…`). Après chaque exécution verte de la CI sur `master`, le workflow [`pages.yml`](.github/workflows/pages.yml) active GitHub Pages si besoin, exporte le site avec `solidify-site export` et le publie sur `https://maxlestage.github.io/Solidify/`. Pour publier tout de suite : **Actions → Pages → Run workflow**.
+
+## Publier sur npm
+
+Le workflow [`npm.yml`](.github/workflows/npm.yml) construit le paquet après chaque fusion dans `master` et le publie quand sa version (dans [`npm/package.json`](npm/package.json)) n'est pas encore sur npm. Il lui faut un jeton npm dans le secret du dépôt `NPM_TOKEN` (**Settings → Secrets and variables → Actions**). Pour essayer le paquet en local :
+
+```sh
+cargo build -p solidify --bin solidify --target wasm32-wasip1 --profile wasm-release
+cp target/wasm32-wasip1/wasm-release/solidify.wasm LICENSE npm/
+node npm/test.js                     # chaque programme de test, comme le traduit la version native
+node npm/bin/solidify.js main.ts     # ce que lance `npx solidify-rs main.ts`
+```
 
 ## Licence
 
