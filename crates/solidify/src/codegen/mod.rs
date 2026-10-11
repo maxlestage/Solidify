@@ -6,6 +6,7 @@
 //! moved rather than cloned.
 
 mod calls;
+mod dynamic;
 mod exprs;
 mod items;
 mod runtime;
@@ -162,6 +163,8 @@ pub(super) struct Gen<'a> {
     pub inspected: BTreeSet<String>,
     /// The structs, enums and unions that `JSON.parse` builds: they get a `JsFromJson`.
     pub json_types: BTreeSet<String>,
+    /// The expressions being written before their conversion to or from a `JsValue`.
+    pub casting: HashSet<NodeId>,
     /// Fields read (or written: `true`) on union values: accessors on the enum.
     pub union_accessors: BTreeSet<(String, String, bool)>,
     /// Unions whose `typeof` is taken.
@@ -275,6 +278,7 @@ fn generate_with(
         generic_inspect: false,
         inspected: BTreeSet::new(),
         json_types: BTreeSet::new(),
+        casting: HashSet::new(),
         union_accessors: BTreeSet::new(),
         union_typeof: BTreeSet::new(),
         current_class: None,
@@ -893,7 +897,18 @@ impl<'a> Gen<'a> {
         if h == Helper::Json {
             self.helpers.insert(Helper::Inspect);
         }
-        if matches!(h, Helper::Json | Helper::Inspect | Helper::NumFormat) {
+        if h == Helper::Dynamic {
+            self.helpers.extend([
+                Helper::Inspect,
+                Helper::Json,
+                Helper::NumFormat,
+                Helper::ToInt32,
+            ]);
+        }
+        if matches!(
+            h,
+            Helper::Json | Helper::Inspect | Helper::NumFormat | Helper::Dynamic
+        ) {
             self.helpers.insert(Helper::NumText);
         }
         match h {
@@ -934,6 +949,7 @@ impl<'a> Gen<'a> {
             Helper::Regex => "JsRegex",
             Helper::Json => "js_json_stringify",
             Helper::Date => "JsDate",
+            Helper::Dynamic => "JsValue",
         }
     }
 
@@ -1389,6 +1405,12 @@ impl<'a> Gen<'a> {
     }
 
     pub(super) fn ty_of(&self, e: &Expr) -> Ty {
+        // Converted for its place: the type it has there.
+        if !self.casting.contains(&e.id)
+            && let Some((_, to)) = self.p.dyn_casts.get(&e.id)
+        {
+            return self.resolve(to);
+        }
         self.resolve(&self.p.ty(e.id))
     }
 
@@ -1742,6 +1764,8 @@ impl<'a> Gen<'a> {
                     self.helper(Helper::Date).into()
                 } else if n == "Symbol" {
                     self.helper(Helper::Symbol).into()
+                } else if n == crate::types::DYNAMIC {
+                    self.helper(Helper::Dynamic).into()
                 } else if self.is_type_param(&n) {
                     n
                 } else if self.p.is_dyn(&n) {
@@ -1965,6 +1989,7 @@ impl<'a> Gen<'a> {
             Ty::Num(_) | Ty::Str | Ty::Bool => "{}",
             Ty::Named(n, ..) => {
                 let prints = n == "Error"
+                    || n == crate::types::DYNAMIC
                     || n == "Symbol"
                     || n == "RegExp"
                     || self.is_type_param(&n)
