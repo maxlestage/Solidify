@@ -405,21 +405,22 @@ impl<'m> Infer<'m> {
             let v = self.vars.get_mut(&id).expect("var");
             if v.func != Some(current) {
                 match v.role {
-                    Role::TopLevel => {
-                        if outer_fn != Some(main_id) {
-                            v.used_in_fn = true;
-                        }
-                        if current != main_id {
+                    Role::Func | Role::Class | Role::Enum => {}
+                    role => {
+                        if role == Role::TopLevel {
+                            if outer_fn != Some(main_id) {
+                                v.used_in_fn = true;
+                            }
+                            if current != main_id {
+                                v.captured = true;
+                            }
+                        } else {
                             v.captured = true;
                         }
-                    }
-                    Role::Func | Role::Class | Role::Enum => {}
-                    _ => {
-                        v.captured = true;
                         // Every function between the use and the declaration captures it.
-                        let owner = v.func;
+                        let owner = v.func.unwrap_or(main_id);
                         for ctx in self.fns.iter_mut().rev() {
-                            if Some(ctx.id) == owner {
+                            if ctx.id == owner {
                                 break;
                             }
                             if !ctx.captures.contains(&id) {
@@ -1265,10 +1266,46 @@ impl<'m> Infer<'m> {
                 Ok(Ty::Array(Box::new(t)))
             }
             "Date" => self.err("`Date` is not supported", e.span),
-            "Promise" => self.err(
-                "`new Promise` is not supported: use `async` functions",
-                e.span,
-            ),
+            "Promise" => {
+                // `new Promise((resolve, reject) => …)`, awaited where it is made.
+                let ExprKind::New { type_args, .. } = &e.kind else {
+                    unreachable!()
+                };
+                let value = match type_args.first() {
+                    Some(t) => self.ann(t, "")?,
+                    None => self.types.fresh(),
+                };
+                let resolve = Ty::Func(Rc::new(FuncTy {
+                    params: vec![value.clone()],
+                    ret: Ty::Void,
+                }));
+                let reject = Ty::Func(Rc::new(FuncTy {
+                    params: vec![Ty::Named("Error".into())],
+                    ret: Ty::Void,
+                }));
+                let executor = Ty::Func(Rc::new(FuncTy {
+                    params: vec![resolve, reject],
+                    ret: Ty::Void,
+                }));
+                let Some(a) = args.first() else {
+                    return self.err("`new Promise` needs an executor function", e.span);
+                };
+                let t = self.expr(&a.expr, Some(&executor))?;
+                self.expect(&t, &executor, a.expr.span)?;
+                let id = self.ctx().id;
+                let is_async = self.funcs.get(&id).is_some_and(|f| f.is_async);
+                if !is_async && id != self.main_id {
+                    return self.err(
+                        "`new Promise` must be made in an async function (it is awaited there)",
+                        e.span,
+                    );
+                }
+                if id == self.main_id {
+                    self.funcs.get_mut(&id).expect("main").is_async = true;
+                }
+                self.calls.insert(e.id, Callee::Builtin("new Promise"));
+                Ok(value)
+            }
             "RegExp" => self.err("regular expressions are not supported", e.span),
             _ => self.err(format!("unknown class `{name}`"), callee.span),
         }
@@ -1579,7 +1616,47 @@ impl<'m> Infer<'m> {
                     span,
                 );
             }
-            "setTimeout" | "setInterval" => return self.err("timers are not supported", span),
+            "setTimeout" | "setInterval" => {
+                // The callback runs later, on its own: it keeps what it uses.
+                let callback = Ty::Func(Rc::new(FuncTy {
+                    params: Vec::new(),
+                    ret: Ty::Void,
+                }));
+                let Some(cb) = args.first() else {
+                    return self.err(format!("`{name}` needs a callback"), span);
+                };
+                let ct = self.expr(&cb.expr, Some(&callback))?;
+                let Ty::Func(f) = self.types.resolve(&ct) else {
+                    let d = self.describe(&ct);
+                    return self.err(
+                        format!("`{name}` needs a function, found {d}"),
+                        cb.expr.span,
+                    );
+                };
+                if f.params
+                    .iter()
+                    .any(|p| !matches!(self.types.resolve(p), Ty::Void | Ty::Var(_)))
+                {
+                    return self.err(
+                        format!("the callback of `{name}` takes no argument"),
+                        cb.expr.span,
+                    );
+                }
+                self.mark_stored(&cb.expr);
+                if args.len() > 1 {
+                    let n = self.types.num(Flavor::Unknown);
+                    self.arg_typed(args, 1, Some(n), name, span)?;
+                }
+                self.no_more_than(args, 2, name, span)?;
+                self.uses_timers = true;
+                self.types.int()
+            }
+            "clearTimeout" | "clearInterval" => {
+                let n = self.types.num(Flavor::Unknown);
+                self.arg_typed(args, 0, Some(n), name, span)?;
+                self.uses_timers = true;
+                Ty::Void
+            }
             "alert" | "prompt" | "confirm" => {
                 return self.err("browser dialogs are not supported", span);
             }

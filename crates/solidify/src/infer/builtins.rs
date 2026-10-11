@@ -30,7 +30,13 @@ impl<'m> Infer<'m> {
         Ok(ty)
     }
 
-    fn no_more_than(&self, args: &[Arg], n: usize, name: &str, span: Span) -> IResult<()> {
+    pub(super) fn no_more_than(
+        &self,
+        args: &[Arg],
+        n: usize,
+        name: &str,
+        span: Span,
+    ) -> IResult<()> {
         if args.len() > n {
             return self.err(
                 format!(
@@ -215,6 +221,22 @@ impl<'m> Infer<'m> {
             }
             ("Array", "isArray") => self.err("`Array.isArray` is not needed: types are known at compile time", span),
             ("Array", _) => self.err(format!("`Array.{prop}` is not supported"), span),
+            ("Promise", "all") => {
+                // Each value is already awaited where it is made: the array itself.
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                let Ty::Array(_) = self.types.resolve(&t) else {
+                    return self.err("`Promise.all` needs an array", span);
+                };
+                self.done(e, full, t)
+            }
+            ("Promise", "resolve") => {
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                self.done(e, full, t)
+            }
+            ("Promise", _) => self.err(
+                format!("`Promise.{prop}` is not supported: use `await` and async functions"),
+                span,
+            ),
             ("JSON", _) => self.err(
                 "`JSON` is not supported: Rust uses the serde crate for that, which Solidify does not generate",
                 span,

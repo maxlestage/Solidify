@@ -51,6 +51,12 @@ impl<'a> Gen<'a> {
         if !self.p.has_main {
             out.push_str("#![allow(dead_code)]\n\n");
         }
+        if self.uses_rc {
+            out.push_str("use std::cell::RefCell;\nuse std::rc::Rc;\n");
+            if !(self.uses_hashmap || self.uses_hashset) {
+                out.push('\n');
+            }
+        }
         if self.uses_hashmap && self.uses_hashset {
             out.push_str("use std::collections::{HashMap, HashSet};\n\n");
         } else if self.uses_hashmap {
@@ -841,7 +847,7 @@ impl<'a> Gen<'a> {
             let pty = self.resolve(&info.sig.params[i]);
             let mode = self.param_mode(
                 &pty,
-                var.stored,
+                var.stored || var.shared,
                 var.reassigned,
                 var.mutated,
                 &info.type_params,
@@ -849,6 +855,12 @@ impl<'a> Gen<'a> {
             let t = self.mode_ty(&pty, mode, p.span)?;
             let repr = Self::mode_repr(mode);
             let name = self.bind(binding, repr);
+            if var.shared {
+                self.shared.insert(binding);
+                self.uses_rc = true;
+                self.param_rebinds
+                    .push(format!("let {name} = Rc::new(RefCell::new({name}));"));
+            }
             let m = if (var.reassigned
                 || (var.mutated && mode == Mode::Value && !self.is_copy(&pty)))
                 && mode == Mode::Value
@@ -906,8 +918,12 @@ impl<'a> Gen<'a> {
             self.fn_ctx_mut().returns_result = false;
             self.fn_ctx_mut().ret_ty = Ty::Void;
         }
+        let rebinds = std::mem::take(&mut self.param_rebinds);
         let body = self.capture(|g| {
             g.indent += 1;
+            for r in &rebinds {
+                g.line(r);
+            }
             if f.is_generator {
                 let FnBody::Block(b) = &f.body else {
                     unreachable!()
@@ -1291,7 +1307,7 @@ impl<'a> Gen<'a> {
             for s in &stmts {
                 g.stmt(s)?;
             }
-            if info.throws {
+            if info.throws && (info.is_async || !g.p.uses_timers) {
                 g.line("Ok(())");
             }
             g.indent -= 1;
@@ -1305,18 +1321,40 @@ impl<'a> Gen<'a> {
         } else {
             ""
         };
+        let timers = if self.p.uses_timers {
+            self.helper(Helper::Timers);
+            true
+        } else {
+            false
+        };
         if info.is_async {
             let h = self.helper(Helper::BlockOn);
             self.line(&format!("fn main(){ret} {{"));
             self.indent += 1;
-            self.line(&format!("{h}(async {{"));
-            self.out.push_str(&indent_text(&body, 1));
-            self.line("})");
+            if timers {
+                self.line(&format!("let result = {h}(async {{"));
+                self.out.push_str(&indent_text(&body, 1));
+                self.line("});");
+                self.line("js_run_timers();");
+                self.line("result");
+            } else {
+                self.line(&format!("{h}(async {{"));
+                self.out.push_str(&indent_text(&body, 1));
+                self.line("})");
+            }
             self.indent -= 1;
             self.line("}");
         } else {
             self.line(&format!("fn main(){ret} {{"));
             self.out.push_str(&body);
+            if timers {
+                self.indent += 1;
+                self.line("js_run_timers();");
+                if info.throws {
+                    self.line("Ok(())");
+                }
+                self.indent -= 1;
+            }
             self.line("}");
         }
         Ok(())

@@ -65,6 +65,9 @@ pub struct VarInfo {
     pub closure_fn: Option<NodeId>,
     /// Holds the result of a generator's `next()`: `.value` and `.done` read it.
     pub iter_result: bool,
+    /// Changed, and captured by a closure that outlives the scope: the closure and the
+    /// scope share it (`Rc<RefCell<T>>`).
+    pub shared: bool,
     /// The loop depth where it was declared (last-use analysis).
     pub loop_depth: usize,
     pub span: Span,
@@ -357,6 +360,8 @@ pub struct Program {
     pub polymorphic: HashSet<String>,
     /// Base method → the methods overriding it in subclasses.
     pub overrides: HashMap<NodeId, Vec<NodeId>>,
+    /// The program sets timers: they run once `main` is done.
+    pub uses_timers: bool,
 }
 
 impl Program {
@@ -562,6 +567,7 @@ pub(super) struct Infer<'m> {
     /// The class declarations, by name (for base classes collected on demand).
     pub(super) class_asts: HashMap<String, &'m Class>,
     pub(super) collected_classes: HashSet<String>,
+    pub(super) uses_timers: bool,
 }
 
 /// A use of a variable: the expression, the loop depth, the function and the branch path.
@@ -600,6 +606,7 @@ pub(super) const GLOBALS: &[&str] = &[
     "setTimeout",
     "setInterval",
     "clearTimeout",
+    "clearInterval",
     "alert",
     "RegExp",
     "Symbol",
@@ -652,6 +659,7 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         overrides: HashMap::new(),
         class_asts: HashMap::new(),
         collected_classes: HashSet::new(),
+        uses_timers: false,
     };
     inf.run(module)?;
     inf.finish()
@@ -758,6 +766,7 @@ impl<'m> Infer<'m> {
                 alias: false,
                 closure_fn: None,
                 iter_result: false,
+                shared: false,
                 loop_depth: depth,
                 span,
             },

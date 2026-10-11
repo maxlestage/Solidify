@@ -482,9 +482,14 @@ impl<'m> Infer<'m> {
             }
             FnBody::Expr(e) => {
                 let ret = self.ctx().ret.clone();
-                let t = self.expr(e, Some(&ret))?;
-                self.mark_stored(e);
-                self.expect(&t, &ret, e.span)?;
+                if matches!(self.types.resolve(&ret), Ty::Void) {
+                    // A callback whose result nobody wants: the value is dropped.
+                    self.expr(e, None)?;
+                } else {
+                    let t = self.expr(e, Some(&ret))?;
+                    self.mark_stored(e);
+                    self.expect(&t, &ret, e.span)?;
+                }
             }
         }
         self.pop_scope();

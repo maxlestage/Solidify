@@ -82,6 +82,10 @@ impl<'m> Infer<'m> {
         let ctx = self.fns.pop().expect("main");
         let info = self.funcs.get_mut(&self.main_id).expect("main");
         info.captures = ctx.captures;
+        // Timers run after the script: `main` exists for them.
+        if self.uses_timers {
+            self.has_main = true;
+        }
         Ok(())
     }
 
@@ -586,7 +590,9 @@ impl<'m> Infer<'m> {
             type_params,
             throws: false,
             throw_direct: false,
-            is_async: f.is_async,
+            // A function giving a `Promise` is awaited by its callers: async in Rust.
+            is_async: f.is_async
+                || matches!(&f.ret, Some(TypeAnn::Named { name, .. }) if name == "Promise"),
             is_arrow: f.is_arrow,
             method_of: method_of.map(str::to_string),
             method_kind,

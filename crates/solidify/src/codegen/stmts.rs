@@ -508,6 +508,37 @@ impl<'a> Gen<'a> {
     ) -> GResult<()> {
         let var = self.p.var(id).clone();
         let it = self.ty_of(init);
+        if var.shared {
+            // Shared with a closure that outlives this scope.
+            let x = match &init.kind {
+                ExprKind::Arrow(f) | ExprKind::Func(f) => self.closure(f, &[], true)?,
+                _ => self.expr(init)?,
+            };
+            let value = self.owned_as(x, &it, ty);
+            let needs_type = matches!(
+                value.as_str(),
+                "Vec::new()"
+                    | "HashMap::new()"
+                    | "HashSet::new()"
+                    | "JsMap::new()"
+                    | "JsSet::new()"
+                    | "None"
+                    | "String::new()"
+            ) || matches!(self.resolve(&it), Ty::Null)
+                || matches!(init.kind, ExprKind::Num { .. }) && self.is_float(ty);
+            let name = self.bind(id, Repr::Owned);
+            self.shared.insert(id);
+            self.uses_rc = true;
+            if needs_type {
+                let t = self.rust_ty(ty, span)?;
+                self.line(&format!(
+                    "let {name}: Rc<RefCell<{t}>> = Rc::new(RefCell::new({value}));"
+                ));
+            } else {
+                self.line(&format!("let {name} = Rc::new(RefCell::new({value}));"));
+            }
+            return Ok(());
+        }
         let copy = self.is_copy(ty);
         let fixed = !var.reassigned;
         let plain_place = matches!(
@@ -560,6 +591,20 @@ impl<'a> Gen<'a> {
             let m = if var.mutated { "mut " } else { "" };
             let name = self.bind(id, Repr::Owned);
             self.line(&format!("let {m}{name} = {value};"));
+            return Ok(());
+        }
+        // `const id = setInterval(() => { … clearInterval(id) … })`: the id exists first.
+        if let ExprKind::Call { args, .. } = &init.kind
+            && let Some(Callee::Builtin(name @ ("global.setTimeout" | "global.setInterval"))) =
+                self.p.calls.get(&init.id)
+            && self.mentions(&args[0].expr, id)
+        {
+            let repeat = *name == "global.setInterval";
+            let name = self.bind(id, Repr::Owned);
+            self.helper(super::Helper::Timers);
+            self.line(&format!("let {name} = js_timer_id();"));
+            let (cb, ms) = self.timer_parts(args)?;
+            self.line(&format!("js_schedule({name}, {cb}, {ms}, {repeat});"));
             return Ok(());
         }
         let x = match &init.kind {
@@ -633,7 +678,7 @@ impl<'a> Gen<'a> {
 
     // ----- expression statements -----
 
-    fn expr_stmt(&mut self, e: &'a Expr) -> GResult<()> {
+    pub(super) fn expr_stmt(&mut self, e: &'a Expr) -> GResult<()> {
         match &e.kind {
             ExprKind::Assign { op, target, value } => self.assign_stmt(*op, target, value, e),
             ExprKind::Update { inc, arg, .. } => {
@@ -693,7 +738,7 @@ impl<'a> Gen<'a> {
     /// `x++` as `x += 1`.
     pub(super) fn update_text(&mut self, inc: bool, arg: &'a Expr) -> GResult<String> {
         let ty = self.ty_of(arg);
-        let x = self.expr(arg)?;
+        let x = self.expr_mut_root(arg)?;
         let target = self.place(x);
         let one = if self.is_float(&ty) { "1.0" } else { "1" };
         Ok(format!("{target} {}= {one}", if inc { "+" } else { "-" }))
@@ -840,12 +885,17 @@ impl<'a> Gen<'a> {
         }
         // The variable itself, even inside a region where it is narrowed.
         let x = match (&t.kind, self.p.refs.get(&t.id)) {
+            (ExprKind::Ident(_), Some(&b)) if self.shared.contains(&b) => E::new(
+                format!("(*{}.borrow_mut())", self.name(b)),
+                PREC_ATOM,
+                Repr::Place,
+            ),
             (ExprKind::Ident(_), Some(&b)) => {
                 let mut x = E::atom(self.name(b), self.repr_of(b));
                 x.var = Some((b, t.id));
                 x
             }
-            _ => self.expr(t)?,
+            _ => self.expr_mut_root(t)?,
         };
         self.assign_to(op, x, value, &tt, &vt, e)
     }
@@ -1126,6 +1176,19 @@ impl<'a> Gen<'a> {
                 test_id: inner.id,
             },
         ))
+    }
+
+    /// Whether an expression (a callback) refers to the variable.
+    fn mentions(&self, e: &Expr, binding: NodeId) -> bool {
+        let mut found = false;
+        let mut on_stmt = |_: &Stmt| {};
+        let mut on_expr = |x: &Expr| {
+            if self.p.refs.get(&x.id) == Some(&binding) {
+                found = true;
+            }
+        };
+        super::visit_expr_deep(e, &mut on_stmt, &mut on_expr);
+        found
     }
 
     /// Whether a branch reads the value a test narrowed.
