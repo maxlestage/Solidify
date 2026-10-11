@@ -50,6 +50,8 @@ enum RxNode {
     Group(Vec<Vec<RxNode>>, Option<usize>),
     /// Lookahead: alternatives, and whether it is negative.
     Look(Vec<Vec<RxNode>>, bool),
+    /// Lookbehind: alternatives ending where the match is, and whether it is negative.
+    Behind(Vec<Vec<RxNode>>, bool),
     Repeat(Box<RxNode>, usize, Option<usize>, bool),
     BackRef(usize),
     /// `\p{…}` (negated: `\P{…}`): a Unicode property, by name.
@@ -246,6 +248,22 @@ impl JsRegex {
                 let found = alts
                     .iter()
                     .any(|alt| self.seq(text, alt, pos, caps, &mut |_, _| true));
+                if found == *negative {
+                    *caps = saved;
+                    return false;
+                }
+                if *negative {
+                    *caps = saved;
+                }
+                self.seq(text, rest, pos, caps, k)
+            }
+            RxNode::Behind(alts, negative) => {
+                let saved = caps.clone();
+                // Some start before `pos` from which an alternative ends exactly at `pos`.
+                let found = (0..=pos).rev().any(|start| {
+                    alts.iter()
+                        .any(|alt| self.seq(text, alt, start, caps, &mut |end, _| end == pos))
+                });
                 if found == *negative {
                     *caps = saved;
                     return false;
@@ -650,7 +668,11 @@ impl RxParser<'_> {
         };
         if matches!(
             atom,
-            RxNode::Start | RxNode::End | RxNode::WordBoundary(_) | RxNode::Look(..)
+            RxNode::Start
+                | RxNode::End
+                | RxNode::WordBoundary(_)
+                | RxNode::Look(..)
+                | RxNode::Behind(..)
         ) {
             return Err("nothing to repeat".into());
         }
@@ -699,7 +721,13 @@ impl RxParser<'_> {
                         Some('<') => {
                             self.pos += 1;
                             if self.peek() == Some('=') || self.peek() == Some('!') {
-                                return Err("lookbehind is not supported".into());
+                                let negative = self.peek() == Some('!');
+                                self.pos += 1;
+                                let alts = self.alternatives()?;
+                                if !self.eat(')') {
+                                    return Err("missing `)`".into());
+                                }
+                                return Ok(RxNode::Behind(alts, negative));
                             }
                             let name: String = std::iter::from_fn(|| {
                                 let c = self.peek()?;

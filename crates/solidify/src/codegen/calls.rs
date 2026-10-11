@@ -2125,10 +2125,23 @@ impl<'a> Gen<'a> {
             "forEach" => {
                 if uses_index(self, 0) {
                     let c = cb(self, 0, &[elem_repr, Repr::Usize])?;
-                    E::owned(
-                        format!("{iter}.enumerate().for_each(|(i, x)| ({c})(x, i))"),
-                        PREC_POSTFIX,
-                    )
+                    // `(x, i) => …` takes the pair `enumerate` gives: `|(i, x)| …`.
+                    let pair = c.find('|').and_then(|a| {
+                        let b = a + 1 + c[a + 1..].find('|')?;
+                        let params: Vec<&str> = c[a + 1..b].split(", ").collect();
+                        (params.len() == 2 && !c[..a].contains('{')).then(|| {
+                            format!("{}|({}, {})|{}", &c[..a], params[1], params[0], &c[b + 1..])
+                        })
+                    });
+                    match pair {
+                        Some(pair) => {
+                            E::owned(format!("{iter}.enumerate().for_each({pair})"), PREC_POSTFIX)
+                        }
+                        None => E::owned(
+                            format!("{iter}.enumerate().for_each(|(i, x)| ({c})(x, i))"),
+                            PREC_POSTFIX,
+                        ),
+                    }
                 } else {
                     let c = cb(self, 0, &[elem_repr])?;
                     E::owned(format!("{iter}.for_each({c})"), PREC_POSTFIX)

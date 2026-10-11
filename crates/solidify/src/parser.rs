@@ -565,9 +565,6 @@ impl<'a> Parser<'a> {
     fn for_stmt(&mut self) -> PResult<StmtKind> {
         let start = self.expect_word("for")?;
         let is_await = self.eat_word("await");
-        if is_await {
-            return Err(Error::new("`for await` is not supported", start));
-        }
         self.expect_punct("(")?;
         let mut init = None;
         if !self.at_punct(";") {
@@ -590,6 +587,9 @@ impl<'a> Parser<'a> {
                     self.expect_punct(")")?;
                     let body = Box::new(self.statement()?);
                     let pat = decl.decls.into_iter().next().unwrap().pat;
+                    if is_await && !is_in {
+                        return Ok(self.for_await(decl.kind, pat, iter, *body));
+                    }
                     return Ok(StmtKind::ForOf {
                         kind: decl.kind,
                         pat,
@@ -614,6 +614,9 @@ impl<'a> Parser<'a> {
                     let iter = self.assignment()?;
                     self.expect_punct(")")?;
                     let body = Box::new(self.statement()?);
+                    if is_await && !is_in {
+                        return Ok(self.for_await(VarKind::Let, pat, iter, *body));
+                    }
                     return Ok(StmtKind::ForOf {
                         kind: VarKind::Let,
                         pat,
@@ -630,6 +633,9 @@ impl<'a> Parser<'a> {
             };
             self.no_in = was;
             init = Some(Box::new(result));
+        }
+        if is_await {
+            return Err(Error::new("`for await` goes over `of` a list", start));
         }
         self.expect_punct(";")?;
         let test = if self.at_punct(";") {
@@ -651,6 +657,64 @@ impl<'a> Parser<'a> {
             update,
             body,
         })
+    }
+
+    /// `for await (const x of xs)`: each item awaited at the start of the body.
+    fn for_await(&mut self, kind: VarKind, pat: Pattern, iter: Expr, body: Stmt) -> StmtKind {
+        let span = pat.span();
+        let name = format!("pending{}", self.next_id);
+        let item = Pattern::Ident {
+            name: name.clone(),
+            span,
+            id: self.id(),
+        };
+        let read = Expr {
+            kind: ExprKind::Ident(name),
+            span,
+            id: self.id(),
+        };
+        let awaited = Expr {
+            kind: ExprKind::Await(Box::new(read)),
+            span,
+            id: self.id(),
+        };
+        let decl = Stmt {
+            kind: StmtKind::Var(VarDecl {
+                kind,
+                decls: vec![Declarator {
+                    pat,
+                    ty: None,
+                    init: Some(awaited),
+                    span,
+                }],
+                exported: false,
+            }),
+            span,
+            comments: Vec::new(),
+        };
+        let bspan = body.span;
+        let stmts = match body.kind {
+            StmtKind::Block(b) => std::iter::once(decl).chain(b.stmts).collect(),
+            other => vec![
+                decl,
+                Stmt {
+                    kind: other,
+                    span: bspan,
+                    comments: body.comments,
+                },
+            ],
+        };
+        StmtKind::ForOf {
+            kind: VarKind::Const,
+            pat: item,
+            iter,
+            body: Box::new(Stmt {
+                kind: StmtKind::Block(Block { stmts, span: bspan }),
+                span: bspan,
+                comments: Vec::new(),
+            }),
+            is_in: false,
+        }
     }
 
     fn switch_stmt(&mut self) -> PResult<StmtKind> {
@@ -1860,10 +1924,15 @@ impl<'a> Parser<'a> {
                     _ => self.unexpected("a number"),
                 }
             }
-            Tok::Template { .. } => Err(Error::new(
-                "template literal types are not supported",
-                start,
-            )),
+            // `` `user-${string}` ``: a string.
+            Tok::Template { .. } => {
+                self.next();
+                Ok(TypeAnn::Named {
+                    name: "string".into(),
+                    args: Vec::new(),
+                    span: start,
+                })
+            }
             Tok::Ident(w) => match w.as_str() {
                 "true" | "false" => {
                     self.next();

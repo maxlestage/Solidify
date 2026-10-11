@@ -257,6 +257,8 @@ impl<'m> Infer<'m> {
                 Ty::Map(Box::new(k), Box::new(v), true)
             }
             "Promise" => Ty::promise(arg(self, 0)?),
+            // The strings of a tagged template.
+            "TemplateStringsArray" => Ty::Array(Box::new(Ty::Str)),
             "Generator" | "Iterable" | "IterableIterator" | "Iterator" => {
                 Ty::Gen(Box::new(arg(self, 0)?))
             }
