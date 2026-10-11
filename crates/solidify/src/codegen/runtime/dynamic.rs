@@ -22,6 +22,9 @@ impl JsValue {
 
     /// `Number(v)`.
     fn to_number(&self) -> f64 {
+        if let Some(inner) = self.shown() {
+            return inner.to_number();
+        }
         match self {
             JsValue::Int(n) => *n as f64,
             JsValue::Float(x) => *x,
@@ -106,7 +109,8 @@ fn js_typeof(v: &JsValue) -> &'static str {
 fn js_primitive(v: &JsValue) -> JsValue {
     match v {
         JsValue::Array(_) | JsValue::Object(..) | JsValue::Map(_) | JsValue::Set(_)
-        | JsValue::Func(_) | JsValue::Raw(_) | JsValue::Date(..) => JsValue::Str(js_to_string(v)),
+        | JsValue::Func(_) | JsValue::Raw(_) | JsValue::Date(..) | JsValue::Ref(_)
+        | JsValue::Proxy(_) => JsValue::Str(js_to_string(v)),
         other => other.clone(),
     }
 }
@@ -169,6 +173,9 @@ fn js_op_cmp(op: &str, a: &JsValue, b: &JsValue) -> bool {
 #[allow(dead_code)]
 fn js_strict_eq(a: &JsValue, b: &JsValue) -> bool {
     match (a, b) {
+        (JsValue::Ref(x), JsValue::Ref(y)) => std::rc::Rc::ptr_eq(x, y),
+        (JsValue::Proxy(x), JsValue::Proxy(y)) => std::rc::Rc::ptr_eq(x, y),
+        (JsValue::Ref(_) | JsValue::Proxy(_), _) | (_, JsValue::Ref(_) | JsValue::Proxy(_)) => false,
         (JsValue::Int(_) | JsValue::Float(_), JsValue::Int(_) | JsValue::Float(_)) => {
             a.to_number() == b.to_number()
         }
@@ -194,6 +201,11 @@ fn js_loose_eq(a: &JsValue, b: &JsValue) -> bool {
 fn js_get(v: &JsValue, key: &str) -> JsValue {
     let index = key.parse::<usize>().ok();
     match v {
+        JsValue::Ref(cell) => js_get(&cell.borrow(), key),
+        JsValue::Proxy(p) => match &p.get {
+            Some(trap) => trap(p.target.clone(), key.to_string(), v.clone()),
+            None => js_get(&p.target, key),
+        },
         JsValue::Object(_, props) => props
             .iter()
             .find(|(k, _)| k == key)
@@ -236,6 +248,19 @@ fn js_key_text(k: &JsValue) -> String {
 #[allow(dead_code)]
 fn js_set(v: &mut JsValue, key: &str, value: JsValue) {
     match v {
+        JsValue::Ref(cell) => js_set(&mut cell.borrow_mut(), key, value),
+        JsValue::Proxy(p) => match &p.set {
+            Some(trap) => {
+                let receiver = JsValue::Proxy(p.clone());
+                if !trap(p.target.clone(), key.to_string(), value, receiver) {
+                    panic!("TypeError: 'set' on proxy: trap returned falsish for property '{key}'");
+                }
+            }
+            None => {
+                let mut target = p.target.clone();
+                js_set(&mut target, key, value);
+            }
+        },
         JsValue::Object(_, props) => match props.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = value,
             None => props.push((key.to_string(), value)),
@@ -258,6 +283,11 @@ fn js_set(v: &mut JsValue, key: &str, value: JsValue) {
 #[allow(dead_code)]
 fn js_has(v: &JsValue, key: &str) -> bool {
     match v {
+        JsValue::Ref(cell) => js_has(&cell.borrow(), key),
+        JsValue::Proxy(p) => match &p.has {
+            Some(trap) => trap(p.target.clone(), key.to_string()),
+            None => js_has(&p.target, key),
+        },
         JsValue::Object(_, props) => props.iter().any(|(k, _)| k == key),
         JsValue::Array(items) => {
             key == "length" || key.parse::<usize>().is_ok_and(|i| i < items.len())
@@ -269,15 +299,26 @@ fn js_has(v: &JsValue, key: &str) -> bool {
 /// `delete v[key]`.
 #[allow(dead_code)]
 fn js_delete(v: &mut JsValue, key: &str) -> bool {
-    if let JsValue::Object(_, props) = v {
-        props.retain(|(k, _)| k != key);
+    match v {
+        JsValue::Ref(cell) => js_delete(&mut cell.borrow_mut(), key),
+        JsValue::Proxy(p) => match &p.delete {
+            Some(trap) => trap(p.target.clone(), key.to_string()),
+            None => js_delete(&mut p.target.clone(), key),
+        },
+        JsValue::Object(_, props) => {
+            props.retain(|(k, _)| k != key);
+            true
+        }
+        _ => true,
     }
-    true
 }
 
 /// `v.name(args)`: the methods of strings, arrays and numbers.
 #[allow(dead_code)]
 fn js_call_method(v: &JsValue, name: &str, args: Vec<JsValue>) -> JsValue {
+    if let JsValue::Ref(cell) = v {
+        return js_call_method(&cell.borrow(), name, args);
+    }
     let arg = |i: usize| args.get(i).cloned().unwrap_or(JsValue::Undefined);
     let int_arg = |i: usize, default: i64| {
         args.get(i)
@@ -406,6 +447,9 @@ fn js_from_json_value(v: &JsonValue) -> JsValue {
 /// A value as the JSON a typed reader takes.
 #[allow(dead_code)]
 fn js_to_json_value(v: &JsValue) -> JsonValue {
+    if let Some(inner) = v.shown() {
+        return js_to_json_value(&inner);
+    }
     match v {
         JsValue::Null | JsValue::Undefined | JsValue::Func(_) => JsonValue::Null,
         JsValue::Bool(b) => JsonValue::Bool(*b),
@@ -428,6 +472,7 @@ fn js_to_json_value(v: &JsValue) -> JsonValue {
                 .map(|(k, x)| (js_to_string(k), js_to_json_value(x)))
                 .collect(),
         ),
+        JsValue::Ref(_) | JsValue::Proxy(_) => unreachable!("shown above"),
     }
 }
 
@@ -543,6 +588,9 @@ impl std::fmt::Display for JsValue {
 /// `for (const x of v)`: the items of an array or a set, the characters of a text.
 #[allow(dead_code)]
 fn js_items(v: &JsValue) -> Vec<JsValue> {
+    if let Some(inner) = v.shown() {
+        return js_items(&inner);
+    }
     match v {
         JsValue::Array(items) | JsValue::Set(items) => items.clone(),
         JsValue::Str(s) => s.chars().map(|c| JsValue::Str(c.to_string())).collect(),
@@ -557,6 +605,9 @@ fn js_items(v: &JsValue) -> Vec<JsValue> {
 /// `for (const k in v)`, `Object.keys(v)`.
 #[allow(dead_code)]
 fn js_keys(v: &JsValue) -> Vec<String> {
+    if let Some(inner) = v.shown() {
+        return js_keys(&inner);
+    }
     match v {
         JsValue::Object(_, props) => props.iter().map(|(k, _)| k.clone()).collect(),
         JsValue::Array(items) => (0..items.len()).map(|i| i.to_string()).collect(),
@@ -568,6 +619,10 @@ fn js_keys(v: &JsValue) -> Vec<String> {
 /// `v.name(args)` for the methods that change an array in place.
 #[allow(dead_code)]
 fn js_call_method_mut(v: &mut JsValue, name: &str, args: Vec<JsValue>) -> JsValue {
+    if let JsValue::Ref(cell) = v {
+        let cell = cell.clone();
+        return js_call_method_mut(&mut cell.borrow_mut(), name, args);
+    }
     let JsValue::Array(items) = v else {
         return js_call_method(v, name, args);
     };
@@ -675,6 +730,9 @@ fn js_op_assign(place: &mut JsValue, op: &str, value: JsValue) -> JsValue {
 /// `Object.values(v)`.
 #[allow(dead_code)]
 fn js_values(v: &JsValue) -> Vec<JsValue> {
+    if let JsValue::Proxy(_) = v {
+        return js_keys(v).iter().map(|k| js_get(v, k)).collect();
+    }
     js_keys(v).iter().map(|k| js_get(v, k)).collect()
 }
 
@@ -688,4 +746,68 @@ fn js_entries(v: &JsValue) -> Vec<(String, JsValue)> {
             (k, x)
         })
         .collect()
+}
+
+/// Changes what a path inside `v` names (`data.items[0]`), through shared objects and
+/// proxies.
+#[allow(dead_code)]
+fn js_with_mut<R>(v: &mut JsValue, path: &[String], f: impl FnOnce(&mut JsValue) -> R) -> R {
+    match v {
+        JsValue::Ref(cell) => {
+            let cell = cell.clone();
+            let mut inner = cell.borrow_mut();
+            js_with_mut(&mut inner, path, f)
+        }
+        // Through a proxy: what its `get` gives, changed (shared when it is an object).
+        JsValue::Proxy(_) if !path.is_empty() => {
+            let mut child = js_get(v, &path[0]);
+            js_with_mut(&mut child, &path[1..], f)
+        }
+        _ => match path.split_first() {
+            None => f(v),
+            Some((k, rest)) => js_with_mut(js_get_mut(v, k), rest, f),
+        },
+    }
+}
+
+/// `v.key op= value`: the new value.
+#[allow(dead_code)]
+fn js_op_assign_prop(v: &mut JsValue, key: &str, op: &str, value: JsValue) -> JsValue {
+    let mut current = js_get(v, key);
+    let new = js_op_assign(&mut current, op, value);
+    js_set(v, key, new.clone());
+    new
+}
+
+/// `list.sort(compare)` in place.
+#[allow(dead_code)]
+fn js_sort_by(v: &mut JsValue, compare: &dyn Fn(JsValue, JsValue) -> f64) -> JsValue {
+    if let JsValue::Ref(cell) = v {
+        let cell = cell.clone();
+        js_sort_by(&mut cell.borrow_mut(), compare);
+        return v.clone();
+    }
+    if let JsValue::Array(items) = v {
+        items.sort_by(|a, b| {
+            compare(a.clone(), b.clone())
+                .partial_cmp(&0.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+    v.clone()
+}
+
+/// The object a proxy stands for, shared with it: a value held in a variable becomes a
+/// shared object, changed for both.
+#[allow(dead_code)]
+fn js_share(v: &mut JsValue) -> JsValue {
+    if matches!(v, JsValue::Ref(_) | JsValue::Proxy(_)) {
+        return v.clone();
+    }
+    let shared = JsValue::Ref(std::rc::Rc::new(std::cell::RefCell::new(std::mem::replace(
+        v,
+        JsValue::Undefined,
+    ))));
+    *v = shared.clone();
+    shared
 }

@@ -89,6 +89,31 @@ pub fn parse_at(
     })
 }
 
+/// Parses code written in a string of the program (`eval("…")`, `new Function("…")`):
+/// every node points at the string itself, node ids continue from `next_id`.
+pub fn parse_snippet(code: &str, at: Span, next_id: &mut NodeId) -> Result<Vec<Stmt>, Error> {
+    let (mut tokens, _) = lex(code).map_err(|e| Error::new(e.message, at))?;
+    for t in &mut tokens {
+        t.span = at;
+    }
+    let mut p = Parser {
+        src: code,
+        tokens,
+        pos: 0,
+        comments: Vec::new(),
+        comment_idx: 0,
+        next_id: *next_id,
+        no_in: false,
+        default_export: None,
+    };
+    let mut body = Vec::new();
+    while !p.at_eof() {
+        body.push(p.statement().map_err(|e| Error::new(e.message, at))?);
+    }
+    *next_id = p.next_id;
+    Ok(body)
+}
+
 struct Parser<'a> {
     src: &'a str,
     tokens: Vec<Token>,

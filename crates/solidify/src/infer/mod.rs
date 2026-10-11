@@ -378,6 +378,8 @@ pub struct Program {
     pub dyn_casts: HashMap<NodeId, (Ty, Ty)>,
     /// Object and array literals built as values known at run time.
     pub dyn_literals: HashSet<NodeId>,
+    /// `eval(code)` with code known at run time: the variables it sees (a read of each).
+    pub eval_scopes: HashMap<NodeId, Vec<(String, Expr)>>,
     /// Test expression → what it narrows.
     pub narrow_tests: HashMap<NodeId, NarrowTest>,
     /// Expression inside a narrowed region → the bound name to use instead, and the
@@ -750,6 +752,7 @@ pub(super) struct Infer<'m> {
     pub(super) enum_literal: HashMap<NodeId, (String, String)>,
     pub(super) dyn_casts: HashMap<NodeId, (Ty, Ty)>,
     pub(super) dyn_literals: HashSet<NodeId>,
+    pub(super) eval_scopes: HashMap<NodeId, Vec<(String, Expr)>>,
     /// The type expected of the call being inferred (`JSON.parse` reads it).
     pub(super) call_expected: Option<Ty>,
     pub(super) narrow_tests: HashMap<NodeId, NarrowTest>,
@@ -830,6 +833,10 @@ pub(super) type IResult<T> = Result<T, Error>;
 
 pub(super) const GLOBALS: &[&str] = &[
     "console",
+    "eval",
+    "Function",
+    "Proxy",
+    "Reflect",
     "Math",
     "JSON",
     "Object",
@@ -896,6 +903,7 @@ pub fn infer<'m>(
         enum_literal: HashMap::new(),
         dyn_casts: HashMap::new(),
         dyn_literals: HashSet::new(),
+        eval_scopes: HashMap::new(),
         call_expected: None,
         narrow_tests: HashMap::new(),
         narrowed_uses: HashMap::new(),
