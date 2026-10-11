@@ -827,6 +827,12 @@ impl<'a> Gen<'a> {
         if self.is_dynamic(&ty) {
             return self.dyn_update(inc, arg);
         }
+        if self.is_big(&ty) {
+            let x = self.expr_mut_root(arg)?;
+            let target = self.place(x);
+            let op = if inc { "plus" } else { "minus" };
+            return Ok(format!("{target} = {target}.{op}(&JsBigInt::from_i64(1))"));
+        }
         let x = self.expr_mut_root(arg)?;
         let target = self.place(x);
         let one = if self.is_float(&ty) { "1.0" } else { "1" };
@@ -1119,11 +1125,11 @@ impl<'a> Gen<'a> {
                 let v = self.expr_as(value, Want::Owned)?;
                 self.line(&format!("{place} = {place} && {v};"));
             }
-            AssignOp::Div => {
+            AssignOp::Div if !self.is_big(&tt) => {
                 let v = self.expr_as(value, Want::Owned)?;
                 self.line(&format!("{place} /= {v};"));
             }
-            AssignOp::Pow => {
+            AssignOp::Pow if !self.is_big(&tt) => {
                 let v = self.float_operand(value)?;
                 self.line(&format!("{place} = {place}.powf({v});"));
             }
@@ -1138,6 +1144,19 @@ impl<'a> Gen<'a> {
                 let bin = op.binary().expect("bitwise");
                 let code = self.bitwise_code(bin, &format!("({place} as i32)"), &b);
                 self.line(&format!("{place} = {code};"));
+            }
+            other if self.is_big(&tt) => {
+                let method = match other {
+                    AssignOp::Add => "plus",
+                    AssignOp::Sub => "minus",
+                    AssignOp::Mul => "times",
+                    AssignOp::Div => "div",
+                    AssignOp::Mod => "rem",
+                    AssignOp::Pow => "pow",
+                    _ => return self.err("this assignment is not supported on a BigInt", e.span),
+                };
+                let v = self.expr_as(value, Want::Ref)?;
+                self.line(&format!("{place} = {place}.{method}({v});"));
             }
             other => {
                 let sym = match other {
@@ -1935,7 +1954,11 @@ impl<'a> Gen<'a> {
             }
             _ => return Ok(None),
         };
-        if step == 0 || assigns_var(body, name) || self.is_float(&self.p.var(*id).ty) {
+        if step == 0
+            || assigns_var(body, name)
+            || self.is_float(&self.p.var(*id).ty)
+            || self.is_big(&self.p.var(*id).ty)
+        {
             return Ok(None);
         }
         let ascending = step > 0;

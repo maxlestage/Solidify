@@ -332,4 +332,32 @@ impl<'m> Infer<'m> {
         }
         self.done(e, full, ret)
     }
+
+    /// Two big integers (`1n + x`): `false` when neither is one. JavaScript refuses to
+    /// mix them with numbers.
+    pub(super) fn big_operands(
+        &mut self,
+        lt: &Ty,
+        rt: &Ty,
+        span: crate::error::Span,
+    ) -> IResult<bool> {
+        let big = |t: &Ty| matches!(t, Ty::Named(n, _) if n == "bigint");
+        let (l, r) = (self.types.resolve(lt), self.types.resolve(rt));
+        if !big(&l) && !big(&r) {
+            return Ok(false);
+        }
+        for t in [lt, rt] {
+            if matches!(self.types.resolve(t), Ty::Var(_)) {
+                self.unify(t, &Ty::named("bigint"), span)?;
+            }
+        }
+        let (l, r) = (self.types.resolve(lt), self.types.resolve(rt));
+        if !(big(&l) && big(&r)) {
+            return self.err(
+                "Cannot mix BigInt and other types, use explicit conversions (BigInt(x), Number(x))",
+                span,
+            );
+        }
+        Ok(true)
+    }
 }
