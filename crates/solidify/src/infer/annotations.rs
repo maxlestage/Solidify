@@ -133,7 +133,9 @@ impl<'m> Infer<'m> {
             "void" | "undefined" => Ty::Void,
             "null" => Ty::Null,
             // `any` and `unknown` are inferred from their uses, like a missing annotation.
-            "any" | "unknown" | "object" => self.types.fresh(),
+            // `any` and `unknown`: values known at run time, with JavaScript's rules.
+            "any" | "unknown" => Ty::dynamic(),
+            "object" => self.types.fresh(),
             "const" => Ty::Any,
             // Given by `desugar` to the target of a proxy.
             crate::types::DYNAMIC => Ty::dynamic(),
