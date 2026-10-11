@@ -195,7 +195,7 @@ impl<'m> Infer<'m> {
                     .aliases
                     .get(name)
                     .cloned()
-                    .unwrap_or(Ty::Named(name.to_string()));
+                    .unwrap_or(Ty::named(name.to_string()));
                 self.aliases.insert(local.to_string(), t);
             }
             return Ok(());

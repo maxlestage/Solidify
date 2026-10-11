@@ -107,7 +107,7 @@ fn unconstrained_parameters_are_generic() {
             .clone()
     };
     assert_eq!(f("id").type_params, vec!["T".to_string()]);
-    assert!(matches!(f("first").sig.ret, Ty::Named(_)));
+    assert!(matches!(f("first").sig.ret, Ty::Named(..)));
 }
 
 #[test]

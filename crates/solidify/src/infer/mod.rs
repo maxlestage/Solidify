@@ -15,13 +15,13 @@ mod finish;
 mod stmts;
 mod unions;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::{Error, Span};
 use crate::types::{FuncTy, Ty, Types};
 
-pub use finish::{pascal, same_shape_ty};
+pub use finish::{pascal, same_shape_ty, substitute};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -90,6 +90,8 @@ pub struct FnInfo {
     pub defaults: Vec<bool>,
     pub sig: FuncTy,
     pub type_params: Vec<String>,
+    /// `<T extends HasId>`: the interface or class each constrained parameter stands for.
+    pub type_bounds: Vec<(String, String)>,
     /// Returns `Result`: throws, or calls a function that throws outside a `try`.
     pub throws: bool,
     pub throw_direct: bool,
@@ -114,6 +116,9 @@ pub struct FnInfo {
     pub calls: Vec<(NodeId, NodeId)>,
     /// Uses `this`.
     pub uses_this: bool,
+    /// A method whose every `return` gives `this` (`add(x) { …; return this; }`): it
+    /// returns a reference to the object, so that calls chain on the same one.
+    pub returns_this: bool,
     pub exported: bool,
     pub span: Span,
 }
@@ -215,6 +220,12 @@ pub struct StructInfo {
     pub is_abstract: bool,
     /// `class C implements I`: the interfaces (also those a class is found to satisfy).
     pub implements: Vec<String>,
+    /// `class Stack<T>`: the type parameters, named in the fields' and methods' types.
+    pub type_params: Vec<String>,
+    /// `class Repo<T extends HasId>`: the constrained parameters and their constraint.
+    pub type_bounds: Vec<(String, String)>,
+    /// `extends Base<number>`: the base class's type arguments.
+    pub parent_args: Vec<Ty>,
 }
 
 impl StructInfo {
@@ -382,9 +393,169 @@ pub struct Program {
     /// Declarations not written: variables only assigned inside a null test, whose
     /// value the test binds.
     pub drop_decl: HashSet<NodeId>,
+    /// `T extends C` given the type `N`: (C, N), which implements C's trait.
+    pub bound_impls: BTreeSet<(String, String)>,
+    /// Variables, functions and fields whose missing value is `undefined`, not `null`.
+    pub undef_vars: HashSet<NodeId>,
+    pub undef_fns: HashSet<NodeId>,
+    pub undef_fields: HashSet<(String, String)>,
+    /// Arrays whose missing elements are `undefined`.
+    pub undef_elem_vars: HashSet<NodeId>,
+}
+
+/// `T | undefined` (and not `T | null`): a missing value is `undefined`.
+pub(super) fn says_undefined(ann: &TypeAnn) -> bool {
+    let undef = |a: &TypeAnn| match a {
+        TypeAnn::Named { name, .. } => name == "undefined" || name == "void",
+        TypeAnn::Lit(Lit::Undefined, _) => true,
+        _ => false,
+    };
+    let null = |a: &TypeAnn| match a {
+        TypeAnn::Named { name, .. } => name == "null",
+        TypeAnn::Lit(Lit::Null, _) => true,
+        _ => false,
+    };
+    match ann {
+        TypeAnn::Union(members, _) => members.iter().any(undef) && !members.iter().any(null),
+        other => undef(other),
+    }
 }
 
 impl Program {
+    /// Whether this expression, when it gives no value, gives `undefined` (as opposed to
+    /// `null`): what `console.log` prints for it.
+    pub fn undefinedish(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Undefined => true,
+            ExprKind::Ident(name) => match self.refs.get(&e.id) {
+                Some(b) => self.undef_vars.contains(b),
+                None => name == "undefined",
+            },
+            ExprKind::Member { optional: true, .. } | ExprKind::Index { optional: true, .. } => {
+                true
+            }
+            ExprKind::Member { obj, prop, .. } => match self.types.resolve(&self.ty(obj.id)) {
+                Ty::Named(n, _) => self.undef_fields.contains(&(n, prop.clone())),
+                Ty::Option(inner) => match self.types.resolve(&inner) {
+                    Ty::Named(n, _) => self.undef_fields.contains(&(n, prop.clone())),
+                    _ => false,
+                },
+                _ => false,
+            },
+            // A map read with `[k]`: `undefined` when the key is missing.
+            ExprKind::Index { obj, .. } => {
+                matches!(self.types.resolve(&self.ty(obj.id)), Ty::Map(..))
+            }
+            ExprKind::Call { .. } => match self.calls.get(&e.id) {
+                Some(Callee::Fn(b)) => self
+                    .fn_bindings
+                    .get(b)
+                    .is_some_and(|f| self.undef_fns.contains(f)),
+                Some(Callee::Closure(b)) => self
+                    .vars
+                    .get(b)
+                    .and_then(|v| v.closure_fn)
+                    .is_some_and(|f| self.undef_fns.contains(&f)),
+                Some(Callee::Method { fn_id, .. }) => self.undef_fns.contains(fn_id),
+                Some(Callee::OptionalCall | Callee::OptionalMethod { .. }) => true,
+                Some(Callee::Builtin(n)) => matches!(
+                    *n,
+                    "map.get"
+                        | "array.find"
+                        | "array.findLast"
+                        | "array.pop"
+                        | "array.shift"
+                        | "array.at"
+                ),
+                _ => false,
+            },
+            ExprKind::Cond { cons, alt, .. } => {
+                let missing = |x: &Expr| matches!(x.kind, ExprKind::Null | ExprKind::Undefined);
+                if missing(cons) {
+                    self.undefinedish(cons)
+                } else if missing(alt) {
+                    self.undefinedish(alt)
+                } else {
+                    self.undefinedish(cons) || self.undefinedish(alt)
+                }
+            }
+            ExprKind::Logical {
+                op: LogicalOp::Nullish | LogicalOp::Or,
+                right,
+                ..
+            } => self.undefinedish(right),
+            ExprKind::As(inner, _) | ExprKind::NonNull(inner) | ExprKind::Await(inner) => {
+                self.undefinedish(inner)
+            }
+            ExprKind::Assign { value, .. } => self.undefinedish(value),
+            _ => false,
+        }
+    }
+
+    /// Whether the missing elements of this array are `undefined`: `[f(), g()]` with
+    /// such calls, `xs.map(x => m.get(x))`, a variable holding one.
+    pub fn elements_undefinedish(&self, e: &Expr) -> bool {
+        match &e.kind {
+            ExprKind::Array(elems) => elems.iter().any(|el| match el {
+                ArrayElem::Expr(x) => self.undefinedish(x),
+                ArrayElem::Spread(x) => self.elements_undefinedish(x),
+                ArrayElem::Hole => true,
+            }),
+            ExprKind::Ident(_) => self
+                .refs
+                .get(&e.id)
+                .is_some_and(|b| self.undef_elem_vars.contains(b)),
+            ExprKind::Call { callee, args, .. } => match self.calls.get(&e.id) {
+                Some(Callee::Builtin("array.map" | "array.flatMap")) => {
+                    args.first().is_some_and(|a| match &a.expr.kind {
+                        ExprKind::Arrow(f) | ExprKind::Func(f) => self.undef_fns.contains(&f.id),
+                        _ => false,
+                    })
+                }
+                Some(Callee::Builtin(
+                    "array.filter" | "array.slice" | "array.concat" | "array.reverse"
+                    | "array.toReversed" | "array.sort" | "array.toSorted",
+                )) => match &callee.kind {
+                    ExprKind::Member { obj, .. } => self.elements_undefinedish(obj),
+                    _ => false,
+                },
+                _ => false,
+            },
+            ExprKind::As(inner, _) | ExprKind::NonNull(inner) => self.elements_undefinedish(inner),
+            _ => false,
+        }
+    }
+
+    /// Variables and functions whose value comes from an `undefined` source.
+    pub(super) fn settle_undefined(
+        &mut self,
+        inits: &[(NodeId, &Expr)],
+        returns: &[(NodeId, &Expr)],
+    ) {
+        loop {
+            let mut changed = false;
+            for (b, e) in inits {
+                if !self.undef_vars.contains(b) && self.undefinedish(e) {
+                    self.undef_vars.insert(*b);
+                    changed = true;
+                }
+                if !self.undef_elem_vars.contains(b) && self.elements_undefinedish(e) {
+                    self.undef_elem_vars.insert(*b);
+                    changed = true;
+                }
+            }
+            for (f, e) in returns {
+                if !self.undef_fns.contains(f) && self.undefinedish(e) {
+                    self.undef_fns.insert(*f);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     /// The class and its ancestors, nearest first.
     pub fn ancestry(&self, class: &str) -> Vec<String> {
         let mut out = vec![class.to_string()];
@@ -473,7 +644,7 @@ impl Program {
     /// The union a type names, if any.
     pub fn union_of(&self, ty: &Ty) -> Option<&UnionInfo> {
         match self.types.resolve(ty) {
-            Ty::Named(n) => self.union_info(&n),
+            Ty::Named(n, ..) => self.union_info(&n),
             _ => None,
         }
     }
@@ -595,6 +766,25 @@ pub(super) struct Infer<'m> {
     /// Functions declared with `function`: binding → fn id.
     pub(super) fn_bindings: HashMap<NodeId, NodeId>,
     pub(super) this_class_stack: Vec<String>,
+    /// (constraint, type given, where): see [`Self::record_bound_uses`].
+    pub(super) bound_uses: Vec<(String, Ty, Span)>,
+    /// `f<number>(…)`: the type arguments of the call being checked.
+    pub(super) type_args: Option<(Span, Vec<Ty>)>,
+    /// `return` statements of each function: (giving `this`, giving something else).
+    pub(super) this_returns: HashMap<NodeId, (usize, usize)>,
+    /// Where a missing value is `undefined` rather than `null` (console.log shows which):
+    /// variables, functions, (struct, field)s known so, and the initializers and returned
+    /// values that decide the others.
+    pub(super) undef_vars: HashSet<NodeId>,
+    pub(super) undef_fns: HashSet<NodeId>,
+    pub(super) undef_fields: HashSet<(String, String)>,
+    pub(super) undef_params: HashSet<(NodeId, usize)>,
+    pub(super) var_inits: Vec<(NodeId, &'m Expr)>,
+    pub(super) fn_returns: Vec<(NodeId, &'m Expr)>,
+    /// The type parameters of the generic classes, interfaces and aliases being read.
+    pub(super) param_scope: Vec<Vec<String>>,
+    /// `type Pair<A, B> = [A, B]`: the parameters and the type, instantiated at each use.
+    pub(super) generic_aliases: HashMap<String, (Vec<String>, Ty)>,
     /// Names suggested for the structs of object literals, by expression id.
     pub(super) hints: HashMap<NodeId, String>,
     /// Variables initialized from a narrowed value: (binding, test).
@@ -702,6 +892,17 @@ pub fn infer<'m>(
         has_main: false,
         fn_bindings: HashMap::new(),
         this_class_stack: Vec::new(),
+        param_scope: Vec::new(),
+        this_returns: HashMap::new(),
+        undef_vars: HashSet::new(),
+        undef_fns: HashSet::new(),
+        undef_fields: HashSet::new(),
+        undef_params: HashSet::new(),
+        var_inits: Vec::new(),
+        fn_returns: Vec::new(),
+        type_args: None,
+        bound_uses: Vec::new(),
+        generic_aliases: HashMap::new(),
         hints: HashMap::new(),
         alias_of_narrow: Vec::new(),
         polymorphic: HashSet::new(),
@@ -891,7 +1092,7 @@ impl<'m> Infer<'m> {
             Pattern::Object { props, rest, span } => {
                 let ty = self.types.resolve(ty);
                 let fields: Vec<(String, Ty)> = match &ty {
-                    Ty::Named(n) => match self.struct_by_name(n) {
+                    Ty::Named(n, ..) => match self.struct_by_name(n) {
                         Some(s) => s
                             .fields
                             .iter()
@@ -963,6 +1164,7 @@ impl<'m> Infer<'m> {
             || self.enum_by_name(name).is_some()
             || self.union_by_name(name).is_some()
             || self.aliases.contains_key(name)
+            || self.generic_aliases.contains_key(name)
     }
 
     pub(super) fn union_by_name(&self, name: &str) -> Option<&UnionInfo> {
@@ -1041,7 +1243,7 @@ impl<'m> Infer<'m> {
             Ty::Option(inner) => self.types.resolve(&inner),
             other => other,
         };
-        let (Ty::Named(base), Ty::Named(class)) = (target, found) else {
+        let (Ty::Named(base, ..), Ty::Named(class, ..)) = (target, found) else {
             return false;
         };
         if base == class {
@@ -1131,7 +1333,7 @@ impl<'m> Infer<'m> {
     /// The union a type names, if any.
     pub(super) fn union_of_ty(&self, ty: &Ty) -> Option<&UnionInfo> {
         match self.types.resolve(ty) {
-            Ty::Named(n) => self.union_by_name(&n),
+            Ty::Named(n, ..) => self.union_by_name(&n),
             _ => None,
         }
     }
@@ -1141,6 +1343,127 @@ impl<'m> Infer<'m> {
             .iter()
             .rev()
             .any(|f| f.type_params.iter().any(|t| t == name))
+            || self
+                .param_scope
+                .iter()
+                .any(|ps| ps.iter().any(|t| t == name))
+    }
+
+    /// `T extends HasId`: the struct a type parameter in scope is constrained to.
+    pub(super) fn constraint_of(&self, param: &str) -> Option<String> {
+        for ctx in self.fns.iter().rev() {
+            if let Some(f) = self.funcs.get(&ctx.id)
+                && let Some((_, c)) = f.type_bounds.iter().find(|(p, _)| p == param)
+            {
+                return Some(c.clone());
+            }
+            if ctx.type_params.iter().any(|t| t == param) {
+                return None;
+            }
+        }
+        let class = self.this_class_stack.last()?;
+        let s = self.struct_by_name(class)?;
+        s.type_bounds
+            .iter()
+            .find(|(p, _)| p == param)
+            .map(|(_, c)| c.clone())
+    }
+
+    /// Type arguments given to constrained parameters: checked at the end, and each type
+    /// given gets the constraint's trait.
+    pub(super) fn record_bound_uses(
+        &mut self,
+        bounds: &[(String, String)],
+        subst: &HashMap<String, Ty>,
+        span: Span,
+    ) {
+        for (p, c) in bounds {
+            if let Some(t) = subst.get(p) {
+                self.bound_uses.push((c.clone(), t.clone(), span));
+            }
+        }
+    }
+
+    /// The type arguments of a generic struct type, by parameter: `Stack<number>` gives
+    /// `T → number`, and so does `NumberStack` for `class NumberStack extends
+    /// Stack<number>`. Empty for other types, and inside a generic class itself.
+    pub(super) fn instance_subst(&self, ty: &Ty) -> HashMap<String, Ty> {
+        let mut out = HashMap::new();
+        let Ty::Named(n, args) = self.types.resolve(ty) else {
+            return out;
+        };
+        if let Some(s) = self.struct_by_name(&n) {
+            for (p, a) in s.type_params.iter().zip(args) {
+                out.insert(p.clone(), a);
+            }
+        }
+        self.ancestor_subst(&n, out)
+    }
+
+    /// `own` (the parameters of `class`) with those of its generic ancestors, as each
+    /// class gives them to its base.
+    pub(super) fn ancestor_subst(
+        &self,
+        class: &str,
+        own: HashMap<String, Ty>,
+    ) -> HashMap<String, Ty> {
+        let mut out = own;
+        let mut current = class.to_string();
+        let mut seen = HashSet::new();
+        while seen.insert(current.clone()) {
+            let Some(s) = self.struct_by_name(&current) else {
+                break;
+            };
+            let Some(parent) = s.parent.clone() else {
+                break;
+            };
+            if let Some(p) = self.struct_by_name(&parent) {
+                let given: Vec<Ty> = s
+                    .parent_args
+                    .iter()
+                    .map(|t| finish::substitute(t, &out, &self.types))
+                    .collect();
+                for (name, t) in p.type_params.iter().zip(given) {
+                    out.entry(name.clone()).or_insert(t);
+                }
+            }
+            current = parent;
+        }
+        out
+    }
+
+    /// The type of `this` in a class: `Stack<T>` in a generic one.
+    pub(super) fn self_type(&self, class: &str) -> Ty {
+        let params = self
+            .struct_by_name(class)
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        Ty::Named(
+            class.to_string(),
+            params.into_iter().map(Ty::named).collect(),
+        )
+    }
+
+    /// A fresh instance of a struct: `Stack<?>` with a new variable per parameter (the
+    /// struct itself when it is not generic).
+    pub(super) fn fresh_instance(&mut self, name: &str) -> (Ty, HashMap<String, Ty>) {
+        let params = self
+            .struct_by_name(name)
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        let mut subst = HashMap::new();
+        let mut args = Vec::new();
+        for p in params {
+            let v = self.types.fresh();
+            subst.insert(p, v.clone());
+            args.push(v);
+        }
+        let bounds = self
+            .struct_by_name(name)
+            .map(|s| s.type_bounds.clone())
+            .unwrap_or_default();
+        self.record_bound_uses(&bounds, &subst, Span::default());
+        (Ty::Named(name.to_string(), args), subst)
     }
 
     pub(super) fn record_use(&mut self, binding: NodeId, use_id: NodeId) {
