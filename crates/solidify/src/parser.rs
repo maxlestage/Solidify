@@ -1934,8 +1934,22 @@ impl<'a> Parser<'a> {
         if let Some(arrow) = self.try_arrow()? {
             return Ok(arrow);
         }
-        if self.at_word("yield") && !self.peek_at(1).nl_before && !self.at_punct_at(1, ")") {
-            return Err(Error::new("generators are not supported", start));
+        if self.at_word("yield") {
+            self.next();
+            let delegate = self.eat_punct("*");
+            let ends = self.at_punct(";")
+                || self.at_punct(")")
+                || self.at_punct("]")
+                || self.at_punct("}")
+                || self.at_punct(",")
+                || self.at_eof()
+                || self.peek().nl_before;
+            let value = if ends && !delegate {
+                None
+            } else {
+                Some(Box::new(self.assignment()?))
+            };
+            return Ok(self.expr(ExprKind::Yield { value, delegate }, start));
         }
         let left = self.conditional()?;
         let op = match &self.peek().tok {

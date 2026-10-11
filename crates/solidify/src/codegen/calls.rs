@@ -735,6 +735,7 @@ impl<'a> Gen<'a> {
                         let m = self.recv(&args[0].expr)?;
                         format!("{m}.iter().map(|(k, v)| (k.clone(), v.clone()))")
                     }
+                    Ty::Gen(_) => self.expr_as(&args[0].expr, Want::Owned)?,
                     _ => {
                         let x = self.expr(&args[0].expr)?;
                         if x.repr == Repr::Owned && x.var.is_none() {
@@ -853,6 +854,11 @@ impl<'a> Gen<'a> {
     ) -> GResult<E> {
         let (kind, method) = name.split_once('.').unwrap_or(("", name));
         match kind {
+            "generator" => {
+                let g = self.expr_as(obj, Want::RefMut)?;
+                let g = g.trim_start_matches("&mut ").to_string();
+                Ok(E::owned(format!("{g}.next()"), PREC_POSTFIX))
+            }
             "string" => self.string_method(e, obj, method, args),
             "array" => self.array_method(e, obj, method, args),
             "map" => self.map_method(e, obj, method, args),
@@ -1548,6 +1554,7 @@ impl<'a> Gen<'a> {
             id: f.id,
             returns_result: false,
             ret_ty: info.sig.ret.clone(),
+            yield_ty: None,
             targets: Vec::new(),
             try_ctx: Vec::new(),
             in_ctor: false,

@@ -34,6 +34,8 @@ pub enum Helper {
     JsMap,
     /// A set in insertion order.
     JsSet,
+    /// `JsGenerator`: a `function*` running on its own thread.
+    Generator,
 }
 
 impl Helper {
@@ -327,6 +329,7 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Inspect => include_str!("runtime/inspect.rs"),
             Helper::JsMap => include_str!("runtime/map.rs"),
             Helper::JsSet => include_str!("runtime/set.rs"),
+            Helper::Generator => include_str!("runtime/generator.rs"),
             Helper::BlockOn => {
                 r#"/// Runs a future to completion (the async functions here never wait on I/O).
 fn block_on<F: std::future::Future>(future: F) -> F::Output {

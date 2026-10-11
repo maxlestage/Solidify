@@ -124,7 +124,7 @@ impl<'m> Infer<'m> {
                             let xt = self.expr(x, Some(&arr))?;
                             // Arrays, sets, maps (pairs) and strings (characters) spread.
                             match self.types.resolve(&xt) {
-                                Ty::Set(t) => self.expect(&t, &item, x.span)?,
+                                Ty::Set(t) | Ty::Gen(t) => self.expect(&t, &item, x.span)?,
                                 Ty::Map(k, v, _) => {
                                     self.expect(&Ty::Tuple(vec![*k, *v]), &item, x.span)?
                                 }
@@ -354,7 +354,32 @@ impl<'m> Infer<'m> {
                 }
                 self.expr(inner, expected)
             }
-            ExprKind::Yield(_) => self.err("generators are not supported", e.span),
+            ExprKind::Yield { value, delegate } => {
+                let Some(t) = self.ctx().yield_ty.clone() else {
+                    return self.err("`yield` outside a generator function", e.span);
+                };
+                match (value, delegate) {
+                    (Some(v), false) => {
+                        let vt = self.expr(v, Some(&t))?;
+                        self.mark_stored(v);
+                        self.expect(&vt, &t, v.span)?;
+                    }
+                    (Some(v), true) => {
+                        let vt = self.expr(v, None)?;
+                        match self.types.resolve(&vt) {
+                            Ty::Gen(item) | Ty::Array(item) | Ty::Set(item) => {
+                                self.expect(&item, &t, v.span)?
+                            }
+                            other => {
+                                let d = self.describe(&other);
+                                return self.err(format!("`yield*` cannot go through {d}"), v.span);
+                            }
+                        }
+                    }
+                    (None, _) => return self.err("`yield` needs a value", e.span),
+                }
+                Ok(Ty::Void)
+            }
             ExprKind::Seq(items) => {
                 let mut last = Ty::Void;
                 for i in items {
@@ -989,6 +1014,17 @@ impl<'m> Infer<'m> {
         }
         let ot = self.expr(obj, None)?;
         let ot = self.types.resolve(&ot);
+        // `it.next().value` / `.done`: the result of a generator step is its value.
+        if let Ty::Option(_) = &ot
+            && !optional
+            && self.is_iter_result(obj)
+        {
+            return Ok(match prop {
+                "value" => ot.clone(),
+                "done" => Ty::Bool,
+                _ => return self.err(format!("a generator step has no property `{prop}`"), e.span),
+            });
+        }
         let (ot, lifted) = match (&ot, optional) {
             (Ty::Option(inner), true) => (self.types.resolve(inner), true),
             (Ty::Option(_), false) => {

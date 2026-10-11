@@ -337,14 +337,45 @@ impl<'a> Gen<'a> {
                         return self.err("rest elements are not supported", *span);
                     }
                     let it = self.ty_of(init);
+                    let plain_names = elems.iter().all(|e| {
+                        e.as_ref().is_some_and(|e| {
+                            matches!(e.pat, Pattern::Ident { .. }) && e.default.is_none()
+                        })
+                    });
+                    // `let [a, b] = [x, y]`: a tuple on both sides.
+                    if let ExprKind::Array(items) = &init.kind
+                        && plain_names
+                        && items.len() == elems.len()
+                        && items.iter().all(|i| matches!(i, ArrayElem::Expr(_)))
+                    {
+                        let mut values = Vec::new();
+                        let mut names = Vec::new();
+                        for (el, item) in elems.iter().flatten().zip(items) {
+                            let ArrayElem::Expr(x) = item else {
+                                unreachable!()
+                            };
+                            let Pattern::Ident { id, .. } = &el.pat else {
+                                unreachable!()
+                            };
+                            let vt = self.resolve(&self.p.var(*id).ty);
+                            values.push(self.expr_to(x, &vt)?);
+                            let var = self.p.var(*id);
+                            let m = if var.reassigned || var.mutated {
+                                "mut "
+                            } else {
+                                ""
+                            };
+                            names.push(format!("{m}{}", self.bind(*id, Repr::Owned)));
+                        }
+                        self.line(&format!(
+                            "let ({}) = ({});",
+                            names.join(", "),
+                            values.join(", ")
+                        ));
+                        continue;
+                    }
                     match self.resolve(&it) {
-                        Ty::Tuple(_)
-                            if elems.iter().all(|e| {
-                                e.as_ref().is_some_and(|e| {
-                                    matches!(e.pat, Pattern::Ident { .. }) && e.default.is_none()
-                                })
-                            }) =>
-                        {
+                        Ty::Tuple(_) if plain_names => {
                             let value = self.expr_as(init, Want::Owned)?;
                             let mut names = Vec::new();
                             for el in elems.iter().flatten() {
@@ -629,6 +660,28 @@ impl<'a> Gen<'a> {
                 }
                 Ok(())
             }
+            ExprKind::Yield { value, delegate } => {
+                let Some(v) = value else {
+                    return self.err("`yield` needs a value", e.span);
+                };
+                if *delegate {
+                    // `yield* inner`: every value of the inner sequence.
+                    let x = self.expr_as(v, Want::Owned)?;
+                    self.line(&format!("for item in {x} {{"));
+                    self.indent += 1;
+                    self.line("y.yield_(item);");
+                    self.indent -= 1;
+                    self.line("}");
+                    return Ok(());
+                }
+                let item = match self.fns.iter().rev().find_map(|c| c.yield_ty.clone()) {
+                    Some(t) => t,
+                    None => return self.err("`yield` outside a generator", e.span),
+                };
+                let code = self.expr_to(v, &item)?;
+                self.line(&format!("y.yield_({code});"));
+                Ok(())
+            }
             _ => {
                 let x = self.expr(e)?;
                 self.line(&format!("let _ = {};", x.code));
@@ -901,6 +954,33 @@ impl<'a> Gen<'a> {
             self.line(&format!(
                 "std::mem::swap(&mut {}, &mut {});",
                 xb.code, xa.code
+            ));
+            return Ok(());
+        }
+        // `[a, b] = [x, y]`: a tuple on both sides.
+        if let ExprKind::Array(items) = &value.kind
+            && items.len() == elems.len()
+            && items.iter().all(|i| matches!(i, ArrayElem::Expr(_)))
+            && elems.iter().all(|e| {
+                e.as_ref()
+                    .is_some_and(|e| matches!(e.pat, Pattern::Ident { .. }))
+            })
+        {
+            let mut values = Vec::new();
+            let mut names = Vec::new();
+            for (el, item) in elems.iter().flatten().zip(items) {
+                let (ArrayElem::Expr(x), Pattern::Ident { id, .. }) = (item, &el.pat) else {
+                    unreachable!()
+                };
+                let binding = self.p.refs[id];
+                let vt = self.resolve(&self.p.var(binding).ty);
+                values.push(self.expr_to(x, &vt)?);
+                names.push(self.name(binding));
+            }
+            self.line(&format!(
+                "({}) = ({});",
+                names.join(", "),
+                values.join(", ")
             ));
             return Ok(());
         }
@@ -1737,6 +1817,8 @@ impl<'a> Gen<'a> {
             let base = Self::paren(&o, PREC_POSTFIX);
             match self.resolve(&it) {
                 Ty::Str => (format!("{base}.chars()"), Repr::Char, false),
+                // A generator is consumed.
+                Ty::Gen(_) => (o.code.clone(), Repr::Owned, false),
                 Ty::Array(ref item) | Ty::Set(ref item) => {
                     let copy = self.is_copy(item);
                     let mutated =
@@ -1781,7 +1863,7 @@ impl<'a> Gen<'a> {
             }
         };
         let item_ty = match self.resolve(&it) {
-            Ty::Array(t) | Ty::Set(t) if !enumerate => *t,
+            Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) if !enumerate => *t,
             Ty::Array(t) => Ty::Tuple(vec![Ty::Any, *t]),
             Ty::Map(k, v, _) => Ty::Tuple(vec![*k, *v]),
             Ty::Str => Ty::Str,

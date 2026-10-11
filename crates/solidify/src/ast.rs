@@ -513,7 +513,11 @@ pub enum ExprKind {
     Void(Box<Expr>),
     Delete(Box<Expr>),
     Await(Box<Expr>),
-    Yield(Option<Box<Expr>>),
+    /// `yield value` / `yield* iterable` in a generator.
+    Yield {
+        value: Option<Box<Expr>>,
+        delegate: bool,
+    },
     Seq(Vec<Expr>),
     Regex {
         pattern: String,
