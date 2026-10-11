@@ -1,0 +1,9 @@
+circle r 2
+[ 'circle 12.6 moved 1', '[square 4.0 moved 0]' ]
+true 0 true
+1 circle 50.3 moved 1 [
+  Circle { name: 'circle', moves: 1, r: 2 },
+  Sq { name: 'square', moves: 0, side: 2 }
+]
+rex barks (15) rex barks (15)
+15 true
