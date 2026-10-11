@@ -759,6 +759,32 @@ impl<'a> Gen<'a> {
                 PREC_POSTFIX,
             ));
         }
+        if name == "global.BigInt" {
+            let h = self.helper(Helper::BigInt);
+            let at = self.ty_of(&args[0].expr);
+            return Ok(match self.resolve(&at) {
+                Ty::Str => {
+                    let s = self.expr_as(&args[0].expr, Want::StrRef)?;
+                    E::owned(format!("{h}::parse({s})"), PREC_POSTFIX)
+                }
+                Ty::Bool => {
+                    let b = self.expr_as(&args[0].expr, Want::Owned)?;
+                    E::owned(format!("{h}::from_i64({b} as i64)"), PREC_POSTFIX)
+                }
+                Ty::Num(_) if self.is_float(&at) => {
+                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
+                    E::owned(format!("{h}::from_f64({x})"), PREC_POSTFIX)
+                }
+                Ty::Num(_) => {
+                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
+                    E::owned(format!("{h}::from_i64({x})"), PREC_POSTFIX)
+                }
+                _ => {
+                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
+                    E::owned(x, PREC_POSTFIX)
+                }
+            });
+        }
         Ok(match name {
             "global.eval" => return self.eval_code(e, args),
             "global.parseInt" => {
@@ -802,6 +828,13 @@ impl<'a> Gen<'a> {
                     Ty::Bool => {
                         let b = self.expr_as(&args[0].expr, Want::Owned)?;
                         E::owned(format!("{b} as i64"), PREC_CAST)
+                    }
+                    Ty::Named(ref n, _) if n == "bigint" => {
+                        let x = self.expr(&args[0].expr)?;
+                        E::owned(
+                            format!("{}.to_f64()", Self::paren(&x, PREC_POSTFIX)),
+                            PREC_POSTFIX,
+                        )
                     }
                     _ => self.expr(&args[0].expr)?,
                 }
@@ -1514,6 +1547,17 @@ impl<'a> Gen<'a> {
             "symbol" => {
                 let r = self.recv(obj)?;
                 Ok(E::owned(format!("{r}.to_string()"), PREC_POSTFIX))
+            }
+            "bigint" => {
+                let r = self.recv(obj)?;
+                Ok(match (method, args.first()) {
+                    ("valueOf", _) => E::owned(format!("{r}.clone()"), PREC_POSTFIX),
+                    (_, Some(a)) => {
+                        let radix = self.expr_as(&a.expr, Want::Owned)?;
+                        E::owned(format!("{r}.to_string_radix({radix} as u32)"), PREC_POSTFIX)
+                    }
+                    _ => E::owned(format!("{r}.to_string()"), PREC_POSTFIX),
+                })
             }
             "regex" => {
                 let r = self.recv(obj)?;
