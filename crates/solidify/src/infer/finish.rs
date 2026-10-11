@@ -36,6 +36,19 @@ impl<'m> Infer<'m> {
                 }
             }
         }
+        // The top level calling an async function waits for it: it runs async itself.
+        let main_calls: Vec<NodeId> = self
+            .funcs
+            .get(&self.main_id)
+            .map(|f| f.calls.iter().map(|(callee, _)| *callee).collect())
+            .unwrap_or_default();
+        if main_calls
+            .iter()
+            .any(|c| self.funcs.get(c).is_some_and(|f| f.is_async))
+            && let Some(m) = self.funcs.get_mut(&self.main_id)
+        {
+            m.is_async = true;
+        }
         self.propagate_throws();
         // A method is mutating when any implementation or override of it is: known
         // before what calls it is settled, and again after.
@@ -134,6 +147,15 @@ impl<'m> Infer<'m> {
             .flat_map(|f| f.captures.iter().copied())
             .collect();
         for id in escaping {
+            // A parameter kept by such a closure is taken by value.
+            if let Some(v) = self.vars.get_mut(&id)
+                && v.role == Role::Param
+            {
+                v.stored = true;
+                if let Some(p) = v.param_of {
+                    self.param_stored.insert(p);
+                }
+            }
             if let Some(v) = self.vars.get_mut(&id)
                 && (v.reassigned || v.mutated || v.mutated_in_closure)
                 && !matches!(v.role, Role::Func | Role::Class | Role::Enum)

@@ -251,8 +251,17 @@ impl<'a> Gen<'a> {
     /// it is async.
     fn finish_call(&mut self, code: String, info: &FnInfo, _e: &'a Expr) -> GResult<E> {
         let mut code = code;
-        if info.is_async {
+        let caller_async = self
+            .p
+            .funcs
+            .get(&self.fn_ctx().id)
+            .is_none_or(|f| f.is_async);
+        if info.is_async && caller_async {
             code.push_str(".await");
+        } else if info.is_async {
+            // Called from code that does not wait: run to the end now.
+            let h = self.helper(Helper::BlockOn);
+            code = format!("{h}({code})");
         }
         let _ = ();
         if info.throws {
@@ -675,6 +684,25 @@ impl<'a> Gen<'a> {
         let ty = self.ty_of(e);
         let arg_str =
             |g: &mut Self, i: usize| -> GResult<String> { g.expr_as(&args[i].expr, Want::StrRef) };
+        if let Some(intrinsic) = name.strip_prefix("global.__") {
+            self.helper(Helper::Node);
+            let (_, params, _) = crate::infer::INTRINSICS
+                .iter()
+                .find(|(n, ..)| n.strip_prefix("__") == Some(intrinsic))
+                .expect("intrinsic");
+            let mut list = Vec::new();
+            for (i, p) in params.chars().enumerate() {
+                list.push(if p == 's' {
+                    self.expr_as(&args[i].expr, Want::StrRef)?
+                } else {
+                    self.expr_as(&args[i].expr, Want::Owned)?
+                });
+            }
+            return Ok(E::owned(
+                format!("js_node_{intrinsic}({})", list.join(", ")),
+                PREC_POSTFIX,
+            ));
+        }
         Ok(match name {
             "global.eval" => return self.eval_code(e, args),
             "global.parseInt" => {
@@ -1186,6 +1214,10 @@ impl<'a> Gen<'a> {
                 let s = self.expr_as(&args[0].expr, Want::Owned)?;
                 E::owned(format!("{}.key_for()", paren_num(&s)), PREC_POSTFIX)
             }
+            "process.cwd" => {
+                self.helper(Helper::Node);
+                E::owned("js_node_os_info(\"cwd\")", PREC_POSTFIX)
+            }
             "Date.now" => E::owned(
                 "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)",
                 PREC_POSTFIX,
@@ -1493,6 +1525,21 @@ impl<'a> Gen<'a> {
                 let h = self.helper(Helper::StrSplit);
                 E::owned(format!("{h}({s}, {sep})"), PREC_POSTFIX)
             }
+            "includes" | "startsWith" | "endsWith" if args.len() > 1 => {
+                let t = arg_s(self, 0)?;
+                let n = arg_n(self, 1)?;
+                self.helper(Helper::StrIndexOf);
+                let code = match method {
+                    "includes" => format!("js_index_of_from({s}, {t}, {n}) >= 0"),
+                    "startsWith" => format!(
+                        "{s}.chars().skip(({n}).max(0) as usize).collect::<String>().starts_with({t})"
+                    ),
+                    _ => format!(
+                        "{s}.chars().take(({n}).max(0) as usize).collect::<String>().ends_with({t})"
+                    ),
+                };
+                E::owned(code, super::PREC_CMP)
+            }
             "includes" => {
                 let t = arg_s(self, 0)?;
                 E::owned(format!("{recv}.contains({t})"), PREC_POSTFIX)
@@ -1504,6 +1551,21 @@ impl<'a> Gen<'a> {
             "endsWith" => {
                 let t = arg_s(self, 0)?;
                 E::owned(format!("{recv}.ends_with({t})"), PREC_POSTFIX)
+            }
+            "indexOf" if args.len() > 1 => {
+                let t = arg_s(self, 0)?;
+                let from = arg_n(self, 1)?;
+                self.helper(Helper::StrIndexOf);
+                E::owned(format!("js_index_of_from({s}, {t}, {from})"), PREC_POSTFIX)
+            }
+            "lastIndexOf" if args.len() > 1 => {
+                let t = arg_s(self, 0)?;
+                let from = arg_n(self, 1)?;
+                self.helper(Helper::StrLastIndexOf);
+                E::owned(
+                    format!("js_last_index_of_from({s}, {t}, {from})"),
+                    PREC_POSTFIX,
+                )
             }
             "indexOf" => {
                 let t = arg_s(self, 0)?;
@@ -2084,6 +2146,17 @@ impl<'a> Gen<'a> {
                         parts.push(format!("&[{x}][..]"));
                     }
                 }
+                // Each part as a slice: `[&a[..], &b[..]].concat()`.
+                let parts: Vec<String> = parts
+                    .iter()
+                    .map(|p| {
+                        if p.ends_with("[..]") {
+                            p.clone()
+                        } else {
+                            format!("&({p})[..]")
+                        }
+                    })
+                    .collect();
                 E::owned(format!("[{}].concat()", parts.join(", ")), PREC_POSTFIX)
             }
             "reverse" => self.changed_array(e, obj, o, &ot, &recv, "reverse()".into()),
