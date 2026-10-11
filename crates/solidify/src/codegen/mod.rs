@@ -969,6 +969,7 @@ impl<'a> Gen<'a> {
             Helper::Random => "js_random",
             Helper::NumToString => "js_num_to_string",
             Helper::BlockOn => "block_on",
+            Helper::ErrorText => "js_error_text",
             Helper::Inspect => "js_inspect",
             Helper::JsMap => "JsMap",
             Helper::JsSet => "JsSet",
