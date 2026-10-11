@@ -1791,7 +1791,12 @@ impl<'a> Gen<'a> {
                         _ => Vec::new(),
                     };
                     let g = self.dyn_generics(&n, &args, false, span)?;
-                    format!("Box<dyn {}Like{g}>", pascal(&n))
+                    if self.p.is_shared(&n) {
+                        let h = self.helper(Helper::Shared);
+                        format!("{h}<dyn {}Like{g}>", pascal(&n))
+                    } else {
+                        format!("Box<dyn {}Like{g}>", pascal(&n))
+                    }
                 } else {
                     let args = match self.resolve(ty) {
                         Ty::Named(_, args) => args,
@@ -1938,7 +1943,7 @@ impl<'a> Gen<'a> {
     /// `dyn CLike<…>` for a type held dynamically, with its type arguments.
     pub(super) fn dyn_ty(&mut self, ty: &Ty, span: Span) -> GResult<Option<String>> {
         match self.resolve(ty) {
-            Ty::Named(n, args) if self.p.is_dyn(&n) => {
+            Ty::Named(n, args) if self.p.is_dyn(&n) && !self.p.is_shared(&n) => {
                 let g = self.dyn_generics(&n, &args, false, span)?;
                 Ok(Some(format!("dyn {}Like{g}", pascal(&n))))
             }
@@ -2166,7 +2171,11 @@ impl<'a> Gen<'a> {
                 Repr::OptRef => e.code,
             },
             // A boxed trait object lent as `&dyn T`: `&Box<dyn T>` does not coerce by itself.
-            Want::Ref if self.dyn_name(&ty).is_some() && e.repr != Repr::OptRef => {
+            Want::Ref
+                if self.dyn_name(&ty).is_some()
+                    && e.repr != Repr::OptRef
+                    && !matches!(self.resolve(&ty), Ty::Named(ref n, ..) if self.p.is_shared(n)) =>
+            {
                 format!("{}.as_ref()", Self::paren(&e, PREC_POSTFIX))
             }
             Want::Ref => match e.repr {
@@ -2322,7 +2331,14 @@ impl<'a> Gen<'a> {
                 .dyn_generics(base, base_args, true, Span::default())
                 .unwrap_or_default();
             let trait_name = format!("Box<dyn {}Like{g}>", pascal(base));
-            code = if self.p.is_dyn(from_class) {
+            code = if self.p.is_shared(base) {
+                // The same object, held as its base class.
+                format!(
+                    "Shared({}.0 as std::rc::Rc<std::cell::RefCell<dyn {}Like{g}>>)",
+                    paren_unless_simple_owned(&code),
+                    pascal(base)
+                )
+            } else if self.p.is_dyn(from_class) {
                 format!("{code} as {trait_name}")
             } else {
                 format!("Box::new({code}) as {trait_name}")
@@ -2423,4 +2439,16 @@ pub(super) fn changes_something(e: &Expr) -> bool {
         !found
     });
     found
+}
+
+/// `code` as the receiver of `.0`: parenthesized unless a plain path.
+fn paren_unless_simple_owned(code: &str) -> String {
+    if code
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+    {
+        code.to_string()
+    } else {
+        format!("({code})")
+    }
 }
