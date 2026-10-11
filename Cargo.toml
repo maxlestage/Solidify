@@ -11,5 +11,5 @@ strip = true
 # Browser bundle: `cargo build -p solidify-site --lib --target wasm32-unknown-unknown --profile wasm-release`.
 [profile.wasm-release]
 inherits = "release"
-opt-level = "s"
+opt-level = "z"
 panic = "abort"
