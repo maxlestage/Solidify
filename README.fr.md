@@ -106,7 +106,11 @@ Trois passes, toutes déterministes :
 | `for … of`, `for (;;)`, `while`, étiquettes | `for x in &v`, `for i in a..b`, `loop`, `'label` |
 | `switch` | `match`, avec regroupement des cas |
 | `async`, `await` | `async fn`, `.await`, un petit exécuteur pour `main` |
-| `function f<T>(x: T)` | `fn f<T: Clone + PartialEq>(x: T)`, bornes déduites de l'usage |
+| `function f<T>(x: T)`, `f<number>(x)` | `fn f<T: Clone + PartialEq>(x: T)`, bornes déduites de l'usage |
+| `class Stack<T>`, `interface Page<T>`, `type Entry<K, V>`, `extends Stack<number>`, `<T extends HasId>` | `struct Stack<T>` + `impl<T: …>`, bornes trouvées dans tout le programme, un trait `HasIdLike` pour les contraintes |
+| `interface Listener<T> { notify(v: T): void }`, `abstract class Shape<T>` | `trait ListenerLike<T>`, `Box<dyn ListenerLike<String>>` |
+| méthodes qui renvoient `this`, `a.add(1).add(2)` | `&mut Self` : les appels s'enchaînent sur un même objet |
+| `enum Level { … }`, `Level[Level.High]` | `enum` avec `Display`, `Level::High.name()` |
 | `console.log`, `Math`, `parseInt`… | `println!`, méthodes de `f64`, petits utilitaires ajoutés au fichier |
 | classes récursives | `Option<Box<T>>` |
 | `class B extends A`, `abstract`, `super`, `protected`, `instanceof` | structs aplaties, un trait par classe de base, `Box<dyn ALike>` là où un `A` est attendu |
@@ -129,7 +133,7 @@ Ce qui reste différent, parce que les valeurs Rust ne sont pas des références
 Quatre règles à connaître :
 
 - **Les entiers d'abord.** `let n = 0` est un `i64`. Écrivez `2.0`, divisez, ou lisez le nombre depuis du JSON, et toute la famille de ce nombre devient `f64`. `parseFloat` et `Number()` renvoient un `f64`, parce qu'ils peuvent renvoyer `NaN` ; `parseInt` renvoie un `Option<i64>`.
-- **Null est `Option`.** Testez les valeurs nullables avec `!== null`, `!== undefined` ou `??` ; le Rust généré utilise `if let`, `let … else` et `unwrap_or`. Lire un champ d'une valeur qui peut être nulle est une erreur, comme en mode strict de TypeScript.
+- **Null est `Option`.** Testez les valeurs nullables avec `!== null`, `!== undefined` ou `??` ; le Rust généré utilise `if let`, `let … else` et `unwrap_or`. Lire un champ d'une valeur qui peut être nulle est une erreur, comme en mode strict de TypeScript. `console.log` imprime `undefined` ou `null` comme Node.js, selon d'où vient la valeur absente.
 - **Throw est `Result`.** `throw new Error("…")` devient `return Err("…".to_string())` ; `catch (e)` reçoit le message dans une `String`. `JSON.parse` lève les mêmes messages de `SyntaxError` que V8.
 - **Les fichiers sont des modules.** Les instructions de premier niveau deviennent `main`, fichiers importés d'abord, comme Node.js les exécute ; les `const` de premier niveau qui tiennent un littéral deviennent des `const` Rust ; les autres variables de premier niveau lues depuis une fonction deviennent des `static` (`LazyLock`, avec un `Mutex` quand elles changent). Chaque fichier importé devient un `mod`, ses exports `pub` ; les fichiers partagent un même espace de noms, deux fichiers ne peuvent donc pas déclarer le même nom de premier niveau.
 
@@ -140,7 +144,7 @@ Quatre règles à connaître :
 | Dossier | Contenu |
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | Le transpileur : lexeur, parseur, inférence de types, génération de code, ligne de commande |
-| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 30 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
+| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 33 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
 | [`site`](site) | Le site web : un bac à sable qui exécute Solidify en WebAssembly, écrit avec [active](https://github.com/maxlestage/Active) |
 
 ## Développement
