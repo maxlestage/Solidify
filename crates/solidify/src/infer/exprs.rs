@@ -112,8 +112,11 @@ impl<'m> Infer<'m> {
                     }
                     _ => None,
                 };
+                // Without an expected type, elements of different types make a union.
+                let free = elem_expected.is_none();
                 let item = elem_expected.unwrap_or_else(|| self.types.fresh());
                 let hint = self.hints.get(&e.id).cloned().unwrap_or_default();
+                let mut others: Vec<(Ty, &'m Expr)> = Vec::new();
                 for el in elems {
                     match el {
                         ArrayElem::Expr(x) => {
@@ -122,12 +125,26 @@ impl<'m> Infer<'m> {
                             }
                             let xt = self.expr(x, Some(&item))?;
                             self.mark_stored(x);
-                            self.expect(&xt, &item, x.span)?;
+                            match self.expect(&xt, &item, x.span) {
+                                Ok(()) => {}
+                                Err(_)
+                                    if free && !matches!(self.types.resolve(&item), Ty::Var(_)) =>
+                                {
+                                    others.push((xt, x));
+                                }
+                                Err(e) => return Err(e),
+                            }
                         }
                         ArrayElem::Spread(x) => {
                             let arr = Ty::Array(Box::new(item.clone()));
                             let xt = self.expr(x, Some(&arr))?;
                             // Arrays, sets, maps (pairs) and strings (characters) spread.
+                            if !others.is_empty() {
+                                return self.err(
+                                    "a spread cannot be mixed with elements of other types",
+                                    x.span,
+                                );
+                            }
                             match self.types.resolve(&xt) {
                                 Ty::Set(t) | Ty::Gen(t) => self.expect(&t, &item, x.span)?,
                                 Ty::Map(k, v, _) => {
@@ -142,7 +159,20 @@ impl<'m> Infer<'m> {
                         }
                     }
                 }
-                Ok(Ty::Array(Box::new(item)))
+                if others.is_empty() {
+                    return Ok(Ty::Array(Box::new(item)));
+                }
+                // `[1, "two"]`: an array of the union of the element types.
+                let mut members = vec![item.clone()];
+                members.extend(others.iter().map(|(t, _)| t.clone()));
+                let union = self.union_of(members, e.span)?;
+                for el in elems {
+                    if let ArrayElem::Expr(x) = el {
+                        let xt = self.expr_ty.get(&x.id).cloned().unwrap_or(Ty::Void);
+                        self.expect(&xt, &union, x.span)?;
+                    }
+                }
+                Ok(Ty::Array(Box::new(union)))
             }
             ExprKind::Object(props) => self.object_literal(e, props, expected_res.as_ref()),
             ExprKind::Func(f) | ExprKind::Arrow(f) => self.closure(f, expected_res.as_ref()),
