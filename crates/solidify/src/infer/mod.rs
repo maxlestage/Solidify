@@ -645,6 +645,18 @@ impl Program {
         self.shared_fields.contains(&(s.to_string(), f.to_string()))
     }
 
+    /// A shared struct in a class hierarchy: its methods stay on the data, borrowed by
+    /// their callers (a value may be held as its base class).
+    pub fn is_shared_hierarchy(&self, name: &str) -> bool {
+        self.is_shared(name)
+            && (self.is_dyn(name)
+                || self.structs.iter().any(|s| {
+                    (s.name == name && (s.parent.is_some() || !s.implements.is_empty()))
+                        || s.parent.as_deref() == Some(name)
+                        || s.implements.iter().any(|i| i == name)
+                }))
+    }
+
     /// Whether the instances of a struct are shared (`Shared<T>`).
     pub fn is_shared(&self, name: &str) -> bool {
         self.shared_types.contains(name)

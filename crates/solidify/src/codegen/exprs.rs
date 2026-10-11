@@ -979,7 +979,7 @@ impl<'a> Gen<'a> {
         } else {
             literal
         };
-        if self.p.is_shared(&struct_name) {
+        if self.p.is_shared(&struct_name) && !self.p.is_dyn(&struct_name) {
             let h = self.helper(super::Helper::Shared);
             return Ok(E::owned(format!("{h}::new({literal})"), PREC_POSTFIX));
         }
@@ -990,6 +990,15 @@ impl<'a> Gen<'a> {
                 _ => Vec::new(),
             };
             let g = self.dyn_generics(&struct_name, &args, true, e.span)?;
+            if self.p.is_shared(&struct_name) {
+                let h = self.helper(super::Helper::Shared);
+                return Ok(E::owned(
+                    format!(
+                        "{h}(std::rc::Rc::new(std::cell::RefCell::new({literal})) as std::rc::Rc<std::cell::RefCell<dyn {name}Like{g}>>)"
+                    ),
+                    PREC_POSTFIX,
+                ));
+            }
             return Ok(E::owned(
                 format!("Box::new({literal}) as Box<dyn {name}Like{g}>"),
                 super::PREC_CAST,
@@ -1262,6 +1271,11 @@ impl<'a> Gen<'a> {
                     self.instance_tests
                         .insert((class.clone(), sub.clone(), false));
                     let x = self.recv(left)?;
+                    let x = if self.p.is_shared(&class) {
+                        format!("{x}.borrow()")
+                    } else {
+                        x
+                    };
                     return Ok(E::owned(
                         format!("{x}.as_{}().is_some()", snake(sub)),
                         PREC_POSTFIX,
@@ -1698,9 +1712,19 @@ impl<'a> Gen<'a> {
                 Ty::Named(b, ..) => b,
                 _ => String::new(),
             };
-            self.instance_tests.insert((base, sub.clone(), mutated));
+            self.instance_tests
+                .insert((base.clone(), sub.clone(), mutated));
             let recv = Self::paren(&x, PREC_POSTFIX);
-            if mutated {
+            if self.p.is_shared(&base) {
+                // The subclass's handle: the guard is dropped before the block.
+                (
+                    format!(
+                        "{{ let o = {recv}.borrow().as_{}_shared(&{recv}); o }}",
+                        snake(sub)
+                    ),
+                    Repr::Owned,
+                )
+            } else if mutated {
                 (format!("{recv}.as_{}_mut()", snake(sub)), Repr::RefMut)
             } else {
                 (format!("{recv}.as_{}()", snake(sub)), Repr::Ref)
@@ -1995,6 +2019,21 @@ impl<'a> Gen<'a> {
                 if info.field(prop).is_some() {
                     // Through a `dyn` value, a field is read with its accessor.
                     if self.p.is_dyn(&n) && !matches!(obj.kind, ExprKind::This) {
+                        if self.p.is_shared(&n) {
+                            let field = snake(prop);
+                            let code = if mutable {
+                                return Ok(E::new(
+                                    format!("(*{base}.borrow_mut().{field}_mut())"),
+                                    PREC_ATOM,
+                                    Repr::Place,
+                                ));
+                            } else if self.is_copy(&ty) {
+                                format!("*{base}.borrow().{field}()")
+                            } else {
+                                format!("{base}.borrow().{field}().clone()")
+                            };
+                            return Ok(E::owned(code, PREC_UNARY));
+                        }
                         return Ok(E::new(
                             format!("{base}.{}()", snake(prop)),
                             PREC_POSTFIX,
@@ -2042,6 +2081,12 @@ impl<'a> Gen<'a> {
                     return Ok(x);
                 }
                 if self.p.find_method(&n, prop, MethodKind::Get).is_some() {
+                    let base =
+                        if self.p.is_shared_hierarchy(&n) && !matches!(obj.kind, ExprKind::This) {
+                            format!("{base}.borrow()")
+                        } else {
+                            base
+                        };
                     return Ok(E::owned(format!("{base}.{}()", snake(prop)), PREC_POSTFIX));
                 }
                 self.err(format!("unknown property `{prop}`"), e.span)
