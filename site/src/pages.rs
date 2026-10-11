@@ -21,7 +21,7 @@ pub const FAMILY: [(&str, &str); 6] = [
 ];
 
 const INSTALL_CLI: &str = "cargo install --git https://github.com/maxlestage/Solidify solidify\n\
-solidify app.ts -o app.rs      # one file in, one file out\n\
+solidify main.ts -o app.rs     # follows the imports of main.ts, one Rust file out\n\
 solidify < app.ts > app.rs     # or through the standard input\n\
 rustc --edition 2024 app.rs && ./app";
 
@@ -29,7 +29,9 @@ const INSTALL_CHECK: &str =
     "solidify --check app.ts        # errors with line and column, nothing written";
 
 const INSTALL_LIB: &str = "let options = solidify::Options::default();\n\
-let rust: String = solidify::transpile(typescript, &options)?;";
+let rust: String = solidify::transpile(typescript, &options)?;\n\
+// A program of several files, from its entry file:\n\
+let rust: String = solidify::transpile_file(Path::new(\"main.ts\"), &options)?;";
 
 const CARGO_LIB: &str =
     "[dependencies]\nsolidify = { git = \"https://github.com/maxlestage/Solidify\" }";

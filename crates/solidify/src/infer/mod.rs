@@ -10,8 +10,10 @@ mod annotations;
 mod builtins;
 mod decls;
 mod exprs;
+mod files;
 mod finish;
 mod stmts;
+mod unions;
 
 use std::collections::{HashMap, HashSet};
 
@@ -19,7 +21,7 @@ use crate::ast::*;
 use crate::error::{Error, Span};
 use crate::types::{FuncTy, Ty, Types};
 
-pub use finish::pascal;
+pub use finish::{pascal, same_shape_ty};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -32,6 +34,8 @@ pub enum Role {
     Catch,
     /// The variable of a `for … of` loop.
     Loop,
+    /// `import * as ns from "./file"`.
+    Namespace,
 }
 
 #[derive(Clone, Debug)]
@@ -62,6 +66,13 @@ pub struct VarInfo {
     pub alias: bool,
     /// Initialized with an arrow function: its function id.
     pub closure_fn: Option<NodeId>,
+    /// Holds the result of a generator's `next()`: `.value` and `.done` read it.
+    pub iter_result: bool,
+    /// Holds a regular expression made from a literal: its flags.
+    pub regex_flags: Option<String>,
+    /// Changed, and captured by a closure that outlives the scope: the closure and the
+    /// scope share it (`Rc<RefCell<T>>`).
+    pub shared: bool,
     /// The loop depth where it was declared (last-use analysis).
     pub loop_depth: usize,
     pub span: Span,
@@ -87,6 +98,8 @@ pub struct FnInfo {
     pub method_of: Option<String>,
     pub method_kind: Option<MethodKind>,
     pub is_static: bool,
+    /// `abstract m(): T;`: no body; the subclasses implement it.
+    pub is_abstract: bool,
     pub mutates_self: bool,
     /// Outer bindings read by this closure.
     pub captures: Vec<NodeId>,
@@ -119,7 +132,57 @@ pub struct FieldInfo {
     pub access: Option<Access>,
     pub readonly: bool,
     pub has_init: bool,
+    /// Declared with a string literal type (`kind: "circle"`): the tag of a union member.
+    pub literal: Option<String>,
     pub span: Span,
+}
+
+/// One member of a union of different types: a variant of the Rust enum.
+#[derive(Clone, Debug)]
+pub struct UnionMember {
+    /// The variant name.
+    pub name: String,
+    pub ty: Ty,
+    /// The value of the discriminant field for this member.
+    pub tag: Option<String>,
+}
+
+/// `A | B`: an enum with one variant per member type.
+#[derive(Clone, Debug)]
+pub struct UnionInfo {
+    pub name: String,
+    pub members: Vec<UnionMember>,
+    /// A field every member has, with a different string literal type each: the tag.
+    pub discriminant: Option<String>,
+    pub exported: bool,
+    pub span: Span,
+}
+
+/// The other side of a union member test.
+#[derive(Clone, Debug)]
+pub enum Complement {
+    /// The only other member: its variant and type.
+    Variant(String, Ty),
+    /// The union of the remaining members.
+    Union(Ty),
+}
+
+impl Complement {
+    pub fn ty(&self) -> &Ty {
+        match self {
+            Complement::Variant(_, t) | Complement::Union(t) => t,
+        }
+    }
+}
+
+impl UnionInfo {
+    pub fn member_with_tag(&self, tag: &str) -> Option<&UnionMember> {
+        self.members.iter().find(|m| m.tag.as_deref() == Some(tag))
+    }
+
+    pub fn variant(&self, name: &str) -> Option<&UnionMember> {
+        self.members.iter().find(|m| m.name == name)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -128,19 +191,26 @@ pub struct MethodInfo {
     pub fn_id: NodeId,
     pub kind: MethodKind,
     pub is_static: bool,
+    pub is_abstract: bool,
+    pub access: Option<Access>,
 }
 
 #[derive(Clone, Debug)]
 pub struct StructInfo {
     pub name: String,
     pub kind: StructKind,
+    /// The fields, inherited ones first.
     pub fields: Vec<FieldInfo>,
+    /// The methods declared in the class itself.
     pub methods: Vec<MethodInfo>,
     pub ctor: Option<NodeId>,
     pub exported: bool,
     pub span: Span,
     /// Static fields, with the id of their initializer.
     pub statics: Vec<(String, Ty, Option<NodeId>)>,
+    /// `class C extends P`: the base class.
+    pub parent: Option<String>,
+    pub is_abstract: bool,
 }
 
 impl StructInfo {
@@ -212,6 +282,14 @@ pub enum Callee {
     Ctor(String),
     /// `"Math.floor"`, `"array.push"`, `"string.split"`, `"map.get"`…
     Builtin(&'static str),
+    /// `super(…)` in a constructor: the class whose constructor runs.
+    SuperCtor(String),
+    /// `super.m(…)`: the class declaring the method.
+    SuperMethod {
+        class: String,
+        name: String,
+        fn_id: NodeId,
+    },
     /// Any other callee of function type.
     Dynamic,
 }
@@ -225,6 +303,14 @@ pub struct NarrowTest {
     pub name: String,
     /// `x !== null` / `x`: the content exists when the test is true.
     pub positive: bool,
+    /// A test of a union member (`typeof x === "string"`, `x.kind === "circle"`): the enum
+    /// and the variant bound; `None` for a nullable value (`Some`).
+    pub union: Option<(String, String)>,
+    /// What the value is on the other side of the test: the other variant of a union of
+    /// two, or the union of the remaining members.
+    pub complement: Option<Complement>,
+    /// `x instanceof C` on a value of a base class: the subclass bound.
+    pub instance_of: Option<String>,
     /// The content is changed in the narrowed region: bind it mutably.
     pub mutated: bool,
     pub inner: Ty,
@@ -253,6 +339,7 @@ pub struct Program {
     pub fn_bindings: HashMap<NodeId, NodeId>,
     pub structs: Vec<StructInfo>,
     pub enums: Vec<EnumInfo>,
+    pub unions: Vec<UnionInfo>,
     pub calls: HashMap<NodeId, Callee>,
     /// Object literal → struct it builds.
     pub literal_struct: HashMap<NodeId, String>,
@@ -274,9 +361,71 @@ pub struct Program {
     pub has_main: bool,
     /// Structs that contain themselves: held through a `Box` inside `Option`.
     pub boxed: HashSet<String>,
+    /// Base classes whose values may be instances of a subclass: a trait and `dyn`.
+    pub polymorphic: HashSet<String>,
+    /// Base method → the methods overriding it in subclasses.
+    pub overrides: HashMap<NodeId, Vec<NodeId>>,
+    /// The program sets timers: they run once `main` is done.
+    pub uses_timers: bool,
 }
 
 impl Program {
+    /// The class and its ancestors, nearest first.
+    pub fn ancestry(&self, class: &str) -> Vec<String> {
+        let mut out = vec![class.to_string()];
+        let mut current = class.to_string();
+        while let Some(p) = self.struct_info(&current).and_then(|s| s.parent.clone()) {
+            if out.contains(&p) {
+                break;
+            }
+            out.push(p.clone());
+            current = p;
+        }
+        out
+    }
+
+    /// Whether `class` is `base` or descends from it.
+    pub fn is_subclass(&self, class: &str, base: &str) -> bool {
+        self.ancestry(class).iter().any(|c| c == base)
+    }
+
+    /// The classes descending from `base` (not `base` itself).
+    pub fn descendants(&self, base: &str) -> Vec<String> {
+        self.structs
+            .iter()
+            .filter(|s| s.name != base && self.is_subclass(&s.name, base))
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    /// A method of the class or of an ancestor, with the class declaring it.
+    pub fn find_method(
+        &self,
+        class: &str,
+        name: &str,
+        kind: MethodKind,
+    ) -> Option<(String, MethodInfo)> {
+        for c in self.ancestry(class) {
+            if let Some(m) = self.struct_info(&c).and_then(|s| s.method(name, kind)) {
+                return Some((c, m.clone()));
+            }
+        }
+        None
+    }
+
+    /// Whether a method, or any override of it in a subclass, changes `this`.
+    pub fn method_mutates(&self, fn_id: NodeId) -> bool {
+        self.funcs.get(&fn_id).is_some_and(|f| f.mutates_self)
+            || self
+                .overrides
+                .get(&fn_id)
+                .is_some_and(|os| os.iter().any(|o| self.method_mutates(*o)))
+    }
+
+    /// Whether values of the class are held as `dyn`.
+    pub fn is_dyn(&self, name: &str) -> bool {
+        self.polymorphic.contains(name)
+    }
     pub fn ty(&self, id: NodeId) -> Ty {
         self.expr_ty.get(&id).cloned().unwrap_or(Ty::Any)
     }
@@ -295,6 +444,18 @@ impl Program {
 
     pub fn is_enum(&self, name: &str) -> bool {
         self.enum_info(name).is_some()
+    }
+
+    pub fn union_info(&self, name: &str) -> Option<&UnionInfo> {
+        self.unions.iter().find(|u| u.name == name)
+    }
+
+    /// The union a type names, if any.
+    pub fn union_of(&self, ty: &Ty) -> Option<&UnionInfo> {
+        match self.types.resolve(ty) {
+            Ty::Named(n) => self.union_info(&n),
+            _ => None,
+        }
     }
 
     /// Whether values of the type copy freely in Rust.
@@ -323,6 +484,8 @@ pub(super) struct FnCtx {
     /// The function (not arrow) this one takes `this` from.
     pub(super) this_fn: NodeId,
     pub(super) has_return_value: bool,
+    /// Inside a generator: the type of the values it yields.
+    pub(super) yield_ty: Option<Ty>,
 }
 
 pub(super) struct ActiveNarrow {
@@ -354,6 +517,12 @@ pub(super) struct Path {
 
 pub(super) struct Infer<'m> {
     pub(super) src: &'m str,
+    /// The files of the program (one when translating a single source).
+    pub(super) files: &'m [crate::project::FileInfo],
+    /// `import * as ns`: the file each namespace binding stands for.
+    pub(super) namespaces: HashMap<NodeId, usize>,
+    /// For each file, its exported names and the global name each one stands for.
+    pub(super) exports: Vec<HashMap<String, String>>,
     pub(super) types: Types,
     pub(super) node_count: usize,
     pub(super) next_synth: usize,
@@ -363,6 +532,7 @@ pub(super) struct Infer<'m> {
     pub(super) funcs: HashMap<NodeId, FnInfo>,
     pub(super) structs: Vec<StructInfo>,
     pub(super) enums: Vec<EnumInfo>,
+    pub(super) unions: Vec<UnionInfo>,
     pub(super) aliases: HashMap<String, Ty>,
     pub(super) calls: HashMap<NodeId, Callee>,
     pub(super) literal_struct: HashMap<NodeId, String>,
@@ -370,6 +540,8 @@ pub(super) struct Infer<'m> {
     pub(super) narrow_tests: HashMap<NodeId, NarrowTest>,
     pub(super) narrowed_uses: HashMap<NodeId, (String, NodeId)>,
     pub(super) calls_in_try: HashSet<NodeId>,
+    /// The types `JSON.parse` fills: their unconstrained numbers are floats, as in JSON.
+    pub(super) json_targets: Vec<Ty>,
     pub(super) try_returns: HashSet<usize>,
     pub(super) scopes: Vec<Scope>,
     pub(super) fns: Vec<FnCtx>,
@@ -388,6 +560,9 @@ pub(super) struct Infer<'m> {
     pub(super) method_receivers: Vec<(NodeId, NodeId)>,
     /// Method calls on `this`: (method fn id, calling method fn id).
     pub(super) this_calls: Vec<(NodeId, NodeId)>,
+    /// `for (const x of xs)`: (loop variable, collection): a changed element changes the
+    /// collection.
+    pub(super) loop_sources: Vec<(NodeId, NodeId)>,
     pub(super) synth_names: HashSet<String>,
     pub(super) main_id: NodeId,
     pub(super) has_main: bool,
@@ -398,6 +573,14 @@ pub(super) struct Infer<'m> {
     pub(super) hints: HashMap<NodeId, String>,
     /// Variables initialized from a narrowed value: (binding, test).
     pub(super) alias_of_narrow: Vec<(NodeId, NodeId)>,
+    /// Base classes whose values may be instances of a subclass.
+    pub(super) polymorphic: HashSet<String>,
+    /// Base method → overriding methods.
+    pub(super) overrides: HashMap<NodeId, Vec<NodeId>>,
+    /// The class declarations, by name (for base classes collected on demand).
+    pub(super) class_asts: HashMap<String, &'m Class>,
+    pub(super) collected_classes: HashSet<String>,
+    pub(super) uses_timers: bool,
 }
 
 /// A use of a variable: the expression, the loop depth, the function and the branch path.
@@ -436,16 +619,24 @@ pub(super) const GLOBALS: &[&str] = &[
     "setTimeout",
     "setInterval",
     "clearTimeout",
+    "clearInterval",
     "alert",
     "RegExp",
     "Symbol",
     "BigInt",
 ];
 
-pub fn infer(module: &Module, src: &str) -> IResult<Program> {
+pub fn infer<'m>(
+    module: &'m Module,
+    src: &'m str,
+    files: &'m [crate::project::FileInfo],
+) -> IResult<Program> {
     let main_id = module.node_count;
     let mut inf = Infer {
         src,
+        files,
+        namespaces: HashMap::new(),
+        exports: Vec::new(),
         types: Types::default(),
         node_count: module.node_count,
         next_synth: module.node_count + 1,
@@ -455,6 +646,7 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         funcs: HashMap::new(),
         structs: Vec::new(),
         enums: Vec::new(),
+        unions: Vec::new(),
         aliases: HashMap::new(),
         calls: HashMap::new(),
         literal_struct: HashMap::new(),
@@ -462,6 +654,7 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         narrow_tests: HashMap::new(),
         narrowed_uses: HashMap::new(),
         calls_in_try: HashSet::new(),
+        json_targets: Vec::new(),
         try_returns: HashSet::new(),
         scopes: vec![Scope {
             vars: HashMap::new(),
@@ -475,6 +668,7 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         arg_bindings: Vec::new(),
         method_receivers: Vec::new(),
         this_calls: Vec::new(),
+        loop_sources: Vec::new(),
         synth_names: HashSet::new(),
         main_id,
         has_main: false,
@@ -482,6 +676,11 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         this_class_stack: Vec::new(),
         hints: HashMap::new(),
         alias_of_narrow: Vec::new(),
+        polymorphic: HashSet::new(),
+        overrides: HashMap::new(),
+        class_asts: HashMap::new(),
+        collected_classes: HashSet::new(),
+        uses_timers: false,
     };
     inf.run(module)?;
     inf.finish()
@@ -514,9 +713,14 @@ impl<'m> Infer<'m> {
         self.types.unify(a, b).map_err(|msg| Error::new(msg, span))
     }
 
-    /// Unifies the type of a value with what is expected of it.
+    /// Unifies the type of a value with what is expected of it. A value of a member type
+    /// is accepted where a union is expected (the generator wraps it in the variant), and
+    /// an instance of a subclass where its base class is expected.
     pub(super) fn expect(&mut self, found: &Ty, expected: &Ty, span: Span) -> IResult<()> {
         if self.types.unify(found, expected).is_err() {
+            if self.union_accepts(expected, found) || self.class_accepts(expected, found) {
+                return Ok(());
+            }
             return self.err(
                 format!(
                     "expected {}, found {}",
@@ -582,6 +786,9 @@ impl<'m> Infer<'m> {
                 used_in_fn: false,
                 alias: false,
                 closure_fn: None,
+                iter_result: false,
+                regex_flags: None,
+                shared: false,
                 loop_depth: depth,
                 span,
             },
@@ -652,7 +859,7 @@ impl<'m> Infer<'m> {
                             .collect(),
                         None => return self.err(format!("cannot destructure {n}"), *span),
                     },
-                    Ty::Map(_, v) => props
+                    Ty::Map(_, v, _) => props
                         .iter()
                         .map(|p| (p.key.clone(), (**v).clone()))
                         .collect(),
@@ -707,7 +914,102 @@ impl<'m> Infer<'m> {
     pub(super) fn type_exists(&self, name: &str) -> bool {
         self.struct_by_name(name).is_some()
             || self.enum_by_name(name).is_some()
+            || self.union_by_name(name).is_some()
             || self.aliases.contains_key(name)
+    }
+
+    pub(super) fn union_by_name(&self, name: &str) -> Option<&UnionInfo> {
+        self.unions.iter().find(|u| u.name == name)
+    }
+
+    /// The class and its ancestors, nearest first.
+    pub(super) fn ancestry(&self, class: &str) -> Vec<String> {
+        let mut out = vec![class.to_string()];
+        let mut current = class.to_string();
+        while let Some(p) = self.struct_by_name(&current).and_then(|s| s.parent.clone()) {
+            if out.contains(&p) {
+                break;
+            }
+            out.push(p.clone());
+            current = p;
+        }
+        out
+    }
+
+    pub(super) fn is_subclass(&self, class: &str, base: &str) -> bool {
+        self.ancestry(class).iter().any(|c| c == base)
+    }
+
+    /// A method of the class or of an ancestor, with the class declaring it.
+    pub(super) fn find_method(
+        &self,
+        class: &str,
+        name: &str,
+        kind: MethodKind,
+    ) -> Option<(String, MethodInfo)> {
+        for c in self.ancestry(class) {
+            if let Some(m) = self.struct_by_name(&c).and_then(|s| s.method(name, kind)) {
+                return Some((c, m.clone()));
+            }
+        }
+        None
+    }
+
+    /// A static field of the class or of an ancestor.
+    pub(super) fn find_static(&self, class: &str, name: &str) -> Option<(String, Ty)> {
+        for c in self.ancestry(class) {
+            if let Some((_, t, _)) = self
+                .struct_by_name(&c)
+                .and_then(|s| s.statics.iter().find(|(n, _, _)| n == name))
+            {
+                return Some((c, t.clone()));
+            }
+        }
+        None
+    }
+
+    /// The constructor a class runs: its own, or the nearest inherited one.
+    pub(super) fn nearest_ctor(&self, class: &str) -> Option<(String, NodeId)> {
+        for c in self.ancestry(class) {
+            if let Some(ctor) = self.struct_by_name(&c).and_then(|s| s.ctor) {
+                return Some((c, ctor));
+            }
+        }
+        None
+    }
+
+    /// Whether a value of class `found` can go where `expected` (a base class of it,
+    /// possibly nullable) is wanted; the base class then needs dynamic dispatch.
+    pub(super) fn class_accepts(&mut self, expected: &Ty, found: &Ty) -> bool {
+        let target = match self.types.resolve(expected) {
+            Ty::Option(inner) => self.types.resolve(&inner),
+            other => other,
+        };
+        let found = match self.types.resolve(found) {
+            Ty::Option(inner) => self.types.resolve(&inner),
+            other => other,
+        };
+        let (Ty::Named(base), Ty::Named(class)) = (target, found) else {
+            return false;
+        };
+        if base == class
+            || self
+                .struct_by_name(&base)
+                .is_none_or(|s| s.kind != StructKind::Class)
+            || !self.is_subclass(&class, &base)
+        {
+            return false;
+        }
+        self.polymorphic.insert(base);
+        true
+    }
+
+    /// The union a type names, if any.
+    pub(super) fn union_of_ty(&self, ty: &Ty) -> Option<&UnionInfo> {
+        match self.types.resolve(ty) {
+            Ty::Named(n) => self.union_by_name(&n),
+            _ => None,
+        }
     }
 
     pub(super) fn is_type_param(&self, name: &str) -> bool {
@@ -759,6 +1061,45 @@ impl<'m> Infer<'m> {
         self.narrows
             .iter()
             .rposition(|n| n.root == path.root && n.path == path.fields)
+    }
+
+    /// The flags of a regular expression expression, when they are written in the program.
+    pub(super) fn regex_flags(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Regex { flags, .. } => Some(flags.clone()),
+            ExprKind::New { callee, args, .. } if matches!(&callee.kind, ExprKind::Ident(n) if n == "RegExp") => {
+                match args.get(1) {
+                    None => Some(String::new()),
+                    Some(a) => match &a.expr.kind {
+                        ExprKind::Str(f) => Some(f.clone()),
+                        _ => None,
+                    },
+                }
+            }
+            ExprKind::Ident(name) => self
+                .lookup(name)
+                .and_then(|id| self.vars.get(&id))
+                .and_then(|v| v.regex_flags.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether an expression is the result of a generator's `next()`, directly or through
+    /// a variable.
+    pub(super) fn is_iter_result(&self, e: &Expr) -> bool {
+        if matches!(
+            self.calls.get(&e.id),
+            Some(Callee::Builtin("generator.next"))
+        ) {
+            return true;
+        }
+        match &e.kind {
+            ExprKind::Ident(name) => self
+                .lookup(name)
+                .and_then(|id| self.vars.get(&id))
+                .is_some_and(|v| v.iter_result),
+            _ => false,
+        }
     }
 
     pub(super) fn root_binding(&self, e: &Expr) -> Option<NodeId> {

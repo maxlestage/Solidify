@@ -15,9 +15,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::{Error, Span};
-use crate::infer::{Program, Role};
+use crate::infer::{Callee, Program, Role};
 use crate::types::{Flavor, Ty};
 pub use runtime::Helper;
+pub use runtime::regex_rt;
 
 /// Options of the generator.
 #[derive(Clone, Debug, Default)]
@@ -26,6 +27,8 @@ pub struct Options {
     pub file_name: Option<String>,
     /// Omit the header comment.
     pub no_header: bool,
+    /// The files of the program: the imported ones become modules.
+    pub files: Vec<crate::project::FileInfo>,
 }
 
 /// How an emitted expression holds its value.
@@ -135,6 +138,8 @@ pub(super) struct FnGen {
     pub id: NodeId,
     pub returns_result: bool,
     pub ret_ty: Ty,
+    /// Inside a generator: the type of the values yielded.
+    pub yield_ty: Option<Ty>,
     pub targets: Vec<Target>,
     pub try_ctx: Vec<TryCtx>,
     pub in_ctor: bool,
@@ -154,6 +159,37 @@ pub(super) struct Gen<'a> {
     pub helpers: BTreeSet<Helper>,
     pub uses_hashmap: bool,
     pub uses_hashset: bool,
+    /// Maps and sets are iterated or shown: they keep the insertion order (`JsMap`, `JsSet`).
+    pub ordered: bool,
+    /// Structs and enums shown by `console.log` or converted to strings: they get a
+    /// `JsInspect` implementation.
+    pub inspected: BTreeSet<String>,
+    /// The structs, enums and unions that `JSON.parse` builds: they get a `JsFromJson`.
+    pub json_types: BTreeSet<String>,
+    /// Fields read (or written: `true`) on union values: accessors on the enum.
+    pub union_accessors: BTreeSet<(String, String, bool)>,
+    /// Unions whose `typeof` is taken.
+    pub union_typeof: BTreeSet<String>,
+    /// The class whose `impl` is being written (methods inherited from a base class are
+    /// written again for each subclass).
+    pub current_class: Option<String>,
+    /// Fields written through a `dyn` value: (class, field).
+    pub dyn_setters: BTreeSet<(String, String)>,
+    /// `x instanceof Sub` on a `dyn Base` value: (base, sub, mutable).
+    pub instance_tests: BTreeSet<(String, String, bool)>,
+    /// `super.m()` helpers to write: class → (declaring class, method).
+    pub super_helpers: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// Variables held in an `Rc<RefCell<T>>` (shared with closures that outlive the scope).
+    pub shared: HashSet<NodeId>,
+    pub uses_rc: bool,
+    /// Top-level variables used inside functions: statics (`true`: changed, in a `Mutex`).
+    pub statics: HashMap<NodeId, bool>,
+    pub uses_lazy: bool,
+    pub uses_mutex: bool,
+    /// The next variable read is written through: borrow a shared one mutably.
+    pub want_mut_root: bool,
+    /// Parameters to wrap in `Rc<RefCell<T>>` at the start of the body.
+    pub param_rebinds: Vec<String>,
     /// Binding → Rust name.
     pub names: HashMap<NodeId, String>,
     /// Binding → how the variable holds its value.
@@ -166,6 +202,8 @@ pub(super) struct Gen<'a> {
     /// Names bound by narrowing, innermost last.
     pub narrowed: Vec<(String, Repr)>,
     pub opts: &'a Options,
+    /// Writing the items of an imported file, inside its module.
+    pub in_module: bool,
 }
 
 pub(super) type GResult<T> = Result<T, Error>;
@@ -180,6 +218,23 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         helpers: BTreeSet::new(),
         uses_hashmap: false,
         uses_hashset: false,
+        ordered: false,
+        in_module: false,
+        inspected: BTreeSet::new(),
+        json_types: BTreeSet::new(),
+        union_accessors: BTreeSet::new(),
+        union_typeof: BTreeSet::new(),
+        current_class: None,
+        dyn_setters: BTreeSet::new(),
+        instance_tests: BTreeSet::new(),
+        super_helpers: BTreeMap::new(),
+        shared: HashSet::new(),
+        uses_rc: false,
+        statics: HashMap::new(),
+        uses_lazy: false,
+        uses_mutex: false,
+        want_mut_root: false,
+        param_rebinds: Vec::new(),
         names: HashMap::new(),
         reprs: HashMap::new(),
         fn_asts: HashMap::new(),
@@ -190,7 +245,225 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         opts,
     };
     collect_asts(&module.body, &mut g.fn_asts, &mut g.class_asts);
+    g.ordered = g.needs_ordered();
     g.module()
+}
+
+/// Visits every statement and every expression of a list of statements, nested
+/// functions included.
+pub(super) fn visit_all<'e>(
+    stmts: &'e [Stmt],
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    for s in stmts {
+        visit_stmt(s, on_stmt, on_expr);
+    }
+}
+
+fn visit_stmt<'e>(
+    s: &'e Stmt,
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    on_stmt(s);
+    macro_rules! ex {
+        ($x:expr) => {
+            visit_expr_deep($x, on_stmt, on_expr)
+        };
+    }
+    match &s.kind {
+        StmtKind::Func(f) => visit_fn(f, on_stmt, on_expr),
+        StmtKind::Class(c) => {
+            for m in &c.members {
+                match m {
+                    ClassMember::Method(m) => visit_fn(&m.func, on_stmt, on_expr),
+                    ClassMember::Field(f) => {
+                        if let Some(i) = &f.init {
+                            visit_expr_deep(i, on_stmt, on_expr);
+                        }
+                    }
+                    ClassMember::StaticBlock(b) => visit_all(&b.stmts, on_stmt, on_expr),
+                }
+            }
+        }
+        StmtKind::Var(v) => {
+            for d in &v.decls {
+                if let Some(i) = &d.init {
+                    ex!(i);
+                }
+            }
+        }
+        StmtKind::Return(Some(e))
+        | StmtKind::Expr(e)
+        | StmtKind::Throw(e)
+        | StmtKind::ExportDefault(e) => ex!(e),
+        StmtKind::If {
+            test,
+            then,
+            otherwise,
+        } => {
+            ex!(test);
+            visit_stmt(then, on_stmt, on_expr);
+            if let Some(o) = otherwise {
+                visit_stmt(o, on_stmt, on_expr);
+            }
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            ex!(test);
+            visit_stmt(body, on_stmt, on_expr);
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            if let Some(i) = init {
+                visit_stmt(i, on_stmt, on_expr);
+            }
+            if let Some(t) = test {
+                ex!(t);
+            }
+            if let Some(u) = update {
+                ex!(u);
+            }
+            visit_stmt(body, on_stmt, on_expr);
+        }
+        StmtKind::ForOf { iter, body, .. } => {
+            ex!(iter);
+            visit_stmt(body, on_stmt, on_expr);
+        }
+        StmtKind::Switch { disc, cases } => {
+            ex!(disc);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    ex!(t);
+                }
+                visit_all(&c.body, on_stmt, on_expr);
+            }
+        }
+        StmtKind::Try {
+            block,
+            catch,
+            finally,
+        } => {
+            visit_all(&block.stmts, on_stmt, on_expr);
+            if let Some(c) = catch {
+                visit_all(&c.body.stmts, on_stmt, on_expr);
+            }
+            if let Some(f) = finally {
+                visit_all(&f.stmts, on_stmt, on_expr);
+            }
+        }
+        StmtKind::Block(b) => visit_all(&b.stmts, on_stmt, on_expr),
+        StmtKind::Labeled { body, .. } => visit_stmt(body, on_stmt, on_expr),
+        _ => {}
+    }
+}
+
+fn visit_fn<'e>(
+    f: &'e Function,
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    for p in &f.params {
+        if let Some(d) = &p.default {
+            visit_expr_deep(d, on_stmt, on_expr);
+        }
+    }
+    match &f.body {
+        FnBody::Block(b) => visit_all(&b.stmts, on_stmt, on_expr),
+        FnBody::Expr(e) => visit_expr_deep(e, on_stmt, on_expr),
+    }
+}
+
+/// Visits an expression and everything inside it, function bodies included.
+pub(super) fn visit_expr_deep<'e>(
+    e: &'e Expr,
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    on_expr(e);
+    macro_rules! visit {
+        ($x:expr) => {
+            visit_expr_deep($x, on_stmt, on_expr)
+        };
+    }
+    match &e.kind {
+        ExprKind::Func(f) | ExprKind::Arrow(f) => visit_fn(f, on_stmt, on_expr),
+        ExprKind::Template { exprs, .. } | ExprKind::Seq(exprs) => {
+            exprs.iter().for_each(|x| visit!(x))
+        }
+        ExprKind::Array(elems) => {
+            for el in elems {
+                match el {
+                    ArrayElem::Expr(x) | ArrayElem::Spread(x) => visit!(x),
+                    ArrayElem::Hole => {}
+                }
+            }
+        }
+        ExprKind::Object(props) => {
+            for p in props {
+                if let PropKey::Computed(k) = &p.key {
+                    visit!(k);
+                }
+                match &p.value {
+                    PropValue::Expr(x) | PropValue::Spread(x) => visit!(x),
+                    PropValue::Method(f) | PropValue::Get(f) | PropValue::Set(f) => {
+                        visit_fn(f, on_stmt, on_expr)
+                    }
+                    PropValue::Shorthand(_) => {}
+                }
+            }
+        }
+        ExprKind::Unary { arg, .. } | ExprKind::Update { arg, .. } => visit!(arg),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            visit!(left);
+            visit!(right);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            if let AssignTarget::Expr(t) = target {
+                visit!(t);
+            }
+            visit!(value);
+        }
+        ExprKind::Cond { test, cons, alt } => {
+            visit!(test);
+            visit!(cons);
+            visit!(alt);
+        }
+        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args, .. } => {
+            visit!(callee);
+            for a in args {
+                visit!(&a.expr);
+            }
+        }
+        ExprKind::Member { obj, .. } => visit!(obj),
+        ExprKind::Index { obj, index, .. } => {
+            visit!(obj);
+            visit!(index);
+        }
+        ExprKind::As(x, _)
+        | ExprKind::NonNull(x)
+        | ExprKind::TypeOf(x)
+        | ExprKind::Void(x)
+        | ExprKind::Delete(x)
+        | ExprKind::Await(x) => visit!(x),
+        ExprKind::Yield { value: Some(x), .. } => visit!(x),
+        ExprKind::Tagged { tag, exprs, .. } => {
+            visit!(tag);
+            exprs.iter().for_each(|x| visit!(x));
+        }
+        ExprKind::Class(c) => {
+            for m in &c.members {
+                if let ClassMember::Method(m) = m {
+                    visit_fn(&m.func, on_stmt, on_expr);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_asts<'a>(
@@ -383,7 +656,7 @@ fn collect_expr<'a>(
         | ExprKind::Void(x)
         | ExprKind::Delete(x)
         | ExprKind::Await(x) => visit!(x),
-        ExprKind::Yield(Some(x)) => visit!(x),
+        ExprKind::Yield { value: Some(x), .. } => visit!(x),
         ExprKind::Tagged { tag, exprs, .. } => {
             visit!(tag);
             exprs.iter().for_each(|x| visit!(x));
@@ -511,6 +784,12 @@ impl<'a> Gen<'a> {
 
     pub(super) fn helper(&mut self, h: Helper) -> &'static str {
         self.helpers.insert(h);
+        if h == Helper::BlockOn {
+            self.helpers.insert(Helper::Timers);
+        }
+        if h == Helper::Json {
+            self.helpers.insert(Helper::Inspect);
+        }
         match h {
             Helper::StrSlice => "js_slice",
             Helper::StrSubstring => "js_substring",
@@ -530,12 +809,371 @@ impl<'a> Gen<'a> {
             Helper::Compare => "js_compare",
             Helper::Ordering => "js_ordering",
             Helper::ParseInt => "js_parse_int",
+            Helper::ParseIntRadix => "js_parse_int_radix",
             Helper::ParseFloat => "js_parse_float",
             Helper::ToNumber => "js_number",
             Helper::Random => "js_random",
             Helper::NumToString => "js_num_to_string",
             Helper::BlockOn => "block_on",
+            Helper::Inspect => "js_inspect",
+            Helper::JsMap => "JsMap",
+            Helper::JsSet => "JsSet",
+            Helper::Generator => "JsGenerator",
+            Helper::Timers => "js_run_timers",
+            Helper::Promise => "JsPromise",
+            Helper::Regex => "JsRegex",
+            Helper::Json => "js_json_stringify",
         }
+    }
+
+    /// The Rust type of a `Map` (`JsMap` keeps the insertion order when it matters).
+    pub(super) fn map_name(&mut self) -> &'static str {
+        if self.ordered {
+            self.helper(Helper::JsMap)
+        } else {
+            self.uses_hashmap = true;
+            "HashMap"
+        }
+    }
+
+    pub(super) fn set_name(&mut self) -> &'static str {
+        if self.ordered {
+            self.helper(Helper::JsSet)
+        } else {
+            self.uses_hashset = true;
+            "HashSet"
+        }
+    }
+
+    /// Whether some map or set of the program is iterated or shown: then every map and set
+    /// keeps its insertion order, like in JavaScript.
+    fn needs_ordered(&self) -> bool {
+        let mut found = false;
+        let is_collection = |g: &Self, e: &Expr| matches!(g.ty_of(e), Ty::Map(..) | Ty::Set(_));
+        let mut on_stmt = |s: &Stmt| {
+            if let StmtKind::ForOf { iter, .. } = &s.kind
+                && is_collection(self, iter)
+            {
+                found = true;
+            }
+        };
+        let mut found2 = false;
+        let mut on_expr = |e: &Expr| match &e.kind {
+            ExprKind::Call { args, .. } => {
+                if let Some(Callee::Builtin(name)) = self.p.calls.get(&e.id)
+                    && (matches!(
+                        *name,
+                        "map.keys"
+                            | "map.values"
+                            | "map.entries"
+                            | "map.forEach"
+                            | "set.values"
+                            | "set.keys"
+                            | "set.forEach"
+                            | "Object.keys"
+                            | "Object.values"
+                            | "Object.entries"
+                            | "JSON.stringify"
+                    ) || (matches!(
+                        *name,
+                        "Array.from"
+                            | "Array.from.map"
+                            | "console.log"
+                            | "console.error"
+                            | "console.warn"
+                            | "console.info"
+                            | "console.debug"
+                            | "global.String"
+                    ) && args.iter().any(|a| is_collection(self, &a.expr))))
+                {
+                    found2 = true;
+                }
+            }
+            ExprKind::Array(elems) => {
+                if elems
+                    .iter()
+                    .any(|el| matches!(el, ArrayElem::Spread(x) if is_collection(self, x)))
+                {
+                    found2 = true;
+                }
+            }
+            ExprKind::Template { exprs, .. } => {
+                if exprs.iter().any(|x| is_collection(self, x)) {
+                    found2 = true;
+                }
+            }
+            ExprKind::Binary {
+                op: BinOp::Add,
+                left,
+                right,
+            } if is_collection(self, left) || is_collection(self, right) => {
+                found2 = true;
+            }
+            _ => {}
+        };
+        visit_all(&self.m.body, &mut on_stmt, &mut on_expr);
+        found || found2
+    }
+
+    /// Whether values of this type print through `JsInspect` rather than `Display`.
+    pub(super) fn is_inspect_ty(&self, ty: &Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Array(_) | Ty::Tuple(_) | Ty::Map(..) | Ty::Set(_) => true,
+            Ty::Option(inner) => self.is_inspect_ty(&inner),
+            Ty::Named(n) => {
+                n != "Error"
+                    && n != "RegExp"
+                    && !self.is_type_param(&n)
+                    && (n == "RegExpMatch"
+                        || self.p.struct_info(&n).is_some()
+                        || self.p.union_info(&n).is_some())
+            }
+            _ => false,
+        }
+    }
+
+    /// The union a type names, if any.
+    pub(super) fn union_of(&self, ty: &Ty) -> Option<&crate::infer::UnionInfo> {
+        self.p.union_of(ty)
+    }
+
+    /// The variant of union `to` that a value of type `from` fills, if `to` is a union
+    /// and `from` one of its members.
+    pub(super) fn union_variant(&self, from: &Ty, to: &Ty) -> Option<(String, String)> {
+        let to = match self.resolve(to) {
+            Ty::Option(inner) => self.resolve(&inner),
+            other => other,
+        };
+        let u = self.union_of(&to)?;
+        let from = self.resolve(from);
+        if matches!(&from, Ty::Named(n) if *n == u.name) {
+            return None;
+        }
+        let zf = self.p.types.zonk(&from);
+        let m = u
+            .members
+            .iter()
+            .find(|m| crate::infer::same_shape_ty(&self.p.types.zonk(&m.ty), &zf))?;
+        Some((pascal(&u.name), m.name.clone()))
+    }
+
+    /// Records that the structs and enums reachable from this type are shown.
+    pub(super) fn mark_inspected(&mut self, ty: &Ty) {
+        self.helpers.insert(Helper::Inspect);
+        match self.resolve(ty) {
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.mark_inspected(&t),
+            Ty::Map(k, v, _) => {
+                self.mark_inspected(&k);
+                self.mark_inspected(&v);
+            }
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.mark_inspected(t);
+                }
+            }
+            Ty::Named(n)
+                if (self.p.struct_info(&n).is_some()
+                    || self.p.is_enum(&n)
+                    || self.p.union_info(&n).is_some())
+                    && self.inspected.insert(n.clone()) =>
+            {
+                let mut inner: Vec<Ty> = self
+                    .p
+                    .struct_info(&n)
+                    .map(|s| s.fields.iter().map(|f| f.ty.clone()).collect())
+                    .unwrap_or_default();
+                if let Some(u) = self.p.union_info(&n) {
+                    inner.extend(u.members.iter().map(|m| m.ty.clone()));
+                }
+                for t in &inner {
+                    self.mark_inspected(t);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `js_inspect(&x.js_value())` or `js_to_string(&x.js_value())` for a value of type `ty`.
+    /// Registers the types `JSON.parse` must build for `ty`, refusing those JSON cannot
+    /// describe.
+    pub(super) fn mark_json(&mut self, ty: &Ty, span: Span) -> GResult<()> {
+        match self.resolve(ty) {
+            Ty::Num(_) | Ty::Str | Ty::Bool | Ty::Null | Ty::Void | Ty::Never => Ok(()),
+            Ty::Var(_) | Ty::Any => self.err(
+                "the type of the parsed JSON is not known: write `const x: T = JSON.parse(…)` or `JSON.parse(…) as T`",
+                span,
+            ),
+            Ty::Option(t) | Ty::Array(t) => self.mark_json(&t, span),
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.mark_json(t, span)?;
+                }
+                Ok(())
+            }
+            Ty::Map(k, v, _) => {
+                if !self.is_str(&k) {
+                    return self.err(
+                        "JSON object keys are strings: a map read from JSON needs string keys",
+                        span,
+                    );
+                }
+                self.mark_json(&v, span)
+            }
+            Ty::Set(_) => self.err(
+                "a `Set` cannot be read from JSON, which only has arrays and objects",
+                span,
+            ),
+            Ty::Func(_) => self.err("a function cannot be read from JSON", span),
+            Ty::Gen(_) => self.err("a generator cannot be read from JSON", span),
+            Ty::Named(n) => {
+                if n == "Error" || n == "RegExp" || n == "RegExpMatch" {
+                    return self.err(format!("a `{n}` cannot be read from JSON"), span);
+                }
+                if self.is_type_param(&n) {
+                    return self.err(
+                        "`JSON.parse` needs a concrete type here, not a type parameter",
+                        span,
+                    );
+                }
+                if self.p.is_dyn(&n) {
+                    return self.err(
+                        format!(
+                            "`{n}` has subclasses: `JSON.parse` cannot tell which one to build; parse the exact class"
+                        ),
+                        span,
+                    );
+                }
+                if !self.json_types.insert(n.clone()) {
+                    return Ok(());
+                }
+                if self.p.is_enum(&n) {
+                    return Ok(());
+                }
+                if let Some(u) = self.p.union_info(&n).cloned() {
+                    for m in &u.members {
+                        self.mark_json(&m.ty, span)?;
+                    }
+                    return Ok(());
+                }
+                let Some(info) = self.p.struct_info(&n).cloned() else {
+                    return self.err(format!("`{n}` cannot be read from JSON"), span);
+                };
+                for f in &info.fields {
+                    if matches!(self.resolve(&f.ty), Ty::Func(_)) {
+                        return self.err(
+                            format!("`{n}.{}` is a function: it cannot be read from JSON", f.name),
+                            span,
+                        );
+                    }
+                    self.mark_json(&f.ty, span)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub(super) fn inspect_call(&mut self, code: &str, ty: &Ty, inspect: bool) -> String {
+        let f = if inspect {
+            "js_inspect"
+        } else {
+            "js_to_string"
+        };
+        let value = self.js_value_of(code, ty);
+        format!("{f}(&{value})")
+    }
+
+    /// Whether a record (an object used as a dictionary) is somewhere in this type.
+    pub(super) fn contains_record(&self, ty: &Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Map(k, v, record) => record || self.contains_record(&k) || self.contains_record(&v),
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.contains_record(&t),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.contains_record(t)),
+            _ => false,
+        }
+    }
+
+    /// The `JsValue` of a Rust expression of type `ty`: `.js_value()`, except that records
+    /// are shown as objects, not as maps.
+    pub(super) fn js_value_of(&mut self, code: &str, ty: &Ty) -> String {
+        self.mark_inspected(ty);
+        let recv = if code.contains(' ') && !(code.starts_with('(') && code.ends_with(')')) {
+            format!("({code})")
+        } else {
+            code.to_string()
+        };
+        if !self.contains_record(ty) {
+            return format!("{recv}.js_value()");
+        }
+        match self.resolve(ty) {
+            Ty::Map(k, v, record) => {
+                let inner = self.js_value_of("v", &v);
+                if record {
+                    format!(
+                        "JsValue::Object(None, {recv}.iter().map(|(k, v)| (k.to_string(), {inner})).collect())"
+                    )
+                } else {
+                    let key = self.js_value_of("k", &k);
+                    format!("JsValue::Map({recv}.iter().map(|(k, v)| ({key}, {inner})).collect())")
+                }
+            }
+            Ty::Array(t) => {
+                let inner = self.js_value_of("x", &t);
+                format!("JsValue::Array({recv}.iter().map(|x| {inner}).collect())")
+            }
+            Ty::Set(t) => {
+                let inner = self.js_value_of("x", &t);
+                format!("JsValue::Set({recv}.iter().map(|x| {inner}).collect())")
+            }
+            Ty::Option(t) => {
+                let inner = self.js_value_of("x", &t);
+                format!("{recv}.as_ref().map_or(JsValue::Null, |x| {inner})")
+            }
+            Ty::Tuple(ts) => {
+                let mut parts = Vec::new();
+                for (i, t) in ts.iter().enumerate() {
+                    parts.push(self.js_value_of(&format!("{recv}.{i}"), t));
+                }
+                format!("JsValue::Array(vec![{}])", parts.join(", "))
+            }
+            _ => format!("{recv}.js_value()"),
+        }
+    }
+
+    /// Visibility of an item: inside a module, what is not exported stays in the crate.
+    pub(super) fn vis(&self, exported: bool) -> &'static str {
+        if exported {
+            "pub "
+        } else if self.in_module {
+            "pub(crate) "
+        } else {
+            ""
+        }
+    }
+
+    /// The file a source offset is in.
+    pub(super) fn file_of(&self, offset: usize) -> usize {
+        self.opts
+            .files
+            .iter()
+            .position(|f| f.contains(offset))
+            .unwrap_or(0)
+    }
+
+    /// Whether an item at `span` belongs to the file being written (`None`: every file).
+    pub(super) fn owned_by(&self, span: Span, file: Option<usize>) -> bool {
+        file.is_none_or(|i| self.file_of(span.start) == i)
+    }
+
+    /// The file declaring a type.
+    pub(super) fn type_file(&self, name: &str) -> usize {
+        let span = self
+            .p
+            .struct_info(name)
+            .map(|s| s.span)
+            .or_else(|| self.p.enum_info(name).map(|e| e.span))
+            .or_else(|| self.p.union_info(name).map(|u| u.span))
+            .unwrap_or_default();
+        self.file_of(span.start)
     }
 
     pub(super) fn err<T>(&self, msg: impl Into<String>, span: Span) -> GResult<T> {
@@ -622,23 +1260,34 @@ impl<'a> Gen<'a> {
                     format!("({})", parts.join(", "))
                 }
             }
-            Ty::Map(k, v) => {
-                self.uses_hashmap = true;
+            Ty::Map(k, v, _) => {
+                let name = self.map_name();
                 format!(
-                    "HashMap<{}, {}>",
+                    "{name}<{}, {}>",
                     self.rust_ty(&k, span)?,
                     self.rust_ty(&v, span)?
                 )
             }
             Ty::Set(t) => {
-                self.uses_hashset = true;
-                format!("HashSet<{}>", self.rust_ty(&t, span)?)
+                let name = self.set_name();
+                format!("{name}<{}>", self.rust_ty(&t, span)?)
+            }
+            Ty::Gen(t) => {
+                let name = self.helper(Helper::Generator);
+                format!("{name}<{}>", self.rust_ty(&t, span)?)
             }
             Ty::Named(n) => {
                 if n == "Error" {
                     "String".into()
+                } else if n == "RegExp" {
+                    self.helper(Helper::Regex).into()
+                } else if n == "RegExpMatch" {
+                    self.helper(Helper::Regex);
+                    "JsMatch".into()
                 } else if self.is_type_param(&n) {
                     n
+                } else if self.p.is_dyn(&n) {
+                    format!("Box<dyn {}Like>", pascal(&n))
                 } else {
                     pascal(&n)
                 }
@@ -709,7 +1358,8 @@ impl<'a> Gen<'a> {
         if let Ty::Func(_) = ty {
             return if stored { Mode::Value } else { Mode::FnImpl };
         }
-        if self.is_copy(&ty) {
+        // A generator is consumed by whoever iterates it.
+        if self.is_copy(&ty) || matches!(ty, Ty::Gen(_)) {
             return Mode::Value;
         }
         if stored || reassigned {
@@ -731,13 +1381,38 @@ impl<'a> Gen<'a> {
         }
     }
 
+    /// `dyn CLike` for a class held dynamically, else `None`.
+    pub(super) fn dyn_name(&self, ty: &Ty) -> Option<String> {
+        match self.resolve(ty) {
+            Ty::Named(n) if self.p.is_dyn(&n) => Some(format!("dyn {}Like", pascal(&n))),
+            _ => None,
+        }
+    }
+
+    /// Whether a value of this type holds a `dyn` class somewhere (no `PartialEq` then).
+    pub(super) fn contains_dyn(&self, ty: &Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Named(n) => self.p.is_dyn(&n),
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.contains_dyn(&t),
+            Ty::Map(k, v, _) => self.contains_dyn(&k) || self.contains_dyn(&v),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.contains_dyn(t)),
+            _ => false,
+        }
+    }
+
     /// The Rust type of a parameter passed in `mode`.
     pub(super) fn mode_ty(&mut self, ty: &Ty, mode: Mode, span: Span) -> GResult<String> {
         Ok(match mode {
             Mode::Value => self.rust_ty(ty, span)?,
             Mode::FnImpl => self.fn_param_ty(ty, span)?,
-            Mode::Ref => format!("&{}", self.rust_ty(ty, span)?),
-            Mode::RefMut => format!("&mut {}", self.rust_ty(ty, span)?),
+            Mode::Ref => match self.dyn_name(ty) {
+                Some(d) => format!("&{d}"),
+                None => format!("&{}", self.rust_ty(ty, span)?),
+            },
+            Mode::RefMut => match self.dyn_name(ty) {
+                Some(d) => format!("&mut {d}"),
+                None => format!("&mut {}", self.rust_ty(ty, span)?),
+            },
             Mode::StrRef => "&str".into(),
             Mode::Slice => match self.resolve(ty) {
                 Ty::Array(t) => format!("&[{}]", self.rust_ty(&t, span)?),
@@ -745,7 +1420,10 @@ impl<'a> Gen<'a> {
             },
             Mode::OptRef => match self.resolve(ty) {
                 Ty::Option(inner) if self.is_str(&inner) => "Option<&str>".into(),
-                Ty::Option(inner) => format!("Option<&{}>", self.rust_ty(&inner, span)?),
+                Ty::Option(inner) => match self.dyn_name(&inner) {
+                    Some(d) => format!("Option<&{d}>"),
+                    None => format!("Option<&{}>", self.rust_ty(&inner, span)?),
+                },
                 _ => self.rust_ty(ty, span)?,
             },
         })
@@ -768,12 +1446,13 @@ impl<'a> Gen<'a> {
             Ty::Num(_) | Ty::Str | Ty::Bool => "{}",
             Ty::Named(n) => {
                 let prints = n == "Error"
+                    || n == "RegExp"
                     || self.is_type_param(&n)
                     || self.p.is_enum(&n)
                     || self
                         .p
-                        .struct_info(&n)
-                        .is_some_and(|s| s.method("toString", MethodKind::Method).is_some());
+                        .find_method(&n, "toString", MethodKind::Method)
+                        .is_some();
                 if prints { "{}" } else { "{:?}" }
             }
             _ => "{:?}",
@@ -1006,7 +1685,28 @@ impl<'a> Gen<'a> {
         if matches!(from_r, Ty::Null) {
             return "None".into();
         }
-        let code = self.owned(e, &from_r);
+        let mut code = self.owned(e, &from_r);
+        // A member of a union goes into its variant.
+        let target = match &to_r {
+            Ty::Option(inner) if !matches!(from_r, Ty::Option(_)) => self.resolve(inner),
+            other => other.clone(),
+        };
+        if let Some((en, variant)) = self.union_variant(&from_r, &target) {
+            code = format!("{en}::{variant}({code})");
+        }
+        // An instance of a subclass where the base class is held dynamically.
+        if let (Ty::Named(from_class), Ty::Named(base)) = (&from_r, &target)
+            && from_class != base
+            && self.p.is_dyn(base)
+            && self.p.is_subclass(from_class, base)
+        {
+            let trait_name = format!("Box<dyn {}Like>", pascal(base));
+            code = if self.p.is_dyn(from_class) {
+                format!("{code} as {trait_name}")
+            } else {
+                format!("Box::new({code}) as {trait_name}")
+            };
+        }
         if let Ty::Option(inner) = &to_r
             && !matches!(from_r, Ty::Option(_))
         {

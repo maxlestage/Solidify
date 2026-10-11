@@ -22,12 +22,34 @@ pub enum Helper {
     Compare,
     Ordering,
     ParseInt,
+    ParseIntRadix,
     ParseFloat,
     ToNumber,
     Random,
     NumToString,
     BlockOn,
+    /// `JsValue` and `JsInspect`: `console.log` and `String(…)` of objects, arrays, maps and sets.
+    Inspect,
+    /// A map in insertion order.
+    JsMap,
+    /// A set in insertion order.
+    JsSet,
+    /// `JsGenerator`: a `function*` running on its own thread.
+    Generator,
+    /// `setTimeout` / `setInterval` and the loop running them.
+    Timers,
+    /// `new Promise`.
+    Promise,
+    /// `JsRegex`: regular expressions.
+    Regex,
+    /// `JSON.stringify` and `JSON.parse` (`JsonValue`, `JsFromJson`).
+    Json,
 }
+
+/// The regular expression engine, compiled into Solidify too: patterns are checked when
+/// translating.
+#[path = "runtime/regex.rs"]
+pub mod regex_rt;
 
 impl Helper {
     pub fn source(self) -> &'static str {
@@ -187,8 +209,8 @@ fn js_ordering(n: f64) -> std::cmp::Ordering {
 }"#
             }
             Helper::ParseInt => {
-                r#"/// `parseInt(s)`: the leading integer, or NaN.
-fn js_parse_int(s: &str) -> f64 {
+                r#"/// `parseInt(s)`: the leading integer, or `None` for `NaN`.
+fn js_parse_int(s: &str) -> Option<i64> {
     let s = s.trim_start();
     let end = s
         .char_indices()
@@ -196,7 +218,36 @@ fn js_parse_int(s: &str) -> f64 {
         .map(|(i, c)| i + c.len_utf8())
         .last()
         .unwrap_or(0);
-    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+    s[..end].parse::<i64>().ok()
+}"#
+            }
+            Helper::ParseIntRadix => {
+                r#"/// `parseInt(s, radix)`: the leading digits in the given base, or `None` for `NaN`.
+fn js_parse_int_radix(s: &str, radix: i64) -> Option<i64> {
+    if !(2..=36).contains(&radix) {
+        return None;
+    }
+    let s = s.trim_start();
+    let (negative, digits) = match s.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
+    };
+    let digits = if radix == 16 {
+        digits
+            .strip_prefix("0x")
+            .or_else(|| digits.strip_prefix("0X"))
+            .unwrap_or(digits)
+    } else {
+        digits
+    };
+    let end = digits
+        .char_indices()
+        .take_while(|&(_, c)| c.is_digit(radix as u32))
+        .map(|(i, c)| i + c.len_utf8())
+        .last()
+        .unwrap_or(0);
+    let n = i64::from_str_radix(&digits[..end], radix as u32).ok()?;
+    Some(if negative { -n } else { n })
 }"#
             }
             Helper::ParseFloat => {
@@ -288,8 +339,16 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
     digits.iter().rev().collect()
 }"#
             }
+            Helper::Inspect => include_str!("runtime/inspect.rs"),
+            Helper::JsMap => include_str!("runtime/map.rs"),
+            Helper::JsSet => include_str!("runtime/set.rs"),
+            Helper::Generator => include_str!("runtime/generator.rs"),
+            Helper::Timers => include_str!("runtime/timers.rs"),
+            Helper::Promise => include_str!("runtime/promise.rs"),
+            Helper::Regex => include_str!("runtime/regex.rs"),
+            Helper::Json => include_str!("runtime/json.rs"),
             Helper::BlockOn => {
-                r#"/// Runs a future to completion (the async functions here never wait on I/O).
+                r#"/// Runs a future to completion, running the timers it waits on.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
     fn noop(_: *const ()) {}
@@ -303,6 +362,9 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
     loop {
         if let Poll::Ready(v) = future.as_mut().poll(&mut cx) {
             return v;
+        }
+        if !js_run_next_timer() {
+            panic!("a promise never settled");
         }
     }
 }"#

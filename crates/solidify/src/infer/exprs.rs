@@ -3,6 +3,8 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
+#[allow(unused_imports)]
+use super::MethodInfo;
 use super::finish::{leak, same_shape_ty, substitute};
 use super::{
     Callee, EnumKind, FieldInfo, FnInfo, GLOBALS, IResult, Infer, Path, Role, Root, StructInfo,
@@ -29,7 +31,7 @@ impl<'m> Infer<'m> {
         };
         match &e.kind {
             ExprKind::Num { int, .. } => Ok(if *int {
-                self.types.int()
+                self.types.int_literal()
             } else {
                 self.types.float()
             }),
@@ -56,7 +58,12 @@ impl<'m> Infer<'m> {
             ExprKind::Tagged { .. } => self.err("tagged templates are not supported", e.span),
             ExprKind::Bool(_) => Ok(Ty::Bool),
             ExprKind::Null | ExprKind::Undefined => Ok(Ty::Null),
-            ExprKind::Regex { .. } => self.err("regular expressions are not supported", e.span),
+            ExprKind::Regex { pattern, flags } => {
+                if let Err(msg) = crate::codegen::regex_rt::JsRegex::parse(pattern, flags) {
+                    return self.err(format!("invalid regular expression: {msg}"), e.span);
+                }
+                Ok(Ty::Named("RegExp".into()))
+            }
             ExprKind::This => {
                 let Some(class) = self.ctx().this.clone() else {
                     return self.err("`this` outside a class", e.span);
@@ -79,7 +86,9 @@ impl<'m> Infer<'m> {
                 }
                 Ok(Ty::Named(class))
             }
-            ExprKind::Super => self.err("`super` is not supported", e.span),
+            ExprKind::Super => {
+                self.err("`super` is used as `super(…)` or `super.method(…)`", e.span)
+            }
             ExprKind::Ident(name) => self.ident(name, e),
             ExprKind::Array(elems) => {
                 let elem_expected = match &expected_res {
@@ -118,7 +127,15 @@ impl<'m> Infer<'m> {
                         ArrayElem::Spread(x) => {
                             let arr = Ty::Array(Box::new(item.clone()));
                             let xt = self.expr(x, Some(&arr))?;
-                            self.expect(&xt, &arr, x.span)?;
+                            // Arrays, sets, maps (pairs) and strings (characters) spread.
+                            match self.types.resolve(&xt) {
+                                Ty::Set(t) | Ty::Gen(t) => self.expect(&t, &item, x.span)?,
+                                Ty::Map(k, v, _) => {
+                                    self.expect(&Ty::Tuple(vec![*k, *v]), &item, x.span)?
+                                }
+                                Ty::Str => self.expect(&Ty::Str, &item, x.span)?,
+                                _ => self.expect(&xt, &arr, x.span)?,
+                            }
                         }
                         ArrayElem::Hole => {
                             return self.err("holes in arrays are not supported", e.span);
@@ -184,10 +201,16 @@ impl<'m> Infer<'m> {
                     Ok(inner)
                 }
                 LogicalOp::Or => {
-                    let lt = self.truthy(left)?;
+                    // `test(x) || rest`: the right side sees what `x` is when the test fails.
+                    let (_, neg) = self.condition(left)?;
+                    let lt = self.expr_ty.get(&left.id).cloned().unwrap_or(Ty::Bool);
                     match self.types.resolve(&lt) {
                         Ty::Bool => {
-                            let rt = self.truthy(right)?;
+                            let before = self.narrows.len();
+                            self.narrows.extend(neg);
+                            let rt = self.truthy(right);
+                            self.narrows.truncate(before);
+                            let rt = rt?;
                             self.expect(&rt, &Ty::Bool, right.span)?;
                             Ok(Ty::Bool)
                         }
@@ -231,14 +254,25 @@ impl<'m> Infer<'m> {
                 self.branch.pop();
                 self.narrows.truncate(before);
                 let ct = ct?;
+                // Both branches may fill a union: each is checked against it.
+                let union_expected = expected_res
+                    .as_ref()
+                    .filter(|t| self.union_of_ty(t).is_some())
+                    .cloned();
+                let alt_expected = union_expected.clone().unwrap_or_else(|| ct.clone());
                 self.narrows.extend(neg);
                 self.branch.push((test.id, 1));
-                let at = self.expr(alt, Some(&ct));
+                let at = self.expr(alt, Some(&alt_expected));
                 self.branch.pop();
                 self.narrows.truncate(before);
                 let at = at?;
                 self.mark_stored(cons);
                 self.mark_stored(alt);
+                if let Some(u) = union_expected {
+                    self.expect(&ct, &u, cons.span)?;
+                    self.expect(&at, &u, alt.span)?;
+                    return Ok(u);
+                }
                 if self.types.unify(&ct, &at).is_err() {
                     return self.err(
                         format!(
@@ -277,7 +311,16 @@ impl<'m> Infer<'m> {
                 optional,
             } => {
                 if *optional {
-                    return self.err("`?.[` is not supported", e.span);
+                    // `a?.[i]`: nothing when `a` is null.
+                    let ot = self.expr(obj, None)?;
+                    let Ty::Option(inner) = self.types.resolve(&ot) else {
+                        return self.err("`?.[` on a value that is never null", obj.span);
+                    };
+                    let t = self.index_of(&inner, index, e.span)?;
+                    return Ok(match self.types.resolve(&t) {
+                        Ty::Option(t) => Ty::Option(t),
+                        t => Ty::Option(Box::new(t)),
+                    });
                 }
                 self.index(obj, index, e.span)
             }
@@ -302,10 +345,10 @@ impl<'m> Infer<'m> {
                     other => other,
                 })
             }
-            ExprKind::TypeOf(_) => self.err(
-                "`typeof` is not supported: types are known at compile time",
-                e.span,
-            ),
+            ExprKind::TypeOf(inner) => {
+                self.expr(inner, None)?;
+                Ok(Ty::Str)
+            }
             ExprKind::Void(inner) => {
                 self.expr(inner, None)?;
                 Ok(Ty::Void)
@@ -325,7 +368,32 @@ impl<'m> Infer<'m> {
                 }
                 self.expr(inner, expected)
             }
-            ExprKind::Yield(_) => self.err("generators are not supported", e.span),
+            ExprKind::Yield { value, delegate } => {
+                let Some(t) = self.ctx().yield_ty.clone() else {
+                    return self.err("`yield` outside a generator function", e.span);
+                };
+                match (value, delegate) {
+                    (Some(v), false) => {
+                        let vt = self.expr(v, Some(&t))?;
+                        self.mark_stored(v);
+                        self.expect(&vt, &t, v.span)?;
+                    }
+                    (Some(v), true) => {
+                        let vt = self.expr(v, None)?;
+                        match self.types.resolve(&vt) {
+                            Ty::Gen(item) | Ty::Array(item) | Ty::Set(item) => {
+                                self.expect(&item, &t, v.span)?
+                            }
+                            other => {
+                                let d = self.describe(&other);
+                                return self.err(format!("`yield*` cannot go through {d}"), v.span);
+                            }
+                        }
+                    }
+                    (None, _) => return self.err("`yield` needs a value", e.span),
+                }
+                Ok(Ty::Void)
+            }
             ExprKind::Seq(items) => {
                 let mut last = Ty::Void;
                 for i in items {
@@ -351,21 +419,22 @@ impl<'m> Infer<'m> {
             let v = self.vars.get_mut(&id).expect("var");
             if v.func != Some(current) {
                 match v.role {
-                    Role::TopLevel => {
-                        if outer_fn != Some(main_id) {
-                            v.used_in_fn = true;
-                        }
-                        if current != main_id {
+                    Role::Func | Role::Class | Role::Enum => {}
+                    role => {
+                        if role == Role::TopLevel {
+                            if outer_fn != Some(main_id) {
+                                v.used_in_fn = true;
+                            }
+                            if current != main_id {
+                                v.captured = true;
+                            }
+                        } else {
                             v.captured = true;
                         }
-                    }
-                    Role::Func | Role::Class | Role::Enum => {}
-                    _ => {
-                        v.captured = true;
                         // Every function between the use and the declaration captures it.
-                        let owner = v.func;
+                        let owner = v.func.unwrap_or(main_id);
                         for ctx in self.fns.iter_mut().rev() {
-                            if Some(ctx.id) == owner {
+                            if ctx.id == owner {
                                 break;
                             }
                             if !ctx.captures.contains(&id) {
@@ -460,7 +529,10 @@ impl<'m> Infer<'m> {
             BinOp::Eq | BinOp::NotEq | BinOp::StrictEq | BinOp::StrictNotEq => {
                 let lt = self.expr(left, None)?;
                 let rt = self.expr(right, Some(&lt))?;
-                if self.types.unify(&lt, &rt).is_err() {
+                if self.types.unify(&lt, &rt).is_err()
+                    && !self.union_accepts(&lt, &rt)
+                    && !self.union_accepts(&rt, &lt)
+                {
                     let (a, b) = (self.describe(&lt), self.describe(&rt));
                     return self.err(format!("cannot compare {a} with {b}"), span);
                 }
@@ -482,7 +554,7 @@ impl<'m> Infer<'m> {
             BinOp::In => {
                 let rt = self.expr(right, None)?;
                 match self.types.resolve(&rt) {
-                    Ty::Map(k, _) => {
+                    Ty::Map(k, _, _) => {
                         let lt = self.expr(left, Some(&k))?;
                         self.expect(&lt, &k, left.span)?;
                         Ok(Ty::Bool)
@@ -490,7 +562,20 @@ impl<'m> Infer<'m> {
                     _ => self.err("`in` is only supported on a Map or a Record", span),
                 }
             }
-            BinOp::InstanceOf => self.err("`instanceof` is not supported", span),
+            BinOp::InstanceOf => {
+                // Outside a condition: decided by the types.
+                self.expr(left, None)?;
+                let ExprKind::Ident(class) = &right.kind else {
+                    return self.err("`instanceof` needs a class name", right.span);
+                };
+                if self
+                    .struct_by_name(class)
+                    .is_none_or(|s| s.kind != StructKind::Class)
+                {
+                    return self.err(format!("`{class}` is not a class"), right.span);
+                }
+                Ok(Ty::Bool)
+            }
         }
     }
 
@@ -647,8 +732,8 @@ impl<'m> Infer<'m> {
     ) -> IResult<Ty> {
         let expected = expected.filter(|t| !matches!(t, Ty::Var(_)));
         // A map literal.
-        if let Some(Ty::Map(k, v)) = expected {
-            let (k, v) = ((**k).clone(), (**v).clone());
+        if let Some(Ty::Map(k, v, record)) = expected {
+            let (k, v, record) = ((**k).clone(), (**v).clone(), *record);
             for p in props {
                 let PropValue::Expr(value) = &p.value else {
                     return self.err(
@@ -671,7 +756,7 @@ impl<'m> Infer<'m> {
                 self.mark_stored(value);
                 self.expect(&vt, &v, value.span)?;
             }
-            return Ok(Ty::Map(Box::new(k), Box::new(v)));
+            return Ok(Ty::Map(Box::new(k), Box::new(v), record));
         }
         let spread_struct = match props.iter().find_map(|p| match &p.value {
             PropValue::Spread(s) => Some(s),
@@ -688,6 +773,15 @@ impl<'m> Infer<'m> {
         };
         let struct_name = match (expected, spread_struct) {
             (Some(Ty::Named(n)), _) if self.struct_by_name(n).is_some() => n.clone(),
+            (Some(Ty::Named(n)), _) if self.union_by_name(n).is_some() => {
+                let u = self.union_by_name(n).expect("union").clone();
+                match self.union_literal_member(&u, props) {
+                    Some(member) => member,
+                    None => {
+                        return self.err(format!("this object matches no member of {n}"), e.span);
+                    }
+                }
+            }
             (_, Some(n)) => n,
             _ => return self.anonymous_object(e, props),
         };
@@ -797,6 +891,7 @@ impl<'m> Infer<'m> {
                 access: None,
                 readonly: false,
                 has_init: false,
+                literal: None,
                 span: p.span,
             });
         }
@@ -823,6 +918,8 @@ impl<'m> Infer<'m> {
             exported: false,
             span: e.span,
             statics: Vec::new(),
+            parent: None,
+            is_abstract: false,
         });
         self.literal_struct.insert(e.id, name.clone());
         Ok(Ty::Named(name))
@@ -865,6 +962,12 @@ impl<'m> Infer<'m> {
     }
 
     fn member(&mut self, e: &'m Expr, obj: &'m Expr, prop: &str, optional: bool) -> IResult<Ty> {
+        // `ns.x` for `import * as ns`: the exported name itself.
+        if let Some(file) = self.namespace_of(obj) {
+            let actual = self.namespace_member(file, prop, e.span)?;
+            self.set_ty(obj.id, Ty::Void);
+            return self.ident(&actual, e);
+        }
         // Globals: `Math.PI`, `Number.MAX_SAFE_INTEGER`.
         if let ExprKind::Ident(name) = &obj.kind
             && self.lookup(name).is_none()
@@ -904,6 +1007,8 @@ impl<'m> Infer<'m> {
         if let ExprKind::Ident(name) = &obj.kind
             && let Some(id) = self.lookup(name)
         {
+            let canonical = self.vars[&id].name.clone();
+            let name = &canonical;
             match self.vars[&id].role {
                 Role::Enum => {
                     self.refs.insert(obj.id, id);
@@ -917,11 +1022,10 @@ impl<'m> Infer<'m> {
                 Role::Class => {
                     self.refs.insert(obj.id, id);
                     self.set_ty(obj.id, Ty::Named(name.clone()));
-                    let s = self.struct_by_name(name).expect("class");
-                    if let Some((_, t, _)) = s.statics.iter().find(|(n, _, _)| n == prop) {
-                        return Ok(t.clone());
+                    if let Some((_, t)) = self.find_static(name, prop) {
+                        return Ok(t);
                     }
-                    if let Some(m) = s.method(prop, MethodKind::Get)
+                    if let Some((_, m)) = self.find_method(name, prop, MethodKind::Get)
                         && m.is_static
                     {
                         return Ok(self.funcs[&m.fn_id].sig.ret.clone());
@@ -933,6 +1037,17 @@ impl<'m> Infer<'m> {
         }
         let ot = self.expr(obj, None)?;
         let ot = self.types.resolve(&ot);
+        // `it.next().value` / `.done`: the result of a generator step is its value.
+        if let Ty::Option(_) = &ot
+            && !optional
+            && self.is_iter_result(obj)
+        {
+            return Ok(match prop {
+                "value" => ot.clone(),
+                "done" => Ty::Bool,
+                _ => return self.err(format!("a generator step has no property `{prop}`"), e.span),
+            });
+        }
         let (ot, lifted) = match (&ot, optional) {
             (Ty::Option(inner), true) => (self.types.resolve(inner), true),
             (Ty::Option(_), false) => {
@@ -967,6 +1082,26 @@ impl<'m> Infer<'m> {
                         _ => self.err(format!("Error has no property `{prop}`"), span),
                     };
                 }
+                if n == "RegExp" {
+                    return match prop {
+                        "source" | "flags" => Ok(Ty::Str),
+                        "global" | "ignoreCase" | "multiline" | "dotAll" | "sticky" | "unicode" => {
+                            Ok(Ty::Bool)
+                        }
+                        "lastIndex" => Ok(self.types.int()),
+                        _ => self.err(format!("RegExp has no property `{prop}`"), span),
+                    };
+                }
+                if n == "RegExpMatch" {
+                    return match prop {
+                        "index" | "length" => Ok(self.types.int()),
+                        "input" => Ok(Ty::Str),
+                        _ => self.err(
+                            format!("a match has no property `{prop}`: its groups are `m[i]`"),
+                            span,
+                        ),
+                    };
+                }
                 if self.is_type_param(n) {
                     return self.err(
                         format!("`{prop}` is not known on the type parameter {n}"),
@@ -977,6 +1112,18 @@ impl<'m> Infer<'m> {
                     if self.enum_by_name(n).is_some() {
                         return self.err(format!("enum values have no property `{prop}`"), span);
                     }
+                    if let Some(u) = self.union_by_name(n) {
+                        return match self.union_field(u, prop) {
+                            Some(t) => Ok(t),
+                            None => self.err(
+                                format!(
+                                    "`{prop}` is not a property of every member of {n}: test which member `{}` is first",
+                                    self.text(obj)
+                                ),
+                                span,
+                            ),
+                        };
+                    }
                     return self.err(format!("{n} has no property `{prop}`"), span);
                 };
                 if let Some(f) = s.field(prop) {
@@ -986,10 +1133,10 @@ impl<'m> Infer<'m> {
                         f.ty.clone()
                     });
                 }
-                if let Some(m) = s.method(prop, MethodKind::Get) {
+                if let Some((_, m)) = self.find_method(n, prop, MethodKind::Get) {
                     return Ok(self.funcs[&m.fn_id].sig.ret.clone());
                 }
-                if s.method(prop, MethodKind::Method).is_some() {
+                if self.find_method(n, prop, MethodKind::Method).is_some() {
                     return self.err(
                         format!(
                             "`{prop}` is a method: call it, `{}.{prop}()`",
@@ -1026,6 +1173,12 @@ impl<'m> Infer<'m> {
     fn index(&mut self, obj: &'m Expr, index: &'m Expr, span: Span) -> IResult<Ty> {
         let ot = self.expr(obj, None)?;
         let ot = self.types.resolve(&ot);
+        self.index_of(&ot, index, span)
+    }
+
+    /// The type of `obj[index]` for a value of type `ot`.
+    fn index_of(&mut self, ot: &Ty, index: &'m Expr, span: Span) -> IResult<Ty> {
+        let ot = self.types.resolve(ot);
         match &ot {
             Ty::Array(t) => {
                 let it = self.expr(index, None)?;
@@ -1049,10 +1202,16 @@ impl<'m> Infer<'m> {
                 self.expect(&it, &n, index.span)?;
                 Ok(Ty::Str)
             }
-            Ty::Map(k, v) => {
+            Ty::Map(k, v, _) => {
                 let it = self.expr(index, Some(k))?;
                 self.expect(&it, k, index.span)?;
                 Ok((**v).clone())
+            }
+            Ty::Named(n) if n == "RegExpMatch" => {
+                let it = self.expr(index, None)?;
+                let n = self.types.num(Flavor::Unknown);
+                self.expect(&it, &n, index.span)?;
+                Ok(Ty::Str)
             }
             Ty::Named(n) if self.struct_by_name(n).is_some() => {
                 let ExprKind::Str(key) = &index.kind else {
@@ -1060,15 +1219,12 @@ impl<'m> Infer<'m> {
                 };
                 self.set_ty(index.id, Ty::Str);
                 let key = key.clone();
-                self.member_of(&ot, &key, span, obj)
+                self.member_of(&ot, &key, span, index)
             }
-            Ty::Option(_) => self.err(
-                format!("`{}` may be null here: test it first", self.text(obj)),
-                obj.span,
-            ),
+            Ty::Option(_) => self.err("this value may be null here: test it first", span),
             Ty::Var(_) => {
                 let t = self.types.fresh();
-                self.unify(&ot, &Ty::Array(Box::new(t.clone())), obj.span)?;
+                self.unify(&ot, &Ty::Array(Box::new(t.clone())), span)?;
                 let it = self.expr(index, None)?;
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&it, &n, index.span)?;
@@ -1089,11 +1245,20 @@ impl<'m> Infer<'m> {
             if self.vars[&id].role != Role::Class {
                 return self.err(format!("`{name}` is not a class"), callee.span);
             }
+            // The class may be imported under another name.
+            let canonical = self.vars[&id].name.clone();
+            let name = &canonical;
             self.refs.insert(callee.id, id);
             self.set_ty(callee.id, Ty::Named(name.clone()));
             let s = self.struct_by_name(name).expect("class");
-            match s.ctor {
-                Some(ctor) => {
+            if s.is_abstract {
+                return self.err(
+                    format!("{name} is abstract: `new` one of its subclasses"),
+                    e.span,
+                );
+            }
+            match self.nearest_ctor(name) {
+                Some((_, ctor)) => {
                     let info = self.funcs[&ctor].clone();
                     self.args(args, &info, ctor, e.span)?;
                     let caller = self.ctx().id;
@@ -1132,7 +1297,7 @@ impl<'m> Infer<'m> {
                     self.expect(&t, &entries, a.expr.span)?;
                 }
                 self.calls.insert(e.id, Callee::Builtin("new Map"));
-                Ok(Ty::Map(Box::new(k), Box::new(v)))
+                Ok(Ty::Map(Box::new(k), Box::new(v), false))
             }
             "Set" => {
                 let t = self.types.fresh();
@@ -1155,11 +1320,67 @@ impl<'m> Infer<'m> {
                 Ok(Ty::Array(Box::new(t)))
             }
             "Date" => self.err("`Date` is not supported", e.span),
-            "Promise" => self.err(
-                "`new Promise` is not supported: use `async` functions",
-                e.span,
-            ),
-            "RegExp" => self.err("regular expressions are not supported", e.span),
+            "Promise" => {
+                // `new Promise((resolve, reject) => …)`, awaited where it is made.
+                let ExprKind::New { type_args, .. } = &e.kind else {
+                    unreachable!()
+                };
+                let value = match type_args.first() {
+                    Some(t) => self.ann(t, "")?,
+                    None => self.types.fresh(),
+                };
+                let resolve = Ty::Func(Rc::new(FuncTy {
+                    params: vec![value.clone()],
+                    ret: Ty::Void,
+                }));
+                let reject = Ty::Func(Rc::new(FuncTy {
+                    params: vec![Ty::Named("Error".into())],
+                    ret: Ty::Void,
+                }));
+                let executor = Ty::Func(Rc::new(FuncTy {
+                    params: vec![resolve, reject],
+                    ret: Ty::Void,
+                }));
+                let Some(a) = args.first() else {
+                    return self.err("`new Promise` needs an executor function", e.span);
+                };
+                let t = self.expr(&a.expr, Some(&executor))?;
+                self.expect(&t, &executor, a.expr.span)?;
+                let id = self.ctx().id;
+                let is_async = self.funcs.get(&id).is_some_and(|f| f.is_async);
+                if !is_async && id != self.main_id {
+                    return self.err(
+                        "`new Promise` must be made in an async function (it is awaited there)",
+                        e.span,
+                    );
+                }
+                if id == self.main_id {
+                    self.funcs.get_mut(&id).expect("main").is_async = true;
+                }
+                self.calls.insert(e.id, Callee::Builtin("new Promise"));
+                Ok(value)
+            }
+            "RegExp" => {
+                self.arg_typed(args, 0, Some(Ty::Str), "RegExp", e.span)?;
+                if args.len() > 1 {
+                    self.arg_typed(args, 1, Some(Ty::Str), "RegExp", e.span)?;
+                }
+                if let (Some(ExprKind::Str(p)), f) = (
+                    args.first().map(|a| &a.expr.kind),
+                    args.get(1).map(|a| &a.expr.kind),
+                ) {
+                    let flags = match f {
+                        None => String::new(),
+                        Some(ExprKind::Str(f)) => f.clone(),
+                        Some(_) => String::new(),
+                    };
+                    if let Err(msg) = crate::codegen::regex_rt::JsRegex::parse(p, &flags) {
+                        return self.err(format!("invalid regular expression: {msg}"), e.span);
+                    }
+                }
+                self.calls.insert(e.id, Callee::Builtin("new RegExp"));
+                Ok(Ty::Named("RegExp".into()))
+            }
             _ => self.err(format!("unknown class `{name}`"), callee.span),
         }
     }
@@ -1237,57 +1458,17 @@ impl<'m> Infer<'m> {
             self.calls_in_try.insert(e.id);
         }
         match &callee.kind {
-            ExprKind::Ident(name) => {
-                if let Some(id) = self.lookup(name) {
-                    self.refs.insert(callee.id, id);
-                    self.record_use(id, callee.id);
-                    let v = self.vars[&id].clone();
-                    match v.role {
-                        Role::Func => {
-                            let fn_id = self.fn_bindings[&id];
-                            let info = self.funcs[&fn_id].clone();
-                            self.set_ty(callee.id, Ty::Func(Rc::new(info.sig.clone())));
-                            self.args(args, &info, fn_id, e.span)?;
-                            self.calls.insert(e.id, Callee::Fn(id));
-                            let caller = self.ctx().id;
-                            self.funcs
-                                .get_mut(&caller)
-                                .expect("fn")
-                                .calls
-                                .push((fn_id, e.id));
-                            if !info.type_params.is_empty() {
-                                return self.instantiate_ret(&info, args);
-                            }
-                            return Ok(info.sig.ret.clone());
-                        }
-                        Role::Class => {
-                            return self.err(
-                                format!("`{name}` is a class: use `new {name}(…)`"),
-                                callee.span,
-                            );
-                        }
-                        _ => {
-                            let ft = self.types.resolve(&v.ty);
-                            let Ty::Func(f) = ft else {
-                                if let Ty::Var(_) = ft {
-                                    return self.err(
-                                        format!("the type of `{name}` is not known yet"),
-                                        callee.span,
-                                    );
-                                }
-                                let d = self.describe(&ft);
-                                return self
-                                    .err(format!("`{name}` is {d}, not a function"), callee.span);
-                            };
-                            self.set_ty(callee.id, Ty::Func(f.clone()));
-                            self.dynamic_args(args, &f, e.span)?;
-                            self.calls.insert(e.id, Callee::Closure(id));
-                            return Ok(f.ret.clone());
-                        }
-                    }
-                }
-                self.global_call(e, name, args, callee.span)
+            ExprKind::Super => self.super_call(e, args),
+            ExprKind::Member { obj, prop, .. } if matches!(obj.kind, ExprKind::Super) => {
+                self.super_method_call(e, prop, args)
             }
+            ExprKind::Member { obj, prop, .. } if self.namespace_of(obj).is_some() => {
+                let file = self.namespace_of(obj).expect("namespace");
+                let actual = self.namespace_member(file, prop, callee.span)?;
+                self.set_ty(obj.id, Ty::Void);
+                self.named_call(e, callee, &actual, args)
+            }
+            ExprKind::Ident(name) => self.named_call(e, callee, name, args),
             ExprKind::Member {
                 obj,
                 prop,
@@ -1312,6 +1493,85 @@ impl<'m> Infer<'m> {
                 Ok(f.ret.clone())
             }
         }
+    }
+
+    /// `super(args)`: the constructor of the base class runs first.
+    fn super_call(&mut self, e: &'m Expr, args: &'m [Arg]) -> IResult<Ty> {
+        let Some(class) = self.ctx().this.clone() else {
+            return self.err("`super(…)` outside a class", e.span);
+        };
+        if !self.ctx().in_ctor {
+            return self.err("`super(…)` belongs in the constructor", e.span);
+        }
+        let Some(parent) = self.struct_by_name(&class).and_then(|s| s.parent.clone()) else {
+            return self.err(format!("{class} has no base class"), e.span);
+        };
+        match self.nearest_ctor(&parent) {
+            Some((owner, ctor)) => {
+                let info = self.funcs[&ctor].clone();
+                self.args(args, &info, ctor, e.span)?;
+                let caller = self.ctx().id;
+                self.funcs
+                    .get_mut(&caller)
+                    .expect("fn")
+                    .calls
+                    .push((ctor, e.id));
+                self.calls.insert(e.id, Callee::SuperCtor(owner));
+            }
+            None => {
+                if !args.is_empty() {
+                    return self.err(
+                        format!("{parent} has no constructor: `super()` takes no arguments"),
+                        e.span,
+                    );
+                }
+                self.calls.insert(e.id, Callee::SuperCtor(parent));
+            }
+        }
+        Ok(Ty::Void)
+    }
+
+    /// `super.m(args)`: the base class's version of a method.
+    fn super_method_call(&mut self, e: &'m Expr, prop: &str, args: &'m [Arg]) -> IResult<Ty> {
+        let Some(class) = self.ctx().this.clone() else {
+            return self.err("`super` outside a class", e.span);
+        };
+        let Some(parent) = self.struct_by_name(&class).and_then(|s| s.parent.clone()) else {
+            return self.err(format!("{class} has no base class"), e.span);
+        };
+        let Some((owner, m)) = self.find_method(&parent, prop, MethodKind::Method) else {
+            return self.err(
+                format!("no method `{prop}` in the base classes of {class}"),
+                e.span,
+            );
+        };
+        if m.is_abstract {
+            return self.err(
+                format!("`{prop}` is abstract in {owner}: nothing to call"),
+                e.span,
+            );
+        }
+        let info = self.funcs[&m.fn_id].clone();
+        self.args(args, &info, m.fn_id, e.span)?;
+        let caller = self.ctx().this_fn;
+        if !self.ctx().in_ctor {
+            self.this_calls.push((m.fn_id, caller));
+        }
+        let caller = self.ctx().id;
+        self.funcs
+            .get_mut(&caller)
+            .expect("fn")
+            .calls
+            .push((m.fn_id, e.id));
+        self.calls.insert(
+            e.id,
+            Callee::SuperMethod {
+                class: owner,
+                name: prop.to_string(),
+                fn_id: m.fn_id,
+            },
+        );
+        Ok(info.sig.ret.clone())
     }
 
     fn instantiate_ret(&mut self, info: &FnInfo, args: &'m [Arg]) -> IResult<Ty> {
@@ -1348,14 +1608,7 @@ impl<'m> Infer<'m> {
     /// `parseInt(…)`, `String(…)`…
     fn global_call(&mut self, e: &'m Expr, name: &str, args: &'m [Arg], span: Span) -> IResult<Ty> {
         let ty = match name {
-            "parseInt" => {
-                self.arg_typed(args, 0, Some(Ty::Str), name, span)?;
-                if args.len() > 1 {
-                    let i = self.types.int();
-                    self.arg_typed(args, 1, Some(i), name, span)?;
-                }
-                self.types.int()
-            }
+            "parseInt" => self.parse_int_call(args, name, span)?,
             "parseFloat" => {
                 self.arg_typed(args, 0, Some(Ty::Str), name, span)?;
                 self.types.float()
@@ -1383,8 +1636,7 @@ impl<'m> Infer<'m> {
                 Ty::Bool
             }
             "isNaN" | "isFinite" => {
-                let f = self.types.num(Flavor::Unknown);
-                self.arg_typed(args, 0, Some(f), name, span)?;
+                self.nan_test_arg(args, name, span)?;
                 Ty::Bool
             }
             "structuredClone" => self.arg_typed(args, 0, None, name, span)?,
@@ -1394,7 +1646,47 @@ impl<'m> Infer<'m> {
                     span,
                 );
             }
-            "setTimeout" | "setInterval" => return self.err("timers are not supported", span),
+            "setTimeout" | "setInterval" => {
+                // The callback runs later, on its own: it keeps what it uses.
+                let callback = Ty::Func(Rc::new(FuncTy {
+                    params: Vec::new(),
+                    ret: Ty::Void,
+                }));
+                let Some(cb) = args.first() else {
+                    return self.err(format!("`{name}` needs a callback"), span);
+                };
+                let ct = self.expr(&cb.expr, Some(&callback))?;
+                let Ty::Func(f) = self.types.resolve(&ct) else {
+                    let d = self.describe(&ct);
+                    return self.err(
+                        format!("`{name}` needs a function, found {d}"),
+                        cb.expr.span,
+                    );
+                };
+                if f.params
+                    .iter()
+                    .any(|p| !matches!(self.types.resolve(p), Ty::Void | Ty::Var(_)))
+                {
+                    return self.err(
+                        format!("the callback of `{name}` takes no argument"),
+                        cb.expr.span,
+                    );
+                }
+                self.mark_stored(&cb.expr);
+                if args.len() > 1 {
+                    let n = self.types.num(Flavor::Unknown);
+                    self.arg_typed(args, 1, Some(n), name, span)?;
+                }
+                self.no_more_than(args, 2, name, span)?;
+                self.uses_timers = true;
+                self.types.int()
+            }
+            "clearTimeout" | "clearInterval" => {
+                let n = self.types.num(Flavor::Unknown);
+                self.arg_typed(args, 0, Some(n), name, span)?;
+                self.uses_timers = true;
+                Ty::Void
+            }
             "alert" | "prompt" | "confirm" => {
                 return self.err("browser dialogs are not supported", span);
             }
@@ -1403,6 +1695,43 @@ impl<'m> Infer<'m> {
         self.calls
             .insert(e.id, Callee::Builtin(leak(format!("global.{name}"))));
         Ok(ty)
+    }
+
+    /// `parseInt(s)` is `Option<i64>` (`NaN` is `None`); `parseInt(n)` truncates a number.
+    pub(super) fn parse_int_call(
+        &mut self,
+        args: &'m [Arg],
+        name: &str,
+        span: Span,
+    ) -> IResult<Ty> {
+        let t = self.arg_typed(args, 0, None, name, span)?;
+        if args.len() > 1 {
+            let i = self.types.int();
+            self.arg_typed(args, 1, Some(i), name, span)?;
+        }
+        Ok(match self.types.resolve(&t) {
+            Ty::Num(_) => self.types.int(),
+            other => {
+                self.expect(&other, &Ty::Str, args[0].expr.span)?;
+                Ty::Option(Box::new(self.types.int()))
+            }
+        })
+    }
+
+    /// The argument of `isNaN` / `isFinite`: a number, or the `Option` of `parseInt`.
+    pub(super) fn nan_test_arg(&mut self, args: &'m [Arg], name: &str, span: Span) -> IResult<Ty> {
+        let t = self.arg_typed(args, 0, None, name, span)?;
+        match self.types.resolve(&t) {
+            Ty::Option(inner) => {
+                let n = self.types.num(Flavor::Unknown);
+                self.expect(&inner, &n, args[0].expr.span)?;
+            }
+            other => {
+                let n = self.types.num(Flavor::Unknown);
+                self.expect(&other, &n, args[0].expr.span)?;
+            }
+        }
+        Ok(t)
     }
 
     /// Argument `i` of a builtin call, typed.
@@ -1427,6 +1756,64 @@ impl<'m> Infer<'m> {
         Ok(t)
     }
 
+    /// A call to a name: a function, a closure variable, a class used as a function…
+    fn named_call(
+        &mut self,
+        e: &'m Expr,
+        callee: &'m Expr,
+        name: &str,
+        args: &'m [Arg],
+    ) -> IResult<Ty> {
+        if let Some(id) = self.lookup(name) {
+            self.refs.insert(callee.id, id);
+            self.record_use(id, callee.id);
+            let v = self.vars[&id].clone();
+            match v.role {
+                Role::Func => {
+                    let fn_id = self.fn_bindings[&id];
+                    let info = self.funcs[&fn_id].clone();
+                    self.set_ty(callee.id, Ty::Func(Rc::new(info.sig.clone())));
+                    self.args(args, &info, fn_id, e.span)?;
+                    self.calls.insert(e.id, Callee::Fn(id));
+                    let caller = self.ctx().id;
+                    self.funcs
+                        .get_mut(&caller)
+                        .expect("fn")
+                        .calls
+                        .push((fn_id, e.id));
+                    if !info.type_params.is_empty() {
+                        return self.instantiate_ret(&info, args);
+                    }
+                    return Ok(info.sig.ret.clone());
+                }
+                Role::Class => {
+                    return self.err(
+                        format!("`{name}` is a class: use `new {name}(…)`"),
+                        callee.span,
+                    );
+                }
+                _ => {
+                    let ft = self.types.resolve(&v.ty);
+                    let Ty::Func(f) = ft else {
+                        if let Ty::Var(_) = ft {
+                            return self.err(
+                                format!("the type of `{name}` is not known yet"),
+                                callee.span,
+                            );
+                        }
+                        let d = self.describe(&ft);
+                        return self.err(format!("`{name}` is {d}, not a function"), callee.span);
+                    };
+                    self.set_ty(callee.id, Ty::Func(f.clone()));
+                    self.dynamic_args(args, &f, e.span)?;
+                    self.calls.insert(e.id, Callee::Closure(id));
+                    return Ok(f.ret.clone());
+                }
+            }
+        }
+        self.global_call(e, name, args, callee.span)
+    }
+
     fn method_call(
         &mut self,
         e: &'m Expr,
@@ -1448,13 +1835,17 @@ impl<'m> Infer<'m> {
             && let Some(id) = self.lookup(name)
             && self.vars[&id].role == Role::Class
         {
+            let canonical = self.vars[&id].name.clone();
+            let name = &canonical;
             self.refs.insert(obj.id, id);
             self.set_ty(obj.id, Ty::Named(name.clone()));
-            let s = self.struct_by_name(name).expect("class");
-            let Some(m) = s.method(prop, MethodKind::Method).filter(|m| m.is_static) else {
+            let Some((owner, m)) = self
+                .find_method(name, prop, MethodKind::Method)
+                .filter(|(_, m)| m.is_static)
+            else {
                 return self.err(format!("{name} has no static method `{prop}`"), e.span);
             };
-            let (fn_id, class) = (m.fn_id, name.clone());
+            let (fn_id, class) = (m.fn_id, owner);
             let info = self.funcs[&fn_id].clone();
             self.args(args, &info, fn_id, e.span)?;
             self.calls.insert(
@@ -1477,8 +1868,22 @@ impl<'m> Infer<'m> {
         let ot = self.expr(obj, None)?;
         let ot = self.types.resolve(&ot);
         match &ot {
-            Ty::Named(n) if n != "Error" && !self.is_type_param(n) => {
+            Ty::Named(n)
+                if n != "Error"
+                    && n != "RegExp"
+                    && n != "RegExpMatch"
+                    && !self.is_type_param(n) =>
+            {
                 let Some(s) = self.struct_by_name(n) else {
+                    if self.union_by_name(n).is_some() {
+                        return self.err(
+                            format!(
+                                "`{}` is a {n}: test which member it is before calling `{prop}`",
+                                self.text(obj)
+                            ),
+                            obj.span,
+                        );
+                    }
                     return self.err(format!("{n} has no method `{prop}`"), e.span);
                 };
                 if let Some(f) = s.field(prop) {
@@ -1491,7 +1896,7 @@ impl<'m> Infer<'m> {
                     self.calls.insert(e.id, Callee::Dynamic);
                     return Ok(fun.ret.clone());
                 }
-                let Some(m) = s.method(prop, MethodKind::Method) else {
+                let Some((_, m)) = self.find_method(n, prop, MethodKind::Method) else {
                     return self.err(format!("{n} has no method `{prop}`"), e.span);
                 };
                 if m.is_static {
@@ -1537,17 +1942,86 @@ impl<'m> Infer<'m> {
                 ),
                 obj.span,
             ),
-            Ty::Var(_) => self.err(
-                format!(
-                    "the type of `{}` is not known yet: add an annotation",
-                    self.text(obj)
-                ),
-                obj.span,
-            ),
+            Ty::Var(_) => {
+                // A method that only strings or only arrays have decides the type.
+                let guessed = if STRING_METHODS.contains(&prop) {
+                    Some(Ty::Str)
+                } else if ARRAY_METHODS.contains(&prop) {
+                    Some(Ty::Array(Box::new(self.types.fresh())))
+                } else {
+                    None
+                };
+                let Some(guess) = guessed else {
+                    return self.err(
+                        format!(
+                            "the type of `{}` is not known yet: add an annotation",
+                            self.text(obj)
+                        ),
+                        obj.span,
+                    );
+                };
+                self.unify(&ot, &guess, obj.span)?;
+                let ot = self.types.resolve(&guess);
+                self.builtin_method(e, obj, &ot, prop, args)
+            }
             _ => self.builtin_method(e, obj, &ot, prop, args),
         }
     }
 }
+
+/// Methods only strings have: calling one on a value of unknown type makes it a string.
+const STRING_METHODS: &[&str] = &[
+    "toUpperCase",
+    "toLowerCase",
+    "trim",
+    "trimStart",
+    "trimEnd",
+    "charAt",
+    "charCodeAt",
+    "codePointAt",
+    "startsWith",
+    "endsWith",
+    "substring",
+    "substr",
+    "padStart",
+    "padEnd",
+    "repeat",
+    "split",
+    "replace",
+    "replaceAll",
+    "localeCompare",
+    "match",
+    "matchAll",
+    "search",
+];
+
+/// Methods only arrays have.
+const ARRAY_METHODS: &[&str] = &[
+    "push",
+    "pop",
+    "shift",
+    "unshift",
+    "map",
+    "filter",
+    "forEach",
+    "reduce",
+    "reduceRight",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "some",
+    "every",
+    "join",
+    "splice",
+    "reverse",
+    "sort",
+    "fill",
+    "flat",
+    "flatMap",
+    "toSorted",
+    "toReversed",
+];
 
 /// `users` → `user`, `entries` → `entry`.
 fn singular(hint: &str) -> String {

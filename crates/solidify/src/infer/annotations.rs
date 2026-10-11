@@ -11,6 +11,47 @@ use crate::error::Span;
 use crate::infer::pascal;
 use crate::types::{Flavor, FuncTy, Ty};
 
+/// The field of inline object types that holds a different string literal in each: the
+/// discriminant of a union written in place.
+fn inline_discriminant(members: &[&TypeAnn]) -> Option<String> {
+    let objects: Vec<&Vec<TypeMember>> = members
+        .iter()
+        .filter_map(|m| match m {
+            TypeAnn::Object(props, _) => Some(props),
+            _ => None,
+        })
+        .collect();
+    if objects.len() < 2 {
+        return None;
+    }
+    let first = objects[0];
+    for m in first {
+        let TypeMember::Prop {
+            name,
+            ty: TypeAnn::Lit(Lit::Str(_), _),
+            ..
+        } = m
+        else {
+            continue;
+        };
+        let mut tags = HashSet::new();
+        let all = objects.iter().all(|props| {
+            props.iter().any(|p| match p {
+                TypeMember::Prop {
+                    name: n,
+                    ty: TypeAnn::Lit(Lit::Str(s), _),
+                    ..
+                } if n == name => tags.insert(s.clone()),
+                _ => false,
+            })
+        });
+        if all && tags.len() == objects.len() {
+            return Some(name.clone());
+        }
+    }
+    None
+}
+
 impl<'m> Infer<'m> {
     /// The type an annotation denotes. `hint` names the structs made for inline object types.
     pub(super) fn ann(&mut self, ann: &TypeAnn, hint: &str) -> IResult<Ty> {
@@ -47,7 +88,7 @@ impl<'m> Infer<'m> {
                 for p in params {
                     let mut t = match &p.ty {
                         Some(t) => self.ann(t, hint)?,
-                        None => Ty::Any,
+                        None => self.types.fresh(),
                     };
                     if p.optional {
                         t = Ty::Option(Box::new(t));
@@ -58,9 +99,9 @@ impl<'m> Infer<'m> {
                 Ok(Ty::Func(Rc::new(FuncTy { params: ps, ret })))
             }
             TypeAnn::Lit(lit, span) => match lit {
-                Lit::Str(s) => {
-                    let span = *span;
-                    self.union_ann(&[TypeAnn::Lit(Lit::Str(s.clone()), span)], span, hint)
+                Lit::Str(_) => {
+                    let _ = span;
+                    Ok(Ty::Str)
                 }
                 Lit::Num(v) => Ok(if v.fract() == 0.0 {
                     self.types.int()
@@ -91,12 +132,16 @@ impl<'m> Infer<'m> {
             "boolean" => Ty::Bool,
             "void" | "undefined" => Ty::Void,
             "null" => Ty::Null,
-            "any" | "unknown" | "object" | "const" => Ty::Any,
+            // `any` and `unknown` are inferred from their uses, like a missing annotation.
+            "any" | "unknown" | "object" => self.types.fresh(),
+            "const" => Ty::Any,
             "never" => Ty::Never,
             "bigint" => return self.err("bigint is not supported", span),
             "symbol" => return self.err("symbols are not supported", span),
             "Array" | "ReadonlyArray" => Ty::Array(Box::new(arg(self, 0)?)),
-            "Map" | "ReadonlyMap" => Ty::Map(Box::new(arg(self, 0)?), Box::new(arg(self, 1)?)),
+            "Map" | "ReadonlyMap" => {
+                Ty::Map(Box::new(arg(self, 0)?), Box::new(arg(self, 1)?), false)
+            }
             "Set" | "ReadonlySet" => Ty::Set(Box::new(arg(self, 0)?)),
             "Record" => {
                 let k = arg(self, 0)?;
@@ -106,16 +151,20 @@ impl<'m> Infer<'m> {
                 {
                     return self.err("Record keys must be strings, numbers or an enum", span);
                 }
-                Ty::Map(Box::new(k), Box::new(v))
+                Ty::Map(Box::new(k), Box::new(v), true)
             }
             "Promise" => arg(self, 0)?,
+            "Generator" | "Iterable" | "IterableIterator" | "Iterator" => {
+                Ty::Gen(Box::new(arg(self, 0)?))
+            }
             "Partial" | "Required" | "Readonly" | "NonNullable" | "Awaited" => arg(self, 0)?,
             "Error" => Ty::Named("Error".into()),
             "Function" => {
                 return self.err("`Function` is too vague: write `(x: T) => U`", span);
             }
             "Date" => return self.err("`Date` is not supported", span),
-            "RegExp" => return self.err("regular expressions are not supported", span),
+            "RegExp" => Ty::Named("RegExp".into()),
+            "RegExpMatchArray" | "RegExpExecArray" => Ty::Named("RegExpMatch".into()),
             "this" => match self.this_class_stack.last() {
                 Some(c) => Ty::Named(c.clone()),
                 None => return self.err("`this` type outside a class", span),
@@ -181,17 +230,27 @@ impl<'m> Infer<'m> {
         {
             Ty::Bool
         } else {
-            let first = self.ann(rest[0], hint)?;
-            for t in &rest[1..] {
-                let other = self.ann(t, hint)?;
-                if self.types.unify(&first, &other).is_err() {
-                    return self.err(
-                        "unions of different types are not supported: only `T | null`, unions of string literals and the same type repeated",
-                        span,
-                    );
-                }
+            // Different types: an enum with one variant per member.
+            let mut members = Vec::new();
+            let discriminant = inline_discriminant(&rest);
+            for t in &rest {
+                let member_hint = match (t, &discriminant) {
+                    (TypeAnn::Object(props, _), Some(d)) => props
+                        .iter()
+                        .find_map(|m| match m {
+                            TypeMember::Prop {
+                                name,
+                                ty: TypeAnn::Lit(Lit::Str(s), _),
+                                ..
+                            } if name == d => Some(s.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| hint.to_string()),
+                    _ => hint.to_string(),
+                };
+                members.push(self.ann(t, &member_hint)?);
             }
-            first
+            self.union_of(members, span)?
         };
         Ok(if nullable {
             match inner {
@@ -207,6 +266,12 @@ impl<'m> Infer<'m> {
     /// A fresh type name made from a hint (`user profile` → `UserProfile`).
     pub(super) fn synth_name(&mut self, hint: &str) -> String {
         let base = pascal(hint);
+        self.synth_name_exact(&base)
+    }
+
+    /// A fresh type name from a Rust name.
+    pub(super) fn synth_name_exact(&mut self, hint: &str) -> String {
+        let base = hint.to_string();
         let base = if base.is_empty() {
             "Object".to_string()
         } else {
@@ -276,6 +341,8 @@ impl<'m> Infer<'m> {
             exported,
             span,
             statics: Vec::new(),
+            parent: None,
+            is_abstract: false,
         });
         let fields = self.fields_from_members(name, members)?;
         self.struct_mut(name).expect("struct").fields = fields;
@@ -302,6 +369,10 @@ impl<'m> Infer<'m> {
                         (Ty::Option(inner), true) => (*inner, true),
                         (_, o) => (fty, o),
                     };
+                    let literal = match ty {
+                        TypeAnn::Lit(Lit::Str(s), _) => Some(s.clone()),
+                        _ => None,
+                    };
                     fields.push(FieldInfo {
                         name: name.clone(),
                         ty: fty,
@@ -309,6 +380,7 @@ impl<'m> Infer<'m> {
                         access: None,
                         readonly: *readonly,
                         has_init: false,
+                        literal,
                         span: *span,
                     });
                 }

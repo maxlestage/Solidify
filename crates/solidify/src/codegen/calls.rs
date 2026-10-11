@@ -47,6 +47,10 @@ impl<'a> Gen<'a> {
                             list.push("None".into());
                             continue;
                         }
+                        if matches!(self.resolve(&f.params[i]), Ty::Void) {
+                            list.push("()".into());
+                            continue;
+                        }
                         let Some(d) = ast.params.get(i).and_then(|p| p.default.as_ref()) else {
                             return self.err("missing argument", e.span);
                         };
@@ -76,7 +80,11 @@ impl<'a> Gen<'a> {
                     let ExprKind::Member { obj, .. } = &callee.kind else {
                         unreachable!()
                     };
-                    let o = self.expr(obj)?;
+                    let o = if info.mutates_self {
+                        self.expr_mut_root(obj)?
+                    } else {
+                        self.expr(obj)?
+                    };
                     let base = if info.mutates_self && o.repr == Repr::Ref {
                         return self.err(
                             format!("`{name}` changes the object, but it is only borrowed here"),
@@ -90,6 +98,24 @@ impl<'a> Gen<'a> {
                 self.finish_call(code, &info, e)
             }
             Callee::Ctor(_) => unreachable!("constructors go through new"),
+            Callee::SuperCtor(_) => self.err(
+                "`super(…)` must be the first statement of the constructor",
+                e.span,
+            ),
+            Callee::SuperMethod { class, name, fn_id } => {
+                // The base class's version, written into this class as `base_method`.
+                let info = self.p.funcs[&fn_id].clone();
+                let list = self.user_args(&info, args, e.span)?;
+                let helper = format!("{}_{}", snake(&class), snake(&name));
+                if let Some(current) = self.current_class.clone() {
+                    self.super_helpers
+                        .entry(current)
+                        .or_default()
+                        .insert((class.clone(), name.clone()));
+                }
+                let code = format!("self.{helper}({list})");
+                self.finish_call(code, &info, e)
+            }
             Callee::Builtin(name) => {
                 let ExprKind::Member { obj, .. } = &callee.kind else {
                     return self.global_call(e, name, args);
@@ -101,7 +127,9 @@ impl<'a> Gen<'a> {
                 let receiver_kind = name.split('.').next().unwrap_or("");
                 match receiver_kind {
                     "console" | "Math" | "Number" | "String" | "Object" | "Array" | "Date"
-                    | "performance" | "process" => self.namespace_call(e, name, args),
+                    | "performance" | "process" | "Promise" | "JSON" => {
+                        self.namespace_call(e, name, args)
+                    }
                     _ => self.method_builtin(e, obj, name, args),
                 }
             }
@@ -169,17 +197,36 @@ impl<'a> Gen<'a> {
             match args.get(i) {
                 Some(a) => {
                     let at = self.ty_of(&a.expr);
-                    let x = self.expr(&a.expr)?;
+                    let x = if mode == Mode::RefMut {
+                        self.expr_mut_root(&a.expr)?
+                    } else {
+                        self.expr(&a.expr)?
+                    };
+                    // A member passed where a union is borrowed: the variant, borrowed.
+                    if mode != Mode::Value
+                        && mode != Mode::FnImpl
+                        && self.union_variant(&at, pt).is_some()
+                    {
+                        let target = match self.resolve(pt) {
+                            Ty::Option(inner) => *inner,
+                            other => other,
+                        };
+                        let wrapped = self.owned_as(x, &at, &target);
+                        list.push(match mode {
+                            Mode::RefMut => format!("&mut {wrapped}"),
+                            Mode::OptRef => format!("Some(&{wrapped})"),
+                            _ => format!("&{wrapped}"),
+                        });
+                        continue;
+                    }
                     let code = match mode {
                         Mode::Value => {
                             let generic = matches!(self.resolve(pt), Ty::Named(ref n) if info.type_params.contains(n));
-                            if optional {
-                                self.owned_as(x, &at, pt)
-                            } else if generic && x.repr == Repr::Str {
+                            if generic && x.repr == Repr::Str {
                                 // A string literal for a type parameter: `&str` does.
                                 x.code
                             } else {
-                                self.owned(x, &at)
+                                self.owned_as(x, &at, pt)
                             }
                         }
                         Mode::FnImpl => {
@@ -196,7 +243,7 @@ impl<'a> Gen<'a> {
                         Mode::Slice => self.coerce(x, &at, Want::Slice),
                         Mode::OptRef => {
                             if matches!(self.resolve(&at), Ty::Option(_)) {
-                                let deref = matches!(self.resolve(pt), Ty::Option(ref i) if self.is_str(i) || self.is_boxed(i));
+                                let deref = matches!(self.resolve(pt), Ty::Option(ref i) if self.is_str(i) || self.is_boxed(i) || self.dyn_name(i).is_some());
                                 match x.repr {
                                     Repr::Owned if self.opt_ref_param_e(&x) => x.code,
                                     _ => format!(
@@ -276,16 +323,58 @@ impl<'a> Gen<'a> {
     ) -> GResult<E> {
         match self.p.calls.get(&e.id).cloned() {
             Some(Callee::Ctor(class)) => {
-                let info = self.p.struct_info(&class).expect("class").clone();
                 let name = pascal(&class);
-                match info.ctor {
+                let ctor = self
+                    .p
+                    .ancestry(&class)
+                    .iter()
+                    .find_map(|c| self.p.struct_info(c).and_then(|s| s.ctor));
+                let built = match ctor {
                     Some(ctor) => {
                         let f = self.p.funcs[&ctor].clone();
                         let list = self.user_args(&f, args, e.span)?;
-                        self.finish_call(format!("{name}::new({list})"), &f, e)
+                        self.finish_call(format!("{name}::new({list})"), &f, e)?
                     }
-                    None => Ok(E::owned(format!("{name}::new()"), PREC_POSTFIX)),
+                    None => E::owned(format!("{name}::new()"), PREC_POSTFIX),
+                };
+                // A class held dynamically: every value of it is boxed.
+                if self.p.is_dyn(&class) {
+                    return Ok(E::owned(
+                        format!("Box::new({}) as Box<dyn {name}Like>", built.code),
+                        PREC_CAST,
+                    ));
                 }
+                Ok(built)
+            }
+            Some(Callee::Builtin("new Promise")) => {
+                let promise = self.helper(Helper::Promise);
+                self.helper(Helper::BlockOn);
+                let (ExprKind::Arrow(f) | ExprKind::Func(f)) = &args[0].expr.kind else {
+                    return self.err(
+                        "`new Promise` needs an inline executor function",
+                        args[0].expr.span,
+                    );
+                };
+                let c = self.closure(f, &[Repr::Owned, Repr::Owned], false)?;
+                // The executor always gets `resolve` and `reject`.
+                let code = match f.params.len() {
+                    0 => c.code.replacen("||", "|_, _|", 1),
+                    1 => c.code.replacen("| ", ", _| ", 1),
+                    _ => c.code,
+                };
+                Ok(E::owned(
+                    format!("{promise}::new({code}).await"),
+                    PREC_POSTFIX,
+                ))
+            }
+            Some(Callee::Builtin("new RegExp")) => {
+                let h = self.helper(Helper::Regex);
+                let p = self.expr_as(&args[0].expr, Want::StrRef)?;
+                let f = match args.get(1) {
+                    Some(a) => self.expr_as(&a.expr, Want::StrRef)?,
+                    None => "\"\"".into(),
+                };
+                Ok(E::owned(format!("{h}::new({p}, {f})"), PREC_POSTFIX))
             }
             Some(Callee::Builtin("new Error")) => match args.first() {
                 Some(a) => {
@@ -295,29 +384,29 @@ impl<'a> Gen<'a> {
                 None => Ok(E::owned("String::new()", PREC_POSTFIX)),
             },
             Some(Callee::Builtin("new Map")) => {
-                self.uses_hashmap = true;
+                let name = self.map_name();
                 match args.first() {
                     Some(a) => {
                         let v = self.expr_as(&a.expr, Want::Owned)?;
                         Ok(E::owned(
-                            format!("{v}.into_iter().collect::<HashMap<_, _>>()"),
+                            format!("{v}.into_iter().collect::<{name}<_, _>>()"),
                             PREC_POSTFIX,
                         ))
                     }
-                    None => Ok(E::atom("HashMap::new()", Repr::Owned)),
+                    None => Ok(E::atom(format!("{name}::new()"), Repr::Owned)),
                 }
             }
             Some(Callee::Builtin("new Set")) => {
-                self.uses_hashset = true;
+                let name = self.set_name();
                 match args.first() {
                     Some(a) => {
                         let v = self.expr_as(&a.expr, Want::Owned)?;
                         Ok(E::owned(
-                            format!("{v}.into_iter().collect::<HashSet<_>>()"),
+                            format!("{v}.into_iter().collect::<{name}<_>>()"),
                             PREC_POSTFIX,
                         ))
                     }
-                    None => Ok(E::atom("HashSet::new()", Repr::Owned)),
+                    None => Ok(E::atom(format!("{name}::new()"), Repr::Owned)),
                 }
             }
             Some(Callee::Builtin("new Array")) => match args.first() {
@@ -350,8 +439,8 @@ impl<'a> Gen<'a> {
             Ty::Bool => "false".into(),
             Ty::Option(_) => "None".into(),
             Ty::Array(_) => "Vec::new()".into(),
-            Ty::Map(..) => "HashMap::new()".into(),
-            Ty::Set(_) => "HashSet::new()".into(),
+            Ty::Map(..) => format!("{}::new()", self.map_name()),
+            Ty::Set(_) => format!("{}::new()", self.set_name()),
             Ty::Void | Ty::Null => "()".into(),
             Ty::Named(n) if self.p.enum_info(&n).is_some() => {
                 let en = self.p.enum_info(&n).expect("enum");
@@ -369,15 +458,21 @@ impl<'a> Gen<'a> {
             |g: &mut Self, i: usize| -> GResult<String> { g.expr_as(&args[i].expr, Want::StrRef) };
         Ok(match name {
             "global.parseInt" => {
+                let at = self.ty_of(&args[0].expr);
+                if matches!(self.resolve(&at), Ty::Num(_)) {
+                    // `parseInt(3.7)`: a truncation.
+                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
+                    if self.is_float(&at) {
+                        let x = super::exprs::num_recv(&paren_num(&x), true);
+                        return Ok(E::owned(format!("{x}.trunc() as i64"), PREC_CAST));
+                    }
+                    return Ok(E::owned(x, PREC_ATOM));
+                }
                 let s = arg_str(self, 0)?;
                 if args.len() > 1 {
                     let radix = self.expr_as(&args[1].expr, Want::Owned)?;
-                    E::owned(
-                        format!(
-                            "i64::from_str_radix({s}.trim(), {radix} as u32).map_or(f64::NAN, |n| n as f64)"
-                        ),
-                        PREC_POSTFIX,
-                    )
+                    let h = self.helper(Helper::ParseIntRadix);
+                    E::owned(format!("{h}({s}, {radix})"), PREC_POSTFIX)
                 } else {
                     let h = self.helper(Helper::ParseInt);
                     E::owned(format!("{h}({s})"), PREC_POSTFIX)
@@ -410,6 +505,7 @@ impl<'a> Gen<'a> {
             "global.String" => {
                 let (spec, arg) = self.format_arg(&args[0].expr)?;
                 match arg {
+                    Some(a) if a.starts_with("js_to_string(") => E::owned(a, PREC_POSTFIX),
                     Some(a) if spec == "{}" => E::owned(format!("{a}.to_string()"), PREC_POSTFIX),
                     _ => E::owned(
                         format_call("format!", &spec, &arg.into_iter().collect::<Vec<_>>()),
@@ -421,29 +517,27 @@ impl<'a> Gen<'a> {
                 let c = self.cond(&args[0].expr)?;
                 E::owned(c, PREC_ATOM)
             }
-            "global.isNaN" => {
-                let at = self.ty_of(&args[0].expr);
-                if self.is_float(&at) {
-                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    E::owned(format!("{}.is_nan()", paren_num(&x)), PREC_POSTFIX)
-                } else {
-                    self.expr(&args[0].expr)?;
-                    E::atom("false", Repr::Owned)
-                }
-            }
-            "global.isFinite" => {
-                let at = self.ty_of(&args[0].expr);
-                if self.is_float(&at) {
-                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    E::owned(format!("{}.is_finite()", paren_num(&x)), PREC_POSTFIX)
-                } else {
-                    self.expr(&args[0].expr)?;
-                    E::atom("true", Repr::Owned)
-                }
+            "global.isNaN" | "global.isFinite" => {
+                self.nan_test(name == "global.isNaN", &args[0].expr)?
             }
             "global.structuredClone" => {
                 let x = self.expr_as(&args[0].expr, Want::Owned)?;
                 E::owned(x, PREC_POSTFIX)
+            }
+            "global.setTimeout" | "global.setInterval" => {
+                let (cb, ms) = self.timer_parts(args)?;
+                self.helper(Helper::Timers);
+                let f = if name == "global.setTimeout" {
+                    "js_set_timeout"
+                } else {
+                    "js_set_interval"
+                };
+                E::owned(format!("{f}({cb}, {ms})"), PREC_POSTFIX)
+            }
+            "global.clearTimeout" | "global.clearInterval" => {
+                let id = self.expr_as(&args[0].expr, Want::Owned)?;
+                self.helper(Helper::Timers);
+                E::owned(format!("js_clear_timer({id})"), PREC_POSTFIX)
             }
             _ => return self.err(format!("`{name}` is not supported"), e.span),
         })
@@ -485,7 +579,7 @@ impl<'a> Gen<'a> {
                         }
                         continue;
                     }
-                    let (spec, arg) = self.format_arg(&a.expr)?;
+                    let (spec, arg) = self.log_arg(&a.expr)?;
                     fmt.push_str(&spec);
                     list.extend(arg);
                 }
@@ -636,22 +730,7 @@ impl<'a> Gen<'a> {
                 }
             }
             "Number.isNaN" | "Number.isFinite" => {
-                let at = self.ty_of(&args[0].expr);
-                let method = if name == "Number.isNaN" {
-                    "is_nan"
-                } else {
-                    "is_finite"
-                };
-                if self.is_float(&at) {
-                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    E::owned(format!("{}.{method}()", paren_num(&x)), PREC_POSTFIX)
-                } else {
-                    self.expr(&args[0].expr)?;
-                    E::atom(
-                        if method == "is_nan" { "false" } else { "true" },
-                        Repr::Owned,
-                    )
-                }
+                self.nan_test(name == "Number.isNaN", &args[0].expr)?
             }
             "String.fromCharCode" => {
                 let x = self.expr_as(&args[0].expr, Want::Owned)?;
@@ -715,6 +794,7 @@ impl<'a> Gen<'a> {
                         let m = self.recv(&args[0].expr)?;
                         format!("{m}.iter().map(|(k, v)| (k.clone(), v.clone()))")
                     }
+                    Ty::Gen(_) => self.expr_as(&args[0].expr, Want::Owned)?,
                     _ => {
                         let x = self.expr(&args[0].expr)?;
                         if x.repr == Repr::Owned && x.var.is_none() {
@@ -750,6 +830,40 @@ impl<'a> Gen<'a> {
                     None => E::owned(format!("{src}.collect::<Vec<_>>()"), PREC_POSTFIX),
                 }
             }
+            "Promise.all" | "Promise.resolve" => self.expr(&args[0].expr)?,
+            "JSON.stringify" => {
+                let value = self.json_value_of(&args[0].expr)?;
+                let h = self.helper(Helper::Json);
+                let indent = match args.get(2) {
+                    None => "\"\"".to_string(),
+                    Some(a) => {
+                        let at = self.ty_of(&a.expr);
+                        if self.is_str(&at) {
+                            self.expr_as(&a.expr, Want::StrRef)?
+                        } else if let ExprKind::Num { value, .. } = a.expr.kind {
+                            string_literal(&" ".repeat((value as i64).clamp(0, 10) as usize))
+                        } else {
+                            let n = self.expr_as(&a.expr, Want::Owned)?;
+                            format!("&\" \".repeat(({n}).clamp(0, 10) as usize)")
+                        }
+                    }
+                };
+                E::owned(format!("{h}(&{value}, {indent})"), PREC_POSTFIX)
+            }
+            "JSON.parse" => {
+                let ty = self.ty_of(e);
+                self.mark_json(&ty, e.span)?;
+                let rt = self.rust_ty(&ty, e.span)?;
+                self.helper(Helper::Json);
+                let text = self.expr_as(&args[0].expr, Want::StrRef)?;
+                let mut code = format!("js_json_parse_as::<{rt}>({text})");
+                if self.fn_ctx().returns_result || !self.fn_ctx().try_ctx.is_empty() {
+                    code.push('?');
+                } else {
+                    code.push_str(".unwrap()");
+                }
+                E::owned(code, PREC_POSTFIX)
+            }
             "Date.now" => E::owned(
                 "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)",
                 PREC_POSTFIX,
@@ -769,6 +883,81 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// The `JsValue` of an expression, for `JSON.stringify`.
+    fn json_value_of(&mut self, e: &'a Expr) -> GResult<String> {
+        let ty = self.ty_of(e);
+        Ok(match self.resolve(&ty) {
+            Ty::Num(_) if self.is_float(&ty) => {
+                let x = self.expr(e)?;
+                let x = self.as_f64(&x);
+                format!("JsValue::Float({x})")
+            }
+            Ty::Num(_) => format!("JsValue::Int({})", self.expr_as(e, Want::Owned)?),
+            Ty::Str => format!("JsValue::Str({})", self.expr_as(e, Want::Owned)?),
+            Ty::Bool => format!("JsValue::Bool({})", self.expr_as(e, Want::Owned)?),
+            Ty::Void | Ty::Null => "JsValue::Null".to_string(),
+            _ => {
+                let x = self.expr(e)?;
+                let code = self.coerce(x, &ty, Want::Display);
+                self.js_value_of(&code, &ty)
+            }
+        })
+    }
+
+    /// The callback and the delay of `setTimeout(cb, ms)`, as Rust code.
+    pub(super) fn timer_parts(&mut self, args: &'a [Arg]) -> GResult<(String, String)> {
+        let cb = &args[0].expr;
+        let code = match &cb.kind {
+            ExprKind::Arrow(f) | ExprKind::Func(f) => self.closure(f, &[], false)?.code,
+            _ => {
+                let ct = self.ty_of(cb);
+                let c = self.expr(cb)?;
+                // `setTimeout(resolve, ms)`: a function of one (void) argument.
+                match self.resolve(&ct) {
+                    Ty::Func(f) if !f.params.is_empty() => format!("move || {}(())", c.code),
+                    _ => c.code,
+                }
+            }
+        };
+        let ms = match args.get(1) {
+            Some(a) => {
+                let x = self.expr_as(&a.expr, Want::Owned)?;
+                let at = self.ty_of(&a.expr);
+                if self.is_float(&at) {
+                    x
+                } else {
+                    self.as_f64(&E::owned(x, PREC_ATOM))
+                }
+            }
+            None => "0.0".into(),
+        };
+        Ok((code, ms))
+    }
+
+    /// `isNaN(x)` / `isFinite(x)`: on a float, the test; on the `Option` of `parseInt`,
+    /// `is_none` / `is_some`; on an integer, decided.
+    fn nan_test(&mut self, nan: bool, arg: &'a Expr) -> GResult<E> {
+        let at = self.ty_of(arg);
+        if matches!(self.resolve(&at), Ty::Option(_)) {
+            let x = self.expr(arg)?;
+            let code = Self::paren(&x, PREC_POSTFIX);
+            return Ok(E::owned(
+                format!("{code}.{}()", if nan { "is_none" } else { "is_some" }),
+                PREC_POSTFIX,
+            ));
+        }
+        if self.is_float(&at) {
+            let x = self.expr_as(arg, Want::Owned)?;
+            let x = super::exprs::num_recv(&paren_num(&x), true);
+            return Ok(E::owned(
+                format!("{x}.{}()", if nan { "is_nan" } else { "is_finite" }),
+                PREC_POSTFIX,
+            ));
+        }
+        self.expr(arg)?;
+        Ok(E::atom(if nan { "false" } else { "true" }, Repr::Owned))
+    }
+
     /// The receiver of a method chain: the expression, parenthesized if needed.
     pub(super) fn recv(&mut self, e: &'a Expr) -> GResult<String> {
         let x = self.expr(e)?;
@@ -784,7 +973,7 @@ impl<'a> Gen<'a> {
         } else if super::is_int_literal(&x) {
             format!("{x}.0_f64")
         } else {
-            format!("({x} as f64)")
+            format!("({} as f64)", paren_num(&x))
         })
     }
 
@@ -808,7 +997,29 @@ impl<'a> Gen<'a> {
         args: &'a [Arg],
     ) -> GResult<E> {
         let (kind, method) = name.split_once('.').unwrap_or(("", name));
+        // Methods that change their receiver borrow a shared one mutably.
+        self.want_mut_root = matches!(
+            method,
+            "push"
+                | "pop"
+                | "shift"
+                | "unshift"
+                | "splice"
+                | "sort"
+                | "reverse"
+                | "fill"
+                | "set"
+                | "delete"
+                | "clear"
+                | "add"
+                | "next"
+        );
         match kind {
+            "generator" => {
+                let g = self.expr_as(obj, Want::RefMut)?;
+                let g = g.trim_start_matches("&mut ").to_string();
+                Ok(E::owned(format!("{g}.next()"), PREC_POSTFIX))
+            }
             "string" => self.string_method(e, obj, method, args),
             "array" => self.array_method(e, obj, method, args),
             "map" => self.map_method(e, obj, method, args),
@@ -828,10 +1039,14 @@ impl<'a> Gen<'a> {
                         } else {
                             format!("({x} as f64)")
                         };
-                        E::owned(
-                            format!("format!(\"{{:.*}}\", {d} as usize, {x})"),
-                            PREC_ATOM,
-                        )
+                        if super::is_int_literal(&d) {
+                            E::owned(format!("format!(\"{{:.{d}}}\", {x})"), PREC_ATOM)
+                        } else {
+                            E::owned(
+                                format!("format!(\"{{:.*}}\", {d} as usize, {x})"),
+                                PREC_ATOM,
+                            )
+                        }
                     }
                     "toString" => match args.first() {
                         Some(a) if self.is_int(&ot) => {
@@ -856,6 +1071,16 @@ impl<'a> Gen<'a> {
             "boolean" | "error" => {
                 let x = self.expr_as(obj, Want::Display)?;
                 Ok(E::owned(format!("{x}.to_string()"), PREC_POSTFIX))
+            }
+            "regex" => {
+                let r = self.recv(obj)?;
+                Ok(match method {
+                    "test" | "exec" => {
+                        let s = self.expr_as(&args[0].expr, Want::StrRef)?;
+                        E::owned(format!("{r}.{method}({s})"), PREC_POSTFIX)
+                    }
+                    _ => E::owned(format!("{r}.to_string()"), PREC_POSTFIX),
+                })
             }
             _ => self.err(format!("`{name}` is not supported"), e.span),
         }
@@ -985,6 +1210,69 @@ impl<'a> Gen<'a> {
                 let b = arg_s(self, 1)?;
                 E::owned(format!("{recv}.replace({a}, {b})"), PREC_POSTFIX)
             }
+            "replaceRegex" | "replaceAllRegex" => {
+                let re = self.recv(&args[0].expr)?;
+                let b = arg_s(self, 1)?;
+                E::owned(format!("{re}.replace({s}, {b})"), PREC_POSTFIX)
+            }
+            "replaceRegexWith" | "replaceAllRegexWith" | "replaceWith" | "replaceAllWith" => {
+                // A function of the match and its groups.
+                let re = if method.contains("Regex") {
+                    self.recv(&args[0].expr)?
+                } else {
+                    let ExprKind::Str(p) = &args[0].expr.kind else {
+                        return self.err(
+                            "`replace` with a function needs a regular expression or a string literal",
+                            args[0].expr.span,
+                        );
+                    };
+                    let h = self.helper(Helper::Regex);
+                    let flags = if method.starts_with("replaceAll") {
+                        "g"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{h}::new({}, \"{flags}\")",
+                        string_literal(&regex_escape(p))
+                    )
+                };
+                let (ExprKind::Arrow(f) | ExprKind::Func(f)) = &args[1].expr.kind else {
+                    unreachable!()
+                };
+                let c = self.closure(f, &[], true)?;
+                let groups: Vec<String> = (0..f.params.len())
+                    .map(|i| format!("m_.get({i})"))
+                    .collect();
+                E::owned(
+                    format!(
+                        "{re}.replace_with({s}, |m_| ({})({}))",
+                        c.code,
+                        groups.join(", ")
+                    ),
+                    PREC_POSTFIX,
+                )
+            }
+            "splitRegex" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.split({s})"), PREC_POSTFIX)
+            }
+            "match" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.exec({s})"), PREC_POSTFIX)
+            }
+            "matchAll" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.match_all({s})"), PREC_POSTFIX)
+            }
+            "matches" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.find_all({s})"), PREC_POSTFIX)
+            }
+            "search" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.search({s})"), PREC_POSTFIX)
+            }
             "padStart" | "padEnd" => {
                 let n = arg_n(self, 0)?;
                 let pad = match args.get(1) {
@@ -1025,7 +1313,7 @@ impl<'a> Gen<'a> {
         args: &'a [Arg],
     ) -> GResult<E> {
         let ot = self.ty_of(obj);
-        let Ty::Map(k, v) = self.resolve(&ot) else {
+        let Ty::Map(k, v, _) = self.resolve(&ot) else {
             unreachable!()
         };
         let key_want = if self.is_str(&k) {
@@ -1163,23 +1451,53 @@ impl<'a> Gen<'a> {
             match &args[i].expr.kind {
                 ExprKind::Arrow(f) | ExprKind::Func(f) => Ok(g.closure(f, reprs, false)?.code),
                 _ => {
-                    // A named function: wrapped so that references are dereferenced.
+                    // A named function: wrapped so that each element is passed the way the
+                    // function takes it.
                     let f = g.expr(&args[i].expr)?;
+                    let modes: Vec<Mode> = match g.p.refs.get(&args[i].expr.id) {
+                        Some(b) if g.p.var(*b).role == crate::infer::Role::Func => {
+                            let fn_id = g.p.fn_bindings[b];
+                            let info = g.p.funcs[&fn_id].clone();
+                            info.sig
+                                .params
+                                .iter()
+                                .enumerate()
+                                .map(|(j, pt)| {
+                                    let (stored, reassigned, mutated) = info
+                                        .params
+                                        .get(j)
+                                        .map(|b| {
+                                            let v = g.p.var(*b);
+                                            (v.stored, v.reassigned, v.mutated)
+                                        })
+                                        .unwrap_or((true, false, false));
+                                    g.param_mode(pt, stored, reassigned, mutated, &info.type_params)
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
                     let n = reprs.len().max(1);
                     let params: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
-                    let call_args: Vec<String> = params
-                        .iter()
-                        .zip(reprs)
-                        .map(|(p, r)| {
-                            if *r == Repr::Ref && copy {
-                                format!("*{p}")
-                            } else if *r == Repr::Ref {
-                                format!("{p}.clone()")
-                            } else {
-                                p.clone()
+                    let mut call_args = Vec::new();
+                    for (j, (p, r)) in params.iter().zip(reprs).enumerate() {
+                        let mode = modes.get(j).copied().unwrap_or(Mode::Value);
+                        call_args.push(match (mode, *r) {
+                            (Mode::RefMut, _) => {
+                                return g.err(
+                                    "this function changes its argument: call it in a loop instead",
+                                    args[i].expr.span,
+                                );
                             }
-                        })
-                        .collect();
+                            (Mode::Value, Repr::Ref | Repr::Place) if copy => format!("*{p}"),
+                            (Mode::Value, Repr::Ref | Repr::Place) => format!("{p}.clone()"),
+                            (Mode::Value | Mode::FnImpl, _) => p.clone(),
+                            (Mode::StrRef, Repr::Owned) => format!("&{p}"),
+                            (_, Repr::Owned) => format!("&{p}"),
+                            (_, Repr::Usize) => format!("{p} as i64"),
+                            _ => p.clone(),
+                        });
+                    }
                     Ok(format!(
                         "|{}| {}({})",
                         params.join(", "),
@@ -1340,10 +1658,9 @@ impl<'a> Gen<'a> {
                 if self.is_str(&item) {
                     E::owned(format!("{recv}.join({sep})"), PREC_POSTFIX)
                 } else {
+                    let shown = self.string_of("x", &item);
                     E::owned(
-                        format!(
-                            "{recv}.iter().map(|x| x.to_string()).collect::<Vec<_>>().join({sep})"
-                        ),
+                        format!("{recv}.iter().map(|x| {shown}).collect::<Vec<_>>().join({sep})"),
                         PREC_POSTFIX,
                     )
                 }
@@ -1448,10 +1765,13 @@ impl<'a> Gen<'a> {
             "entries" => E::owned(format!("{iter}.enumerate()"), PREC_POSTFIX),
             "keys" => E::owned(format!("(0..{recv}.len())"), PREC_ATOM),
             "values" => E::owned(iter, PREC_POSTFIX),
-            "toString" => E::owned(
-                format!("{recv}.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(\",\")"),
-                PREC_POSTFIX,
-            ),
+            "toString" => {
+                let shown = self.string_of("x", &item);
+                E::owned(
+                    format!("{recv}.iter().map(|x| {shown}).collect::<Vec<_>>().join(\",\")"),
+                    PREC_POSTFIX,
+                )
+            }
             _ => return self.err(format!("`array.{method}` is not supported"), e.span),
         })
     }
@@ -1472,6 +1792,7 @@ impl<'a> Gen<'a> {
             id: f.id,
             returns_result: false,
             ret_ty: info.sig.ret.clone(),
+            yield_ty: None,
             targets: Vec::new(),
             try_ctx: Vec::new(),
             in_ctor: false,
@@ -1535,7 +1856,7 @@ impl<'a> Gen<'a> {
             let n = if self.is_float(&bt) {
                 n
             } else {
-                format!("{n} as f64")
+                format!("{} as f64", paren_num(&n))
             };
             Ok(format!("|{a}, {b}| {h}({n})"))
         })();
@@ -1543,6 +1864,18 @@ impl<'a> Gen<'a> {
         self.pop_scope();
         result
     }
+}
+
+/// A string as a regular expression matching it literally.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if "\\^$.|?*+()[]{}/".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn paren_num(code: &str) -> String {
