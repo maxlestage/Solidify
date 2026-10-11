@@ -116,6 +116,8 @@ enum JsValue {
     Set(Vec<JsValue>),
     /// A function, by name.
     Func(&'static str),
+    /// Text shown as it is (a regular expression).
+    Raw(String),
 }
 
 /// Implemented by every type that `console.log` can show.
@@ -294,6 +296,7 @@ fn js_to_string(v: &JsValue) -> String {
         JsValue::Map(_) => "[object Map]".into(),
         JsValue::Set(_) => "[object Set]".into(),
         JsValue::Func(name) => format!("function {name}() {{ [native code] }}"),
+        JsValue::Raw(text) => text.clone(),
     }
 }
 
@@ -380,6 +383,7 @@ fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> Strin
                 format!("[Function: {name}]")
             };
         }
+        JsValue::Raw(text) => return text.clone(),
         JsValue::Array(items) => {
             if items.is_empty() {
                 return "[]".into();

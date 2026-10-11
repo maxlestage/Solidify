@@ -18,6 +18,7 @@ use crate::error::{Error, Span};
 use crate::infer::{Callee, Program, Role};
 use crate::types::{Flavor, Ty};
 pub use runtime::Helper;
+pub use runtime::regex_rt;
 
 /// Options of the generator.
 #[derive(Clone, Debug, Default)]
@@ -177,6 +178,10 @@ pub(super) struct Gen<'a> {
     /// Variables held in an `Rc<RefCell<T>>` (shared with closures that outlive the scope).
     pub shared: HashSet<NodeId>,
     pub uses_rc: bool,
+    /// Top-level variables used inside functions: statics (`true`: changed, in a `Mutex`).
+    pub statics: HashMap<NodeId, bool>,
+    pub uses_lazy: bool,
+    pub uses_mutex: bool,
     /// The next variable read is written through: borrow a shared one mutably.
     pub want_mut_root: bool,
     /// Parameters to wrap in `Rc<RefCell<T>>` at the start of the body.
@@ -217,6 +222,9 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         super_helpers: BTreeMap::new(),
         shared: HashSet::new(),
         uses_rc: false,
+        statics: HashMap::new(),
+        uses_lazy: false,
+        uses_mutex: false,
         want_mut_root: false,
         param_rebinds: Vec::new(),
         names: HashMap::new(),
@@ -802,6 +810,7 @@ impl<'a> Gen<'a> {
             Helper::Generator => "JsGenerator",
             Helper::Timers => "js_run_timers",
             Helper::Promise => "JsPromise",
+            Helper::Regex => "JsRegex",
         }
     }
 
@@ -901,8 +910,11 @@ impl<'a> Gen<'a> {
             Ty::Option(inner) => self.is_inspect_ty(&inner),
             Ty::Named(n) => {
                 n != "Error"
+                    && n != "RegExp"
                     && !self.is_type_param(&n)
-                    && (self.p.struct_info(&n).is_some() || self.p.union_info(&n).is_some())
+                    && (n == "RegExpMatch"
+                        || self.p.struct_info(&n).is_some()
+                        || self.p.union_info(&n).is_some())
             }
             _ => false,
         }
@@ -1140,6 +1152,11 @@ impl<'a> Gen<'a> {
             Ty::Named(n) => {
                 if n == "Error" {
                     "String".into()
+                } else if n == "RegExp" {
+                    self.helper(Helper::Regex).into()
+                } else if n == "RegExpMatch" {
+                    self.helper(Helper::Regex);
+                    "JsMatch".into()
                 } else if self.is_type_param(&n) {
                     n
                 } else if self.p.is_dyn(&n) {
@@ -1302,6 +1319,7 @@ impl<'a> Gen<'a> {
             Ty::Num(_) | Ty::Str | Ty::Bool => "{}",
             Ty::Named(n) => {
                 let prints = n == "Error"
+                    || n == "RegExp"
                     || self.is_type_param(&n)
                     || self.p.is_enum(&n)
                     || self

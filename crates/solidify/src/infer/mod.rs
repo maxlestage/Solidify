@@ -65,6 +65,8 @@ pub struct VarInfo {
     pub closure_fn: Option<NodeId>,
     /// Holds the result of a generator's `next()`: `.value` and `.done` read it.
     pub iter_result: bool,
+    /// Holds a regular expression made from a literal: its flags.
+    pub regex_flags: Option<String>,
     /// Changed, and captured by a closure that outlives the scope: the closure and the
     /// scope share it (`Rc<RefCell<T>>`).
     pub shared: bool,
@@ -766,6 +768,7 @@ impl<'m> Infer<'m> {
                 alias: false,
                 closure_fn: None,
                 iter_result: false,
+                regex_flags: None,
                 shared: false,
                 loop_depth: depth,
                 span,
@@ -1039,6 +1042,27 @@ impl<'m> Infer<'m> {
         self.narrows
             .iter()
             .rposition(|n| n.root == path.root && n.path == path.fields)
+    }
+
+    /// The flags of a regular expression expression, when they are written in the program.
+    pub(super) fn regex_flags(&self, e: &Expr) -> Option<String> {
+        match &e.kind {
+            ExprKind::Regex { flags, .. } => Some(flags.clone()),
+            ExprKind::New { callee, args, .. } if matches!(&callee.kind, ExprKind::Ident(n) if n == "RegExp") => {
+                match args.get(1) {
+                    None => Some(String::new()),
+                    Some(a) => match &a.expr.kind {
+                        ExprKind::Str(f) => Some(f.clone()),
+                        _ => None,
+                    },
+                }
+            }
+            ExprKind::Ident(name) => self
+                .lookup(name)
+                .and_then(|id| self.vars.get(&id))
+                .and_then(|v| v.regex_flags.clone()),
+            _ => None,
+        }
     }
 
     /// Whether an expression is the result of a generator's `next()`, directly or through

@@ -215,6 +215,11 @@ impl<'a> Gen<'a> {
                 prop,
                 optional,
             } => self.member(e, obj, prop, *optional),
+            ExprKind::Index {
+                obj,
+                index,
+                optional: true,
+            } => self.optional_index(obj, index),
             ExprKind::Index { obj, index, .. } => self.index(e, obj, index),
             ExprKind::As(inner, _) | ExprKind::NonNull(inner) => {
                 let inner_ty = self.ty_of(inner);
@@ -260,8 +265,18 @@ impl<'a> Gen<'a> {
                 Ok(E::owned(format!("{{ {} }}", parts.join(" ")), PREC_ATOM))
             }
             ExprKind::TypeOf(inner) => self.typeof_expr(inner),
+            ExprKind::Regex { pattern, flags } => {
+                let h = self.helper(super::Helper::Regex);
+                Ok(E::owned(
+                    format!(
+                        "{h}::new({}, {})",
+                        string_literal(pattern),
+                        string_literal(flags)
+                    ),
+                    PREC_POSTFIX,
+                ))
+            }
             ExprKind::Tagged { .. }
-            | ExprKind::Regex { .. }
             | ExprKind::Super
             | ExprKind::Class(_)
             | ExprKind::Delete(_)
@@ -391,6 +406,15 @@ impl<'a> Gen<'a> {
             }
             _ => {
                 let mutable = std::mem::take(&mut self.want_mut_root);
+                if let Some(&changed) = self.statics.get(&binding) {
+                    let name = self.name(binding);
+                    let code = if changed {
+                        format!("(*{name}.lock().unwrap())")
+                    } else {
+                        format!("(*{name})")
+                    };
+                    return Ok(E::new(code, PREC_ATOM, Repr::Place));
+                }
                 if self.shared.contains(&binding) {
                     // Shared with a closure: read or written through the cell.
                     let borrow = if mutable { "borrow_mut" } else { "borrow" };
@@ -1561,6 +1585,27 @@ impl<'a> Gen<'a> {
             });
         }
         match self.resolve(&ot) {
+            Ty::Named(n) if n == "RegExp" => Ok(match prop {
+                "source" => E::owned(format!("{base}.source()"), PREC_POSTFIX),
+                "flags" => E::owned(format!("{base}.flags()"), PREC_POSTFIX),
+                "lastIndex" => E::atom("0", Repr::Owned),
+                _ => {
+                    let flag = match prop {
+                        "global" => 'g',
+                        "ignoreCase" => 'i',
+                        "multiline" => 'm',
+                        "dotAll" => 's',
+                        "sticky" => 'y',
+                        _ => 'u',
+                    };
+                    E::owned(format!("{base}.flags().contains('{flag}')"), PREC_POSTFIX)
+                }
+            }),
+            Ty::Named(n) if n == "RegExpMatch" => Ok(match prop {
+                "index" => E::new(format!("{base}.index"), PREC_POSTFIX, Repr::Place),
+                "input" => E::new(format!("{base}.input"), PREC_POSTFIX, Repr::Place),
+                _ => E::new(format!("{base}.len()"), PREC_POSTFIX, Repr::Usize),
+            }),
             Ty::Named(n) if n == "Error" => Ok(match prop {
                 "message" => {
                     let mut x = E::atom(
@@ -1690,6 +1735,53 @@ impl<'a> Gen<'a> {
         })
     }
 
+    /// `a?.[i]`: `a.as_ref().map(|v| v[i].clone())`.
+    fn optional_index(&mut self, obj: &'a Expr, index: &'a Expr) -> GResult<E> {
+        let ot = self.ty_of(obj);
+        let o = self.expr(obj)?;
+        let is_param_ref = self.opt_ref_param(&o);
+        let source = match o.repr {
+            Repr::OptRef => o.code.clone(),
+            Repr::Owned if is_param_ref || self.can_move(&o) => o.code.clone(),
+            _ => format!("{}.as_ref()", Self::paren(&o, PREC_POSTFIX)),
+        };
+        let Ty::Option(inner) = self.resolve(&ot) else {
+            return self.err("`?.[` on a value that is never null", obj.span);
+        };
+        Ok(match self.resolve(&inner) {
+            Ty::Named(n) if n == "RegExpMatch" => {
+                let i = self.expr_as(index, Want::Owned)?;
+                E::owned(format!("{source}.map(|v| v.get({i}))"), PREC_POSTFIX)
+            }
+            Ty::Array(item) => {
+                let i = self.expr_as(index, Want::Index)?;
+                let get = if self.is_copy(&item) {
+                    format!("{source}.and_then(|v| v.get({i}).copied())")
+                } else {
+                    format!("{source}.and_then(|v| v.get({i}).cloned())")
+                };
+                E::owned(get, PREC_POSTFIX)
+            }
+            Ty::Map(k, v, _) => {
+                let key = self.expr_as(
+                    index,
+                    if self.is_str(&k) {
+                        Want::StrRef
+                    } else {
+                        Want::Ref
+                    },
+                )?;
+                let get = if self.is_copy(&v) {
+                    format!("{source}.and_then(|m| m.get({key}).copied())")
+                } else {
+                    format!("{source}.and_then(|m| m.get({key}).cloned())")
+                };
+                E::owned(get, PREC_POSTFIX)
+            }
+            _ => return self.err("`?.[` is only supported on arrays and maps", obj.span),
+        })
+    }
+
     fn index(&mut self, e: &'a Expr, obj: &'a Expr, index: &'a Expr) -> GResult<E> {
         let ot = self.ty_of(obj);
         let o = self.expr(obj)?;
@@ -1725,6 +1817,10 @@ impl<'a> Gen<'a> {
                     },
                 )?;
                 Ok(E::new(format!("{base}[{key}]"), PREC_POSTFIX, Repr::Place))
+            }
+            Ty::Named(n) if n == "RegExpMatch" => {
+                let i = self.expr_as(index, Want::Owned)?;
+                Ok(E::owned(format!("{base}.get({i})"), PREC_POSTFIX))
             }
             Ty::Named(_) => {
                 let ExprKind::Str(key) = &index.kind else {

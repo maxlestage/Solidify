@@ -365,6 +365,15 @@ impl<'a> Gen<'a> {
                     PREC_POSTFIX,
                 ))
             }
+            Some(Callee::Builtin("new RegExp")) => {
+                let h = self.helper(Helper::Regex);
+                let p = self.expr_as(&args[0].expr, Want::StrRef)?;
+                let f = match args.get(1) {
+                    Some(a) => self.expr_as(&a.expr, Want::StrRef)?,
+                    None => "\"\"".into(),
+                };
+                Ok(E::owned(format!("{h}::new({p}, {f})"), PREC_POSTFIX))
+            }
             Some(Callee::Builtin("new Error")) => match args.first() {
                 Some(a) => {
                     let s = self.expr_as(&a.expr, Want::Owned)?;
@@ -1003,6 +1012,16 @@ impl<'a> Gen<'a> {
                 let x = self.expr_as(obj, Want::Display)?;
                 Ok(E::owned(format!("{x}.to_string()"), PREC_POSTFIX))
             }
+            "regex" => {
+                let r = self.recv(obj)?;
+                Ok(match method {
+                    "test" | "exec" => {
+                        let s = self.expr_as(&args[0].expr, Want::StrRef)?;
+                        E::owned(format!("{r}.{method}({s})"), PREC_POSTFIX)
+                    }
+                    _ => E::owned(format!("{r}.to_string()"), PREC_POSTFIX),
+                })
+            }
             _ => self.err(format!("`{name}` is not supported"), e.span),
         }
     }
@@ -1130,6 +1149,69 @@ impl<'a> Gen<'a> {
                 let a = arg_s(self, 0)?;
                 let b = arg_s(self, 1)?;
                 E::owned(format!("{recv}.replace({a}, {b})"), PREC_POSTFIX)
+            }
+            "replaceRegex" | "replaceAllRegex" => {
+                let re = self.recv(&args[0].expr)?;
+                let b = arg_s(self, 1)?;
+                E::owned(format!("{re}.replace({s}, {b})"), PREC_POSTFIX)
+            }
+            "replaceRegexWith" | "replaceAllRegexWith" | "replaceWith" | "replaceAllWith" => {
+                // A function of the match and its groups.
+                let re = if method.contains("Regex") {
+                    self.recv(&args[0].expr)?
+                } else {
+                    let ExprKind::Str(p) = &args[0].expr.kind else {
+                        return self.err(
+                            "`replace` with a function needs a regular expression or a string literal",
+                            args[0].expr.span,
+                        );
+                    };
+                    let h = self.helper(Helper::Regex);
+                    let flags = if method.starts_with("replaceAll") {
+                        "g"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "{h}::new({}, \"{flags}\")",
+                        string_literal(&regex_escape(p))
+                    )
+                };
+                let (ExprKind::Arrow(f) | ExprKind::Func(f)) = &args[1].expr.kind else {
+                    unreachable!()
+                };
+                let c = self.closure(f, &[], true)?;
+                let groups: Vec<String> = (0..f.params.len())
+                    .map(|i| format!("m_.get({i})"))
+                    .collect();
+                E::owned(
+                    format!(
+                        "{re}.replace_with({s}, |m_| ({})({}))",
+                        c.code,
+                        groups.join(", ")
+                    ),
+                    PREC_POSTFIX,
+                )
+            }
+            "splitRegex" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.split({s})"), PREC_POSTFIX)
+            }
+            "match" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.exec({s})"), PREC_POSTFIX)
+            }
+            "matchAll" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.match_all({s})"), PREC_POSTFIX)
+            }
+            "matches" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.find_all({s})"), PREC_POSTFIX)
+            }
+            "search" => {
+                let re = self.recv(&args[0].expr)?;
+                E::owned(format!("{re}.search({s})"), PREC_POSTFIX)
             }
             "padStart" | "padEnd" => {
                 let n = arg_n(self, 0)?;
@@ -1722,6 +1804,18 @@ impl<'a> Gen<'a> {
         self.pop_scope();
         result
     }
+}
+
+/// A string as a regular expression matching it literally.
+fn regex_escape(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if "\\^$.|?*+()[]{}/".contains(c) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
 }
 
 fn paren_num(code: &str) -> String {

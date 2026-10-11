@@ -308,17 +308,9 @@ impl<'a> Gen<'a> {
             match &d.pat {
                 Pattern::Ident { id, span, .. } => {
                     let var = self.p.var(*id);
-                    if var.role == Role::TopLevel && var.const_literal {
+                    if var.role == Role::TopLevel && (var.const_literal || var.used_in_fn) {
+                        // A constant or a static, written with the items.
                         continue;
-                    }
-                    if var.role == Role::TopLevel && var.used_in_fn {
-                        return self.err(
-                            format!(
-                                "the top-level variable `{}` is used inside a function: pass it as a parameter, or make it a `const` with a literal value",
-                                var.name
-                            ),
-                            *span,
-                        );
                     }
                     let ty = self.resolve(&var.ty);
                     let Some(init) = &d.init else {
@@ -885,11 +877,23 @@ impl<'a> Gen<'a> {
         }
         // The variable itself, even inside a region where it is narrowed.
         let x = match (&t.kind, self.p.refs.get(&t.id)) {
-            (ExprKind::Ident(_), Some(&b)) if self.shared.contains(&b) => E::new(
-                format!("(*{}.borrow_mut())", self.name(b)),
-                PREC_ATOM,
-                Repr::Place,
-            ),
+            (ExprKind::Ident(_), Some(&b))
+                if self.shared.contains(&b) || self.statics.contains_key(&b) =>
+            {
+                // The value first, then the cell: the value may read the variable.
+                let place = if self.shared.contains(&b) {
+                    format!("(*{}.borrow_mut())", self.name(b))
+                } else {
+                    format!("(*{}.lock().unwrap())", self.name(b))
+                };
+                if matches!(op, AssignOp::Assign) {
+                    let val = self.expr_to(value, &tt)?;
+                    self.line(&format!("let value_ = {val};"));
+                    self.line(&format!("{place} = value_;"));
+                    return Ok(());
+                }
+                E::new(place, PREC_ATOM, Repr::Place)
+            }
             (ExprKind::Ident(_), Some(&b)) => {
                 let mut x = E::atom(self.name(b), self.repr_of(b));
                 x.var = Some((b, t.id));

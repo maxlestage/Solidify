@@ -359,10 +359,12 @@ impl<'m> Infer<'m> {
                     _ => None,
                 };
                 let iter_result = self.is_iter_result(init);
+                let regex_flags = self.regex_flags(init);
                 if let Some(v) = self.vars.get_mut(id) {
                     v.alias = alias;
                     v.closure_fn = closure_fn;
                     v.iter_result = iter_result;
+                    v.regex_flags = regex_flags;
                 }
                 if alias && let Some(&(_, test)) = self.narrowed_uses.get(&init.id) {
                     self.alias_of_narrow.push((*id, test));

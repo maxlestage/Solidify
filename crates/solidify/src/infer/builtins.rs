@@ -25,6 +25,22 @@ impl<'m> Infer<'m> {
         Ok(())
     }
 
+    /// Whether an argument is a regular expression.
+    fn is_regex(&mut self, arg: Option<&'m Arg>) -> bool {
+        let Some(a) = arg else { return false };
+        match &a.expr.kind {
+            ExprKind::Regex { .. } => true,
+            ExprKind::New { callee, .. } => {
+                matches!(&callee.kind, ExprKind::Ident(n) if n == "RegExp")
+            }
+            ExprKind::Ident(name) => self
+                .lookup(name)
+                .map(|id| self.vars[&id].ty.clone())
+                .is_some_and(|t| matches!(self.types.resolve(&t), Ty::Named(n) if n == "RegExp")),
+            _ => false,
+        }
+    }
+
     fn done(&mut self, e: &Expr, name: String, ty: Ty) -> IResult<Ty> {
         self.calls.insert(e.id, Callee::Builtin(leak(name)));
         Ok(ty)
@@ -379,6 +395,29 @@ impl<'m> Infer<'m> {
                 "toString" => self.done(e, "error.toString".into(), Ty::Str),
                 _ => self.err(format!("Error has no method `{prop}`"), span),
             },
+            Ty::Named(n) if n == "RegExp" => {
+                let full = format!("regex.{prop}");
+                match prop {
+                    "test" => {
+                        self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                        self.done(e, full, Ty::Bool)
+                    }
+                    "exec" => {
+                        self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                        self.done(
+                            e,
+                            full,
+                            Ty::Option(Box::new(Ty::Named("RegExpMatch".into()))),
+                        )
+                    }
+                    "toString" => self.done(e, full, Ty::Str),
+                    _ => self.err(format!("RegExp has no method `{prop}`"), span),
+                }
+            }
+            Ty::Named(n) if n == "RegExpMatch" => self.err(
+                format!("a match has no method `{prop}`: its groups are `m[i]`"),
+                span,
+            ),
             Ty::Tuple(_) => self.err(
                 format!("tuples have no method `{prop}`: use an array"),
                 span,
@@ -427,6 +466,11 @@ impl<'m> Infer<'m> {
                 self.done(e, full, Ty::Str)
             }
             "split" => {
+                if self.is_regex(args.first()) {
+                    self.arg_typed(args, 0, None, &full, span)?;
+                    self.no_more_than(args, 1, &full, span)?;
+                    return self.done(e, "string.splitRegex".into(), Ty::Array(Box::new(Ty::Str)));
+                }
                 self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
                 self.no_more_than(args, 1, &full, span)?;
                 self.done(e, full, Ty::Array(Box::new(Ty::Str)))
@@ -467,9 +511,33 @@ impl<'m> Infer<'m> {
                 self.done(e, full, Ty::Str)
             }
             "replace" | "replaceAll" => {
-                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
-                self.arg_typed(args, 1, Some(Ty::Str), &full, span)?;
-                self.done(e, full, Ty::Str)
+                let regex = self.is_regex(args.first());
+                if regex {
+                    self.arg_typed(args, 0, None, &full, span)?;
+                } else {
+                    self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                }
+                // The replacement: a string, or a function of the match and its groups.
+                let by_function = matches!(
+                    args.get(1).map(|a| &a.expr.kind),
+                    Some(ExprKind::Arrow(_) | ExprKind::Func(_))
+                );
+                if by_function {
+                    let (ExprKind::Arrow(f) | ExprKind::Func(f)) = &args[1].expr.kind else {
+                        unreachable!()
+                    };
+                    let params = vec![Ty::Str; f.params.len()];
+                    self.callback(args, 1, params, Ty::Str, &full, span)?;
+                } else {
+                    self.arg_typed(args, 1, Some(Ty::Str), &full, span)?;
+                }
+                let name = match (regex, by_function) {
+                    (true, true) => format!("{full}RegexWith"),
+                    (true, false) => format!("{full}Regex"),
+                    (false, true) => format!("{full}With"),
+                    (false, false) => full,
+                };
+                self.done(e, name, Ty::Str)
             }
             "padStart" | "padEnd" => {
                 let n = int(self);
@@ -490,8 +558,46 @@ impl<'m> Infer<'m> {
                 let i = int(self);
                 self.done(e, full, i)
             }
-            "match" | "matchAll" | "search" => {
-                self.err("regular expressions are not supported", span)
+            "match" => {
+                if !self.is_regex(args.first()) {
+                    return self.err("`match` needs a regular expression", span);
+                }
+                self.arg_typed(args, 0, None, &full, span)?;
+                let global = self
+                    .regex_flags(&args[0].expr)
+                    .is_some_and(|f| f.contains('g'));
+                if global {
+                    self.done(
+                        e,
+                        "string.matchAll".into(),
+                        Ty::Option(Box::new(Ty::Array(Box::new(Ty::Str)))),
+                    )
+                } else {
+                    self.done(
+                        e,
+                        full,
+                        Ty::Option(Box::new(Ty::Named("RegExpMatch".into()))),
+                    )
+                }
+            }
+            "matchAll" => {
+                if !self.is_regex(args.first()) {
+                    return self.err("`matchAll` needs a regular expression", span);
+                }
+                self.arg_typed(args, 0, None, &full, span)?;
+                self.done(
+                    e,
+                    "string.matches".into(),
+                    Ty::Array(Box::new(Ty::Named("RegExpMatch".into()))),
+                )
+            }
+            "search" => {
+                if !self.is_regex(args.first()) {
+                    return self.err("`search` needs a regular expression", span);
+                }
+                self.arg_typed(args, 0, None, &full, span)?;
+                let i = int(self);
+                self.done(e, full, i)
             }
             _ => self.err(format!("strings have no method `{prop}`"), span),
         }
