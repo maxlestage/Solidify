@@ -23,6 +23,7 @@ pub fn desugar(body: &mut Vec<Stmt>, next_id: &mut NodeId) -> Option<String> {
     });
     literal_code(body, next_id);
     error_classes(body, next_id);
+    object_methods(body, next_id);
     proxy_targets(body);
     let mut ids = Ids(next_id);
     constructor_functions(body, &mut ids);
@@ -1317,4 +1318,227 @@ fn error_classes(body: &mut [Stmt], next_id: &mut NodeId) {
             *b = ERROR_BASE.to_string();
         }
     });
+}
+
+/// The classes made for objects with methods are named from this prefix; they are shown
+/// like plain objects.
+pub const OBJECT_CLASS: &str = "__Object";
+
+/// `{ count: 0, inc() { this.count++ }, get double() { … } }`: an object with methods is
+/// an instance of a class made for it (its values given to the constructor).
+fn object_methods(body: &mut Vec<Stmt>, next_id: &mut NodeId) {
+    // The handler of a proxy keeps its traps.
+    let mut handlers = std::collections::HashSet::new();
+    for_each_expr(body, &mut |e| {
+        if let ExprKind::New { callee, args, .. } = &e.kind
+            && matches!(&callee.kind, ExprKind::Ident(n) if n == "Proxy")
+            && let Some(h) = args.get(1)
+        {
+            handlers.insert(h.expr.id);
+        }
+        true
+    });
+    let mut classes: Vec<Class> = Vec::new();
+    for_each_expr_mut(body, &mut |e| {
+        if handlers.contains(&e.id) {
+            return true;
+        }
+        let ExprKind::Object(props) = &e.kind else {
+            return true;
+        };
+        let has_methods = props.iter().any(|p| {
+            matches!(
+                p.value,
+                PropValue::Method(_) | PropValue::Get(_) | PropValue::Set(_)
+            )
+        });
+        let plain_keys = props.iter().all(|p| {
+            !matches!(p.key, PropKey::Computed(_)) && !matches!(p.value, PropValue::Spread(_))
+        });
+        if !has_methods || !plain_keys {
+            return true;
+        }
+        let span = e.span;
+        let name = format!("{OBJECT_CLASS}{}", classes.len() + 1);
+        let mut fresh = || {
+            let id = *next_id;
+            *next_id += 1;
+            id
+        };
+        let mut params = Vec::new();
+        let mut args = Vec::new();
+        let mut members = Vec::new();
+        let mut assigns: Vec<Stmt> = Vec::new();
+        let ExprKind::Object(props) = std::mem::replace(&mut e.kind, ExprKind::Null) else {
+            unreachable!()
+        };
+        for p in props {
+            let key = p.key.name().unwrap_or_default();
+            match p.value {
+                PropValue::Expr(_) | PropValue::Shorthand(_) => {
+                    let value = match p.value {
+                        PropValue::Expr(x) => x,
+                        PropValue::Shorthand(id) => Expr {
+                            kind: ExprKind::Ident(key.clone()),
+                            span: p.span,
+                            id,
+                        },
+                        _ => unreachable!(),
+                    };
+                    // A field in its place, set by the constructor.
+                    params.push(Param {
+                        pat: Pattern::Ident {
+                            name: key.clone(),
+                            span: p.span,
+                            id: fresh(),
+                        },
+                        ty: None,
+                        optional: false,
+                        default: None,
+                        rest: false,
+                        access: None,
+                        readonly: false,
+                        span: p.span,
+                    });
+                    let this = Expr {
+                        kind: ExprKind::This,
+                        span: p.span,
+                        id: fresh(),
+                    };
+                    let target = Expr {
+                        kind: ExprKind::Member {
+                            obj: Box::new(this),
+                            prop: key.clone(),
+                            optional: false,
+                        },
+                        span: p.span,
+                        id: fresh(),
+                    };
+                    let read = Expr {
+                        kind: ExprKind::Ident(key.clone()),
+                        span: p.span,
+                        id: fresh(),
+                    };
+                    assigns.push(Stmt {
+                        kind: StmtKind::Expr(Expr {
+                            kind: ExprKind::Assign {
+                                op: AssignOp::Assign,
+                                target: AssignTarget::Expr(Box::new(target)),
+                                value: Box::new(read),
+                            },
+                            span: p.span,
+                            id: fresh(),
+                        }),
+                        span: p.span,
+                        comments: Vec::new(),
+                    });
+                    members.push(ClassMember::Field(Field {
+                        name: key,
+                        ty: None,
+                        init: None,
+                        is_static: false,
+                        access: None,
+                        readonly: false,
+                        optional: false,
+                        span: p.span,
+                    }));
+                    args.push(Arg {
+                        expr: value,
+                        spread: false,
+                    });
+                }
+                PropValue::Method(f) => members.push(ClassMember::Method(Method {
+                    name: key,
+                    kind: MethodKind::Method,
+                    func: f,
+                    is_static: false,
+                    access: None,
+                    is_abstract: false,
+                    span: p.span,
+                })),
+                PropValue::Get(f) => members.push(ClassMember::Method(Method {
+                    name: key,
+                    kind: MethodKind::Get,
+                    func: f,
+                    is_static: false,
+                    access: None,
+                    is_abstract: false,
+                    span: p.span,
+                })),
+                PropValue::Set(f) => members.push(ClassMember::Method(Method {
+                    name: key,
+                    kind: MethodKind::Set,
+                    func: f,
+                    is_static: false,
+                    access: None,
+                    is_abstract: false,
+                    span: p.span,
+                })),
+                PropValue::Spread(_) => {}
+            }
+        }
+        let ctor_id = fresh();
+        members.insert(
+            0,
+            ClassMember::Method(Method {
+                name: "constructor".into(),
+                kind: MethodKind::Constructor,
+                func: Function {
+                    name: None,
+                    type_params: Vec::new(),
+                    params,
+                    ret: None,
+                    body: FnBody::Block(Block {
+                        stmts: assigns,
+                        span,
+                    }),
+                    is_async: false,
+                    is_arrow: false,
+                    is_generator: false,
+                    exported: false,
+                    span,
+                    id: ctor_id,
+                },
+                is_static: false,
+                access: None,
+                is_abstract: false,
+                span,
+            }),
+        );
+        let class_id = fresh();
+        let callee_id = fresh();
+        classes.push(Class {
+            name: name.clone(),
+            type_params: Vec::new(),
+            extends: None,
+            extends_args: Vec::new(),
+            implements: Vec::new(),
+            members,
+            exported: false,
+            is_abstract: false,
+            span,
+            id: class_id,
+        });
+        e.kind = ExprKind::New {
+            callee: Box::new(Expr {
+                kind: ExprKind::Ident(name),
+                span,
+                id: callee_id,
+            }),
+            args,
+            type_args: Vec::new(),
+        };
+        true
+    });
+    for (i, c) in classes.into_iter().enumerate() {
+        let span = c.span;
+        body.insert(
+            i,
+            Stmt {
+                kind: StmtKind::Class(c),
+                span,
+                comments: Vec::new(),
+            },
+        );
+    }
 }

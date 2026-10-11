@@ -2151,6 +2151,17 @@ impl<'a> Gen<'a> {
             Ty::Array(_) | Ty::Tuple(_) if prop == "length" => {
                 Ok(E::new(format!("{base}.len()"), PREC_POSTFIX, Repr::Usize))
             }
+            // `record.key`: `record["key"]`.
+            Ty::Map(_, v, true) => {
+                let key = string_literal(prop);
+                if self.is_dynamic(&v) && !mutable {
+                    return Ok(E::owned(
+                        format!("{base}.get({key}).cloned().unwrap_or(JsValue::Undefined)"),
+                        PREC_POSTFIX,
+                    ));
+                }
+                Ok(E::new(format!("{base}[{key}]"), PREC_POSTFIX, Repr::Place))
+            }
             Ty::Str if prop == "length" => Ok(E::new(
                 format!("{base}.chars().count()"),
                 PREC_POSTFIX,
@@ -2312,7 +2323,7 @@ impl<'a> Gen<'a> {
                 let h = self.helper(super::Helper::StrCharAt);
                 Ok(E::owned(format!("{h}({s}, {i})"), PREC_POSTFIX))
             }
-            Ty::Map(k, _, _) => {
+            Ty::Map(k, v, _) => {
                 let key = self.expr_as(
                     index,
                     if self.is_str(&k) {
@@ -2321,6 +2332,13 @@ impl<'a> Gen<'a> {
                         Want::Ref
                     },
                 )?;
+                // A value known at run time: `undefined` when missing.
+                if self.is_dynamic(&v) && !self.want_mut_root {
+                    return Ok(E::owned(
+                        format!("{base}.get({key}).cloned().unwrap_or(JsValue::Undefined)"),
+                        PREC_POSTFIX,
+                    ));
+                }
                 Ok(E::new(format!("{base}[{key}]"), PREC_POSTFIX, Repr::Place))
             }
             Ty::Named(n, ..) if n == "RegExpMatch" => {

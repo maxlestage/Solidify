@@ -1,0 +1,11 @@
+number 42 string HI array of 2 null other {"a":1}
+number 1
+string two
+boolean true
+object { three: 3 }
+now text 8
+2 x
+2 [ 'a', 'b' ]
+{ lines: [ 'a', 'b' ], log: [Function: log], count: [Getter] }
+5 3
+{ a: 1, f: [Function: f], g: [Getter/Setter], b: 'x' } 1 2
