@@ -1009,9 +1009,12 @@ impl<'a> Gen<'a> {
                 Ok(E::owned(format!("{rc}.contains_key({key})"), PREC_POSTFIX))
             }
             BinOp::InstanceOf => {
-                let ExprKind::Ident(sub) = &right.kind else {
-                    return self.err("`instanceof` needs a class name", right.span);
+                let sub = match (self.p.refs.get(&right.id), &right.kind) {
+                    (Some(b), _) => self.p.var(*b).name.clone(),
+                    (None, ExprKind::Ident(sub)) => sub.clone(),
+                    _ => return self.err("`instanceof` needs a class name", right.span),
                 };
+                let sub = &sub;
                 let Ty::Named(class) = self.resolve(&lt) else {
                     self.expr(left)?;
                     return Ok(E::atom("false", Repr::Owned));
@@ -1529,9 +1532,9 @@ impl<'a> Gen<'a> {
             ));
         }
         let ot = self.ty_of(obj);
-        // Enum variants and static members.
-        if let ExprKind::Ident(_) = &obj.kind
-            && let Some(&binding) = self.p.refs.get(&obj.id)
+        // Enum variants and static members (`E.A`, `C.x`, also through a namespace).
+        if let Some(&binding) = self.p.refs.get(&obj.id)
+            && matches!(self.p.var(binding).role, Role::Enum | Role::Class)
         {
             match self.p.var(binding).role {
                 Role::Enum => {

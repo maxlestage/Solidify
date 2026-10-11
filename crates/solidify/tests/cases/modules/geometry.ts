@@ -3,11 +3,24 @@ export interface Point {
   y: number;
 }
 
+export enum Shade {
+  Light = "light",
+  Dark = "dark",
+}
+
 export class Circle {
   constructor(
     public center: Point,
     public radius: number,
   ) {}
+
+  static unit(): Circle {
+    return new Circle(ORIGIN, 1);
+  }
+
+  shade(): Shade {
+    return this.radius > 5 ? Shade.Dark : Shade.Light;
+  }
 
   area(): number {
     return Math.PI * this.radius * this.radius;

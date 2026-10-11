@@ -595,9 +595,21 @@ impl<'m> Infer<'m> {
             BinOp::InstanceOf => {
                 // Outside a condition: decided by the types.
                 self.expr(left, None)?;
-                let ExprKind::Ident(class) = &right.kind else {
-                    return self.err("`instanceof` needs a class name", right.span);
+                // The class may be imported under another name, or through a namespace.
+                let class = match self.type_ref(right) {
+                    Some((canonical, id)) if self.vars[&id].role == Role::Class => {
+                        if let ExprKind::Member { obj: ns, .. } = &right.kind {
+                            self.set_ty(ns.id, Ty::Void);
+                        }
+                        self.refs.insert(right.id, id);
+                        canonical
+                    }
+                    _ => match &right.kind {
+                        ExprKind::Ident(c) => c.clone(),
+                        _ => return self.err("`instanceof` needs a class name", right.span),
+                    },
                 };
+                let class = &class;
                 if self
                     .struct_by_name(class)
                     .is_none_or(|s| s.kind != StructKind::Class)
@@ -1033,11 +1045,11 @@ impl<'m> Infer<'m> {
             self.narrowed_uses.insert(e.id, (name, test_id));
             return Ok(inner);
         }
-        // Static members and enum variants.
-        if let ExprKind::Ident(name) = &obj.kind
-            && let Some(id) = self.lookup(name)
-        {
-            let canonical = self.vars[&id].name.clone();
+        // Static members and enum variants: `C.x`, `E.A`, or through a namespace import.
+        if let Some((canonical, id)) = self.type_ref(obj) {
+            if let ExprKind::Member { obj: ns, .. } = &obj.kind {
+                self.set_ty(ns.id, Ty::Void);
+            }
             let name = &canonical;
             match self.vars[&id].role {
                 Role::Enum => {
@@ -1268,15 +1280,14 @@ impl<'m> Infer<'m> {
     }
 
     fn new_expr(&mut self, e: &'m Expr, callee: &'m Expr, args: &'m [Arg]) -> IResult<Ty> {
-        let ExprKind::Ident(name) = &callee.kind else {
-            return self.err("`new` needs a class name", callee.span);
-        };
-        if let Some(id) = self.lookup(name) {
+        // `new C(…)`, `new ns.C(…)`; the class may be imported under another name.
+        if let Some((canonical, id)) = self.type_ref(callee) {
             if self.vars[&id].role != Role::Class {
-                return self.err(format!("`{name}` is not a class"), callee.span);
+                return self.err(format!("`{canonical}` is not a class"), callee.span);
             }
-            // The class may be imported under another name.
-            let canonical = self.vars[&id].name.clone();
+            if let ExprKind::Member { obj: ns, .. } = &callee.kind {
+                self.set_ty(ns.id, Ty::Void);
+            }
             let name = &canonical;
             self.refs.insert(callee.id, id);
             self.set_ty(callee.id, Ty::Named(name.clone()));
@@ -1309,6 +1320,12 @@ impl<'m> Infer<'m> {
             }
             self.calls.insert(e.id, Callee::Ctor(name.clone()));
             return Ok(Ty::Named(name.clone()));
+        }
+        let ExprKind::Ident(name) = &callee.kind else {
+            return self.err("`new` needs a class name", callee.span);
+        };
+        if self.lookup(name).is_some() {
+            return self.err(format!("`{name}` is not a class"), callee.span);
         }
         match name.as_str() {
             "Error" | "TypeError" | "RangeError" => {
@@ -1860,12 +1877,13 @@ impl<'m> Infer<'m> {
             }
             return self.namespace_call(e, ns, prop, args);
         }
-        // Static methods.
-        if let ExprKind::Ident(name) = &obj.kind
-            && let Some(id) = self.lookup(name)
+        // Static methods: `C.m()`, or `ns.C.m()` through a namespace import.
+        if let Some((canonical, id)) = self.type_ref(obj)
             && self.vars[&id].role == Role::Class
         {
-            let canonical = self.vars[&id].name.clone();
+            if let ExprKind::Member { obj: ns, .. } = &obj.kind {
+                self.set_ty(ns.id, Ty::Void);
+            }
             let name = &canonical;
             self.refs.insert(obj.id, id);
             self.set_ty(obj.id, Ty::Named(name.clone()));
