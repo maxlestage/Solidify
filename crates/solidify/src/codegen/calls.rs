@@ -3,7 +3,7 @@
 use super::exprs::format_call;
 use super::{
     E, GResult, Gen, Helper, Mode, PREC_ATOM, PREC_CAST, PREC_POSTFIX, PREC_UNARY, Repr, Want,
-    pascal, snake, string_literal,
+    is_place_kind, pascal, snake, string_literal,
 };
 use crate::ast::*;
 use crate::error::Span;
@@ -117,6 +117,9 @@ impl<'a> Gen<'a> {
                 self.finish_call(code, &info, e)
             }
             Callee::Builtin(name) => {
+                if name == "new Array" {
+                    return self.new_expr(e, callee, args);
+                }
                 let ExprKind::Member { obj, .. } = &callee.kind else {
                     return self.global_call(e, name, args);
                 };
@@ -193,6 +196,34 @@ impl<'a> Gen<'a> {
                 None => (true, false, false),
             };
             let mode = self.param_mode(pt, stored, reassigned, mutated, &info.type_params);
+            // `...rest`: the extra arguments as one array (a slice, or a `Vec` when kept).
+            if info.rest && i + 1 == info.sig.params.len() {
+                let extra = &args[i.min(args.len())..];
+                let Ty::Array(item) = self.resolve(pt) else {
+                    return self.err("the rest parameter is not an array", span);
+                };
+                let code = if extra.len() == 1 && extra[0].spread {
+                    let at = self.ty_of(&extra[0].expr);
+                    let x = self.expr(&extra[0].expr)?;
+                    if mode == Mode::Value {
+                        self.owned_as(x, &at, pt)
+                    } else {
+                        self.coerce(x, &at, Want::Slice)
+                    }
+                } else {
+                    let mut items = Vec::new();
+                    for a in extra {
+                        items.push(self.expr_to(&a.expr, &item)?);
+                    }
+                    if mode == Mode::Value {
+                        format!("vec![{}]", items.join(", "))
+                    } else {
+                        format!("&[{}]", items.join(", "))
+                    }
+                };
+                list.push(code);
+                break;
+            }
             let optional = info.optional.get(i).copied().unwrap_or(false);
             match args.get(i) {
                 Some(a) => {
@@ -902,6 +933,27 @@ impl<'a> Gen<'a> {
                 self.js_value_of(&code, &ty)
             }
         })
+    }
+
+    /// `arr.reverse()`, `arr.fill(v)`: a statement, or as a value the array changed then
+    /// given back (a copy of a variable, the value itself for a temporary).
+    fn changed_array(
+        &mut self,
+        e: &'a Expr,
+        obj: &'a Expr,
+        o: E,
+        ot: &Ty,
+        recv: &str,
+        op: String,
+    ) -> E {
+        if self.stmt_call == Some(e.id) {
+            return E::owned(format!("{recv}.{op}"), PREC_POSTFIX);
+        }
+        if is_place_kind(obj) {
+            return E::owned(format!("{{ {recv}.{op}; {recv}.clone() }}"), PREC_ATOM);
+        }
+        let v = self.coerce(o, ot, Want::Owned);
+        E::owned(format!("{{ let mut v = {v}; v.{op}; v }}"), PREC_ATOM)
     }
 
     /// The callback and the delay of `setTimeout(cb, ms)`, as Rust code.
@@ -1716,13 +1768,16 @@ impl<'a> Gen<'a> {
                 }
                 E::owned(format!("[{}].concat()", parts.join(", ")), PREC_POSTFIX)
             }
-            "reverse" => E::owned(format!("{recv}.reverse()"), PREC_POSTFIX),
+            "reverse" => self.changed_array(e, obj, o, &ot, &recv, "reverse()".into()),
             "toReversed" => E::owned(
                 format!("{recv}.iter().rev().cloned().collect::<Vec<_>>()"),
                 PREC_POSTFIX,
             ),
             "sort" | "toSorted" => {
-                let target = if method == "sort" {
+                // `xs.sort()` as a value gives the array back: changed, then copied.
+                let as_value = method == "toSorted" || self.stmt_call != Some(e.id);
+                let in_place = method == "sort" && (!as_value || is_place_kind(obj));
+                let target = if in_place {
                     recv.clone()
                 } else {
                     "v".to_string()
@@ -1744,8 +1799,10 @@ impl<'a> Gen<'a> {
                         format!("{target}.sort_by({cmp})")
                     }
                 };
-                if method == "sort" {
+                if !as_value {
                     E::owned(sorting, PREC_POSTFIX)
+                } else if in_place {
+                    E::owned(format!("{{ {sorting}; {recv}.clone() }}"), PREC_ATOM)
                 } else {
                     let v = self.coerce(o, &ot, Want::Owned);
                     E::owned(format!("{{ let mut v = {v}; {sorting}; v }}"), PREC_ATOM)
@@ -1753,7 +1810,7 @@ impl<'a> Gen<'a> {
             }
             "fill" => {
                 let v = self.expr_to(&args[0].expr, &item)?;
-                E::owned(format!("{recv}.fill({v})"), PREC_POSTFIX)
+                self.changed_array(e, obj, o, &ot, &recv, format!("fill({v})"))
             }
             "at" => {
                 let v = self.coerce(o, &ot, Want::Slice);

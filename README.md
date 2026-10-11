@@ -118,6 +118,7 @@ Three passes, all deterministic:
 | `import`, `export`, `export default`, `import * as ns`, `export … from` | one `mod` per imported file, `pub` for exports |
 | `console.log` of objects, arrays, maps, sets, nested values | the exact text Node.js prints (`util.inspect` rules) |
 | `any`, `unknown` | inferred from use |
+| `...rest` parameters, `f(...xs)`, `{ ...base, z }`, `[a, ...rest] = xs`, `({ x, y }: Point) =>` | slices, `vec!`, struct literals built field by field, `let rest = xs[1..].to_vec()` |
 | `parseInt` | `Option<i64>` (`NaN` is `None`), narrowed by `isNaN` |
 
 What stays different, because Rust values are not JavaScript references: an object stored in two places is copied, and changing one copy leaves the other alone (variables changed inside closures that outlive their scope are shared through `Rc<RefCell<T>>`). Numbers are `i64` until a float is involved, so an integer that overflows panics where JavaScript would lose precision. Imports go between your own files only, not to packages. `JSON` replacers and revivers, `Symbol`, `Proxy`, `eval`, prototype manipulation and `arguments` have no Rust counterpart and are refused with a message that says what to write instead.
@@ -136,7 +137,7 @@ Four rules worth knowing:
 | Folder | Contents |
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | The transpiler: lexer, parser, type inference, code generation, CLI |
-| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 26 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
+| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 27 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
 | [`site`](site) | The website: a playground running Solidify as WebAssembly, written with [active](https://github.com/maxlestage/Active) |
 
 ## Development
