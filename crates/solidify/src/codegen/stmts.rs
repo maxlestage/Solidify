@@ -259,10 +259,41 @@ impl<'a> Gen<'a> {
     fn error_value(&mut self, e: &'a Expr) -> GResult<String> {
         let ty = self.ty_of(e);
         let x = self.expr(e)?;
+        // An error of the program's own class: encoded with its classes and fields.
+        if let Ty::Named(n, _) = self.resolve(&ty)
+            && self.p.is_error_class(&n)
+        {
+            self.helper(super::Helper::Error);
+            let code = self.coerce(x, &ty, Want::Display);
+            let v = self.js_value_of(&code, &ty);
+            let classes = self.p.error_ancestry(&n).join(",");
+            return Ok(format!("js_error_encode(&{v}, \"{classes},Error\")"));
+        }
         Ok(self.owned(x, &ty))
     }
 
+    /// A jump out of the closure of a `try` block: the closure gives it back.
+    fn jump_out_of_try(&mut self, is_break: bool, label: Option<&str>) -> Option<String> {
+        let targets = &self.fn_ctx().targets;
+        let index = targets.iter().rposition(|t| match (t, label) {
+            (Target::Loop { label: name, .. }, Some(l)) => name.as_deref() == Some(l),
+            (Target::Loop { .. }, None) => true,
+            (Target::Switch { .. }, None) => is_break,
+            (Target::Switch { .. }, Some(_)) => false,
+        })?;
+        let try_ctx = self.fn_ctx_mut().try_ctx.last_mut()?;
+        if index >= try_ctx.targets {
+            return None;
+        }
+        try_ctx.jumps.push((is_break, label.map(str::to_string)));
+        let n = try_ctx.jumps.len() - 1;
+        Some(format!("return Err(\"\\u{{1}}jump:{n}\".to_string());"))
+    }
+
     fn break_text(&mut self, label: Option<&str>, span: crate::error::Span) -> GResult<String> {
+        if let Some(text) = self.jump_out_of_try(true, label) {
+            return Ok(text);
+        }
         if let Some(l) = label {
             for t in self.fn_ctx().targets.iter().rev() {
                 if let Target::Loop {
@@ -288,6 +319,9 @@ impl<'a> Gen<'a> {
     }
 
     fn continue_text(&mut self, label: Option<&str>, span: crate::error::Span) -> GResult<String> {
+        if let Some(text) = self.jump_out_of_try(false, label) {
+            return Ok(text);
+        }
         let targets = &self.fn_ctx().targets;
         let found = targets.iter().rev().find(|t| match t {
             Target::Loop { label: name, .. } => match label {
@@ -2211,6 +2245,12 @@ impl<'a> Gen<'a> {
     }
 
     fn switch_stmt(&mut self, disc: &'a Expr, cases: &'a [Case]) -> GResult<()> {
+        let falls = cases.iter().enumerate().any(|(i, c)| {
+            i + 1 < cases.len() && !c.body.is_empty() && !c.body.last().is_some_and(always_exits)
+        });
+        if falls {
+            return self.switch_falling(disc, cases);
+        }
         if let Some(text) = self.switch_on_union(disc, cases)? {
             self.out.push_str(&text);
             return Ok(());
@@ -2498,6 +2538,76 @@ impl<'a> Gen<'a> {
     }
 
     /// A `switch` whose cases are not constants: a chain of `if`.
+    /// A `switch` whose cases fall through: the case that matches is found first, then
+    /// every body from it on runs until a `break`.
+    fn switch_falling(&mut self, disc: &'a Expr, cases: &'a [Case]) -> GResult<()> {
+        let dt = self.ty_of(disc);
+        let d = self.expr_as(disc, Want::Owned)?;
+        self.line(&format!("let switch_ = {d};"));
+        let mut tests = Vec::new();
+        for (i, c) in cases.iter().enumerate() {
+            if let Some(t) = &c.test {
+                let v = self.expr_as(
+                    t,
+                    if self.is_str(&dt) {
+                        Want::StrRef
+                    } else {
+                        Want::Owned
+                    },
+                )?;
+                tests.push(format!("if switch_ == {v} {{ {i} }}"));
+            }
+        }
+        let default = cases
+            .iter()
+            .position(|c| c.test.is_none())
+            .unwrap_or(cases.len());
+        let found = if tests.is_empty() {
+            default.to_string()
+        } else {
+            format!("{} else {{ {default} }}", tests.join(" else "))
+        };
+        self.line(&format!("let case_ = {found};"));
+        let label = self.fresh_label("switch");
+        self.fn_ctx_mut().targets.push(Target::Switch {
+            rust_label: label.clone(),
+            used: false,
+        });
+        let text = self.capture(|g| {
+            for (i, c) in cases.iter().enumerate() {
+                if c.body.is_empty() {
+                    continue;
+                }
+                g.line(&format!("if case_ <= {i} {{"));
+                g.indent += 1;
+                g.block_body(&c.body, false)?;
+                g.indent -= 1;
+                g.line("}");
+            }
+            Ok(())
+        })?;
+        let Some(Target::Switch { used, .. }) = self.fn_ctx_mut().targets.pop() else {
+            unreachable!()
+        };
+        self.line(&format!("#[allow(unused_labels)] {label}: {{"));
+        self.indent += 1;
+        self.out.push_str(&indent_text(&text, 1));
+        self.indent -= 1;
+        self.line("}");
+        // Every case ends in the last body, which leaves: nothing runs after.
+        let exits = default < cases.len()
+            && !used
+            && cases
+                .iter()
+                .rev()
+                .find(|c| !c.body.is_empty())
+                .is_some_and(|c| c.body.last().is_some_and(always_exits));
+        if exits {
+            self.line("unreachable!()");
+        }
+        Ok(())
+    }
+
     fn switch_as_ifs(&mut self, disc: &'a Expr, cases: &'a [Case]) -> GResult<()> {
         let dt = self.ty_of(disc);
         let d = self.expr_as(disc, Want::Owned)?;
@@ -2589,12 +2699,6 @@ impl<'a> Gen<'a> {
             .any(|s| walk(s, &mut |st| matches!(st.kind, StmtKind::Return(_)), false));
         // Every path of the block returns or throws: nothing runs after the closure.
         let always = self.p.try_returns.contains(&block.span.start);
-        if contains_break_or_continue(&block.stmts) {
-            return self.err(
-                "`break` and `continue` inside `try` are not supported",
-                block.span,
-            );
-        }
         let ret_ty = self.fn_ctx().ret_ty.clone();
         let result_ty = if returns {
             let t = self.rust_ty(&ret_ty, block.span)?;
@@ -2602,7 +2706,12 @@ impl<'a> Gen<'a> {
         } else {
             "Result<(), String>".into()
         };
-        self.fn_ctx_mut().try_ctx.push(TryCtx { returns });
+        let targets = self.fn_ctx().targets.len();
+        self.fn_ctx_mut().try_ctx.push(TryCtx {
+            returns,
+            targets,
+            jumps: Vec::new(),
+        });
         let body = self.capture(|g| {
             g.indent += 1;
             g.block_body(&block.stmts, false)?;
@@ -2612,13 +2721,29 @@ impl<'a> Gen<'a> {
             g.indent -= 1;
             Ok(())
         });
-        self.fn_ctx_mut().try_ctx.pop();
+        let jumps = self
+            .fn_ctx_mut()
+            .try_ctx
+            .pop()
+            .map(|t| t.jumps)
+            .unwrap_or_default();
         let body = body?;
         self.line(&format!("let result_: {result_ty} = (|| {{"));
         self.out.push_str(&body);
         self.line("})();");
         if let Some(f) = finally {
             self.block_body(&f.stmts, false)?;
+        }
+        // A `break` or `continue` that left the block: made now.
+        for (i, (is_break, label)) in jumps.iter().enumerate() {
+            let text = if *is_break {
+                self.break_text(label.as_deref(), block.span)?
+            } else {
+                self.continue_text(label.as_deref(), block.span)?
+            };
+            self.line(&format!(
+                "if matches!(&result_, Err(e) if e == \"\\u{{1}}jump:{i}\") {{ {text} }}"
+            ));
         }
         let ret = if self.fn_ctx().returns_result {
             "return Ok(v)"
@@ -2758,16 +2883,6 @@ fn contains_break(s: &Stmt, label: Option<&str>) -> bool {
         },
         true,
     )
-}
-
-fn contains_break_or_continue(stmts: &[Stmt]) -> bool {
-    stmts.iter().any(|s| {
-        walk(
-            s,
-            &mut |st| matches!(st.kind, StmtKind::Break(_) | StmtKind::Continue(_)),
-            true,
-        )
-    })
 }
 
 /// Visits the statements of `s` that belong to the same loop (not nested loops when

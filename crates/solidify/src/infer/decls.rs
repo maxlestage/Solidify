@@ -408,7 +408,12 @@ impl<'m> Infer<'m> {
         // The base class first: its fields come first, its methods are inherited.
         let mut parent = None;
         let mut fields = Vec::new();
-        if let Some(base) = &c.extends {
+        if let Some(base) = &c.extends
+            && matches!(&base.kind, ExprKind::Ident(b) if b == crate::desugar::ERROR_BASE)
+        {
+            // A class of errors: thrown and caught like `Error`.
+            self.error_classes.insert(c.name.clone());
+        } else if let Some(base) = &c.extends {
             let ExprKind::Ident(base_name) = &base.kind else {
                 return self.err(
                     "a class can only extend a class declared in the program",

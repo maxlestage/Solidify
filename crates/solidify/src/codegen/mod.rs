@@ -128,6 +128,10 @@ pub(super) enum Target {
 pub(super) struct TryCtx {
     /// `return v` inside the block returns `Ok(Some(v))`.
     returns: bool,
+    /// The jump targets outside the block: those before this index.
+    targets: usize,
+    /// `break` / `continue` (with their label) leaving the block: made after it.
+    jumps: Vec<(bool, Option<String>)>,
 }
 
 pub(super) struct FnGen {
@@ -906,6 +910,10 @@ impl<'a> Gen<'a> {
         if h == Helper::Eval {
             self.helper(Helper::Dynamic);
         }
+        if h == Helper::Error {
+            self.helpers
+                .extend([Helper::Json, Helper::Inspect, Helper::NumText]);
+        }
         if h == Helper::BigInt {
             self.helpers.insert(Helper::Inspect);
             self.helpers.insert(Helper::NumText);
@@ -971,6 +979,7 @@ impl<'a> Gen<'a> {
             Helper::Shared => "Shared",
             Helper::Node => "js_node_os_info",
             Helper::BigInt => "JsBigInt",
+            Helper::Error => "js_error_encode",
         }
     }
 
