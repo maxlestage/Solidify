@@ -110,7 +110,7 @@ Three passes, all deterministic:
 | `console.log`, `Math`, `parseInt`… | `println!`, `f64` methods, small helpers appended to the file |
 | recursive classes | `Option<Box<T>>` |
 | `class B extends A`, `abstract`, `super`, `protected`, `instanceof` | flattened structs, a trait per base class, `Box<dyn ALike>` where an `A` is expected |
-| `A \| B`, discriminated unions, `typeof x === "string"`, `"kind" in x` | `enum` with one variant per member, `match` |
+| `A \| B`, `[1, "two"]`, discriminated unions, `typeof x === "string"`, `"kind" in x` | `enum` with one variant per member, `match` |
 | `function*`, `yield`, `yield*` | `JsGenerator<T>`, `for x in gen` |
 | `setTimeout`, `setInterval`, `clearTimeout`, `new Promise`, `Promise.all` | an event loop run by `main`, `JsPromise` |
 | `/regex/flags`, `new RegExp`, `test`, `exec`, `match`, `matchAll`, `replace`, `split`, `search` | `JsRegex`, a backtracking engine shipped in the generated file |

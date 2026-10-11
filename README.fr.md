@@ -110,7 +110,7 @@ Trois passes, toutes déterministes :
 | `console.log`, `Math`, `parseInt`… | `println!`, méthodes de `f64`, petits utilitaires ajoutés au fichier |
 | classes récursives | `Option<Box<T>>` |
 | `class B extends A`, `abstract`, `super`, `protected`, `instanceof` | structs aplaties, un trait par classe de base, `Box<dyn ALike>` là où un `A` est attendu |
-| `A \| B`, unions discriminées, `typeof x === "string"`, `"kind" in x` | `enum` avec une variante par membre, `match` |
+| `A \| B`, `[1, "two"]`, unions discriminées, `typeof x === "string"`, `"kind" in x` | `enum` avec une variante par membre, `match` |
 | `function*`, `yield`, `yield*` | `JsGenerator<T>`, `for x in gen` |
 | `setTimeout`, `setInterval`, `clearTimeout`, `new Promise`, `Promise.all` | une boucle d'événements lancée par `main`, `JsPromise` |
 | `/regex/flags`, `new RegExp`, `test`, `exec`, `match`, `matchAll`, `replace`, `split`, `search` | `JsRegex`, un moteur à retour arrière livré dans le fichier généré |
