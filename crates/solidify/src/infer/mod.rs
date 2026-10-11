@@ -100,6 +100,8 @@ pub struct FnInfo {
     pub is_static: bool,
     /// `abstract m(): T;`: no body; the subclasses implement it.
     pub is_abstract: bool,
+    /// The last parameter is `...rest: T[]`: the extra arguments make an array.
+    pub rest: bool,
     pub mutates_self: bool,
     /// Outer bindings read by this closure.
     pub captures: Vec<NodeId>,

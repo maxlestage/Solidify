@@ -429,13 +429,22 @@ impl<'m> Infer<'m> {
                 }
                 other => {
                     let id = self.synth_id();
-                    self.declare(
-                        &format!("arg{i}"),
-                        id,
-                        ty.clone(),
-                        Role::Param,
-                        other.span(),
-                    );
+                    // Named after its type when it has a name: `{ x, y }: Point` is `point`.
+                    let mut name = match &p.ty {
+                        Some(TypeAnn::Named { name, .. }) => {
+                            let mut c = name.chars();
+                            c.next()
+                                .map(|f| f.to_lowercase().collect::<String>() + c.as_str())
+                                .unwrap_or_default()
+                        }
+                        _ => String::new(),
+                    };
+                    let taken: Vec<String> =
+                        other.names().iter().map(|(n, _)| n.to_string()).collect();
+                    if name.is_empty() || taken.contains(&name) || self.lookup(&name).is_some() {
+                        name = format!("arg{i}");
+                    }
+                    self.declare(&name, id, ty.clone(), Role::Param, other.span());
                     param_ids.push(id);
                     self.bind_pattern(other, &ty, Role::Local)?;
                 }

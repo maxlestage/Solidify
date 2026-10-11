@@ -204,6 +204,8 @@ pub(super) struct Gen<'a> {
     pub opts: &'a Options,
     /// Writing the items of an imported file, inside its module.
     pub in_module: bool,
+    /// The call that is the whole current statement: its result is not used.
+    pub stmt_call: Option<NodeId>,
 }
 
 pub(super) type GResult<T> = Result<T, Error>;
@@ -220,6 +222,7 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         uses_hashset: false,
         ordered: false,
         in_module: false,
+        stmt_call: None,
         inspected: BTreeSet::new(),
         json_types: BTreeSet::new(),
         union_accessors: BTreeSet::new(),
@@ -1738,6 +1741,14 @@ pub(super) enum Mode {
     Slice,
     OptRef,
     FnImpl,
+}
+
+/// A variable, a field or an element: a value that lives on after the expression.
+pub(super) fn is_place_kind(e: &Expr) -> bool {
+    matches!(
+        e.kind,
+        ExprKind::Ident(_) | ExprKind::Member { .. } | ExprKind::Index { .. } | ExprKind::This
+    )
 }
 
 pub(super) fn is_int_literal(code: &str) -> bool {

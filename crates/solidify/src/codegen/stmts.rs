@@ -334,9 +334,6 @@ impl<'a> Gen<'a> {
                     let Some(init) = &d.init else {
                         return self.err("destructuring needs a value", *span);
                     };
-                    if rest.is_some() {
-                        return self.err("rest elements are not supported", *span);
-                    }
                     let it = self.ty_of(init);
                     let plain_names = elems.iter().all(|e| {
                         e.as_ref().is_some_and(|e| {
@@ -346,6 +343,7 @@ impl<'a> Gen<'a> {
                     // `let [a, b] = [x, y]`: a tuple on both sides.
                     if let ExprKind::Array(items) = &init.kind
                         && plain_names
+                        && rest.is_none()
                         && items.len() == elems.len()
                         && items.iter().all(|i| matches!(i, ArrayElem::Expr(_)))
                     {
@@ -376,7 +374,7 @@ impl<'a> Gen<'a> {
                         continue;
                     }
                     match self.resolve(&it) {
-                        Ty::Tuple(_) if plain_names => {
+                        Ty::Tuple(_) if plain_names && rest.is_none() => {
                             let value = self.expr_as(init, Want::Owned)?;
                             let mut names = Vec::new();
                             for el in elems.iter().flatten() {
@@ -395,40 +393,7 @@ impl<'a> Gen<'a> {
                         }
                         _ => {
                             let base = self.temp_binding(init, "parts")?;
-                            for (i, el) in elems.iter().enumerate() {
-                                let Some(el) = el else { continue };
-                                let Pattern::Ident { id, span, .. } = &el.pat else {
-                                    return self
-                                        .err("nested patterns are not supported", el.pat.span());
-                                };
-                                let var = self.p.var(*id);
-                                let ty = self.resolve(&var.ty);
-                                let access = if matches!(self.resolve(&it), Ty::Tuple(_)) {
-                                    format!("{base}.{i}")
-                                } else {
-                                    format!("{base}[{i}]")
-                                };
-                                let value = if self.is_copy(&ty) {
-                                    access
-                                } else {
-                                    format!("{access}.clone()")
-                                };
-                                let value = match &el.default {
-                                    Some(d) => {
-                                        let dv = self.expr_to(d, &ty)?;
-                                        format!("{value}.unwrap_or({dv})")
-                                    }
-                                    None => value,
-                                };
-                                let m = if var.reassigned || var.mutated {
-                                    "mut "
-                                } else {
-                                    ""
-                                };
-                                let name = self.bind(*id, Repr::Owned);
-                                let _ = span;
-                                self.line(&format!("let {m}{name} = {value};"));
-                            }
+                            self.destructure_array(elems, rest, &base, &it)?;
                         }
                     }
                 }
@@ -438,46 +403,117 @@ impl<'a> Gen<'a> {
                     };
                     let base = self.temp_binding(init, "obj")?;
                     let it = self.ty_of(init);
-                    for p in props {
-                        let Pattern::Ident { id, .. } = &p.value else {
-                            return self.err("nested patterns are not supported", p.value.span());
-                        };
-                        let var = self.p.var(*id);
-                        let ty = self.resolve(&var.ty);
-                        let access = match self.resolve(&it) {
-                            Ty::Map(..) => format!("{base}[{}]", super::string_literal(&p.key)),
-                            _ => format!("{base}.{}", snake(&p.key)),
-                        };
-                        let field_optional = match self.resolve(&it) {
-                            Ty::Named(n) => self
-                                .p
-                                .struct_info(&n)
-                                .and_then(|s| s.field(&p.key))
-                                .is_some_and(|f| f.optional),
-                            _ => false,
-                        };
-                        let value = if self.is_copy(&ty) && !field_optional {
-                            access.clone()
-                        } else {
-                            format!("{access}.clone()")
-                        };
-                        let value = match &p.default {
-                            Some(d) => {
-                                let dv = self.expr_to(d, &ty)?;
-                                format!("{value}.unwrap_or({dv})")
-                            }
-                            None => value,
-                        };
-                        let m = if var.reassigned || var.mutated {
-                            "mut "
-                        } else {
-                            ""
-                        };
-                        let name = self.bind(*id, Repr::Owned);
-                        self.line(&format!("let {m}{name} = {value};"));
-                    }
+                    self.destructure_object(props, &base, &it)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    /// `{ a, b: c = d }` taken from the variable `base` of type `it`.
+    pub(super) fn destructure_object(
+        &mut self,
+        props: &'a [PatProp],
+        base: &str,
+        it: &Ty,
+    ) -> GResult<()> {
+        for p in props {
+            let Pattern::Ident { id, .. } = &p.value else {
+                return self.err("nested patterns are not supported", p.value.span());
+            };
+            let var = self.p.var(*id);
+            let ty = self.resolve(&var.ty);
+            let access = match self.resolve(it) {
+                Ty::Map(..) => format!("{base}[{}]", super::string_literal(&p.key)),
+                _ => format!("{base}.{}", snake(&p.key)),
+            };
+            let field_optional = match self.resolve(it) {
+                Ty::Named(n) => self
+                    .p
+                    .struct_info(&n)
+                    .and_then(|s| s.field(&p.key))
+                    .is_some_and(|f| f.optional),
+                _ => false,
+            };
+            let value = if self.is_copy(&ty) && !field_optional {
+                access.clone()
+            } else {
+                format!("{access}.clone()")
+            };
+            let value = match &p.default {
+                Some(d) => {
+                    let dv = self.expr_to(d, &ty)?;
+                    format!("{value}.unwrap_or({dv})")
+                }
+                None => value,
+            };
+            let m = if var.reassigned || var.mutated {
+                "mut "
+            } else {
+                ""
+            };
+            let name = self.bind(*id, Repr::Owned);
+            self.line(&format!("let {m}{name} = {value};"));
+        }
+        Ok(())
+    }
+
+    /// `[a, b = c, ...rest]` taken from the variable `base` of type `it`.
+    pub(super) fn destructure_array(
+        &mut self,
+        elems: &'a [Option<PatElem>],
+        rest: &'a Option<Box<Pattern>>,
+        base: &str,
+        it: &Ty,
+    ) -> GResult<()> {
+        for (i, el) in elems.iter().enumerate() {
+            let Some(el) = el else { continue };
+            let Pattern::Ident { id, .. } = &el.pat else {
+                return self.err("nested patterns are not supported", el.pat.span());
+            };
+            let var = self.p.var(*id);
+            let ty = self.resolve(&var.ty);
+            let access = if matches!(self.resolve(it), Ty::Tuple(_)) {
+                format!("{base}.{i}")
+            } else {
+                format!("{base}[{i}]")
+            };
+            let value = if self.is_copy(&ty) {
+                access
+            } else {
+                format!("{access}.clone()")
+            };
+            let value = match &el.default {
+                Some(d) => {
+                    let dv = self.expr_to(d, &ty)?;
+                    format!("{value}.unwrap_or({dv})")
+                }
+                None => value,
+            };
+            let m = if var.reassigned || var.mutated {
+                "mut "
+            } else {
+                ""
+            };
+            let name = self.bind(*id, Repr::Owned);
+            self.line(&format!("let {m}{name} = {value};"));
+        }
+        // `[a, ...rest]`: the elements left, as a new array.
+        if let Some(r) = rest {
+            let Pattern::Ident { id, .. } = r.as_ref() else {
+                return self.err("nested patterns are not supported", r.span());
+            };
+            let var = self.p.var(*id);
+            let m = if var.reassigned || var.mutated {
+                "mut "
+            } else {
+                ""
+            };
+            let name = self.bind(*id, Repr::Owned);
+            self.line(&format!(
+                "let {m}{name} = {base}[{}..].to_vec();",
+                elems.len()
+            ));
         }
         Ok(())
     }
@@ -688,7 +724,10 @@ impl<'a> Gen<'a> {
                 Ok(())
             }
             ExprKind::Call { .. } | ExprKind::New { .. } | ExprKind::Await(_) => {
-                let x = self.expr(e)?;
+                let outer = self.stmt_call.replace(e.id);
+                let x = self.expr(e);
+                self.stmt_call = outer;
+                let x = x?;
                 // `map.delete(k);` as a statement: the result is not wanted.
                 let code = match self.p.calls.get(&e.id) {
                     Some(Callee::Builtin("map.delete" | "set.delete")) => x
