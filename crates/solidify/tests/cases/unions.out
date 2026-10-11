@@ -11,3 +11,9 @@ five true false
 num(4) op(+) end 3 4 0
 { type: 'op', symbol: '+' } n:3 s:x b:false null
 [ 'num', 'op', 'end' ] { type: 'end' }
+2
+TWO
+7
+FOUR
+[ 1, 'two', 3.5, 'four' ] 4
+[ 1, [ 2, 3 ], 'x' ] [1,[2,3],"x"]
