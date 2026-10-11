@@ -51,8 +51,10 @@ impl Thermostat {
 
 fn main() {
     let mut t = Thermostat::new("hall".to_string());
-    t.set_target(24);
-    t.set_target(40);
+    let value_ = 24;
+    t.set_target(value_);
+    let value_ = 40;
+    t.set_target(value_);
     println!("{} {} {} {}", t.target(), t.level(), t.history.len(), Thermostat::MAX);
     println!("{} {} {}", t.to_string(), t.to_string().to_string(), Thermostat::from_default().name);
     let level = Level::High;

@@ -75,6 +75,8 @@ pub struct VarInfo {
     /// Changed, and captured by a closure that outlives the scope: the closure and the
     /// scope share it (`Rc<RefCell<T>>`).
     pub shared: bool,
+    /// Made from this other variable (`const b = a`) and sharing its cell.
+    pub shares_with: Option<NodeId>,
     /// The loop depth where it was declared (last-use analysis).
     pub loop_depth: usize,
     pub span: Span,
@@ -378,6 +380,11 @@ pub struct Program {
     pub dyn_casts: HashMap<NodeId, (Ty, Ty)>,
     /// Object and array literals built as values known at run time.
     pub dyn_literals: HashSet<NodeId>,
+    /// Classes and object types whose instances are shared between the places holding
+    /// them (`Shared<T>`): changed through one, changed for all; `===` is identity.
+    pub shared_types: HashSet<String>,
+    /// Fields sharing their collection with a variable (`Rc<RefCell<T>>`).
+    pub shared_fields: HashSet<(String, String)>,
     /// `eval(code)` with code known at run time: the variables it sees (a read of each).
     pub eval_scopes: HashMap<NodeId, Vec<(String, Expr)>>,
     /// Test expression → what it narrows.
@@ -632,6 +639,16 @@ impl Program {
     pub fn is_dyn(&self, name: &str) -> bool {
         self.polymorphic.contains(name)
     }
+
+    /// Whether a field shares its collection with a variable.
+    pub fn is_shared_field(&self, s: &str, f: &str) -> bool {
+        self.shared_fields.contains(&(s.to_string(), f.to_string()))
+    }
+
+    /// Whether the instances of a struct are shared (`Shared<T>`).
+    pub fn is_shared(&self, name: &str) -> bool {
+        self.shared_types.contains(name)
+    }
     pub fn ty(&self, id: NodeId) -> Ty {
         self.expr_ty.get(&id).cloned().unwrap_or(Ty::Any)
     }
@@ -752,6 +769,20 @@ pub(super) struct Infer<'m> {
     pub(super) enum_literal: HashMap<NodeId, (String, String)>,
     pub(super) dyn_casts: HashMap<NodeId, (Ty, Ty)>,
     pub(super) dyn_literals: HashSet<NodeId>,
+    /// Struct types changed through a path (`a.count = 1`, `list[0].items.push(x)`).
+    pub(super) changed_types: HashSet<String>,
+    /// Methods called on an instance that is not `this`, with its class.
+    pub(super) instance_calls: Vec<(NodeId, String)>,
+    /// Types of values copied out of a place (stored, returned).
+    pub(super) copied_types: Vec<Ty>,
+    /// Struct types compared with `===`.
+    pub(super) identity_types: HashSet<String>,
+    /// `const b = a`: (b, a).
+    pub(super) var_aliases: Vec<(NodeId, NodeId)>,
+    /// `{ items: list }`: (struct, field, variable).
+    pub(super) field_sources: Vec<(String, String, NodeId)>,
+    /// Fields changed through a path (`holder.items.push(x)`).
+    pub(super) changed_fields: HashSet<(String, String)>,
     pub(super) eval_scopes: HashMap<NodeId, Vec<(String, Expr)>>,
     /// The type expected of the call being inferred (`JSON.parse` reads it).
     pub(super) call_expected: Option<Ty>,
@@ -903,6 +934,13 @@ pub fn infer<'m>(
         enum_literal: HashMap::new(),
         dyn_casts: HashMap::new(),
         dyn_literals: HashSet::new(),
+        changed_types: HashSet::new(),
+        instance_calls: Vec::new(),
+        copied_types: Vec::new(),
+        identity_types: HashSet::new(),
+        var_aliases: Vec::new(),
+        field_sources: Vec::new(),
+        changed_fields: HashSet::new(),
         eval_scopes: HashMap::new(),
         call_expected: None,
         narrow_tests: HashMap::new(),
@@ -1095,6 +1133,7 @@ impl<'m> Infer<'m> {
                 iter_result: false,
                 regex_flags: None,
                 shared: false,
+                shares_with: None,
                 loop_depth: depth,
                 span,
             },
