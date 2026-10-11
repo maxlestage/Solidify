@@ -12,7 +12,7 @@ async fn total(xs: &[i64]) -> i64 {
 
 fn main() {
     block_on(async {
-        let result = total(&vec![1, 2, 3]).await;
+        let result = total(&[1, 2, 3]).await;
         println!("total: {result}");
     })
 }

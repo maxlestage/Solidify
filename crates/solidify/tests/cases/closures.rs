@@ -29,7 +29,7 @@ fn main() {
         if excited { format!("{base}!") } else { base }
     };
     println!("{} {}", greet("Ada".to_string(), false), greet("Bob".to_string(), true));
-    println!("{} {} {} {}", first(&vec![7, 8]), first(&vec!["a".to_string(), "b".to_string()]), same(1, 1), same("x".to_string(), "y".to_string()));
+    println!("{} {} {} {}", first(&[7, 8]), first(&["a".to_string(), "b".to_string()]), same(1, 1), same("x", "y"));
     let mut hits = 0;
     vec![1, 2, 3].into_iter().for_each(|n| {
         if n % 2 == 1 {

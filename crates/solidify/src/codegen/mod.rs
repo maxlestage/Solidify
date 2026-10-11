@@ -955,6 +955,7 @@ impl<'a> Gen<'a> {
                 Repr::Usize | Repr::OptRef => e.code,
             },
             Want::Slice => match e.repr {
+                Repr::Owned if e.code.starts_with("vec![") => format!("&{}", &e.code[4..]),
                 Repr::Owned | Repr::Place => format!("&{}", Self::paren(&e, PREC_UNARY)),
                 Repr::Ref | Repr::RefMut => e.code,
                 _ => e.code,

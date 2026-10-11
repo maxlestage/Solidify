@@ -19,8 +19,8 @@ fn sum(items: &[String]) -> Result<f64, String> {
 
 fn main() {
     let result_: Result<(), String> = (|| {
-        println!("{}", sum(&vec!["1".to_string(), "2.5".to_string(), "3".to_string()])?);
-        println!("{}", sum(&vec!["1".to_string(), "x".to_string()])?);
+        println!("{}", sum(&["1".to_string(), "2.5".to_string(), "3".to_string()])?);
+        println!("{}", sum(&["1".to_string(), "x".to_string()])?);
         Ok(())
     })();
     if let Err(e) = result_ {

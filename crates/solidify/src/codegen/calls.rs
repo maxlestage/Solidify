@@ -172,8 +172,12 @@ impl<'a> Gen<'a> {
                     let x = self.expr(&a.expr)?;
                     let code = match mode {
                         Mode::Value => {
+                            let generic = matches!(self.resolve(pt), Ty::Named(ref n) if info.type_params.contains(n));
                             if optional {
                                 self.owned_as(x, &at, pt)
+                            } else if generic && x.repr == Repr::Str {
+                                // A string literal for a type parameter: `&str` does.
+                                x.code
                             } else {
                                 self.owned(x, &at)
                             }
