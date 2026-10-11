@@ -668,6 +668,7 @@ impl<'a> Gen<'a> {
         // A string literal kept as a `&str`.
         if let ExprKind::Str(s) = &init.kind
             && fixed
+            && !self.is_dynamic(ty)
             && !var.mutated
             && !var.stored
             && !self.p.enum_literal.contains_key(&init.id)
@@ -960,6 +961,20 @@ impl<'a> Gen<'a> {
             let r = Self::paren(&r, PREC_POSTFIX);
             let i = self.expr_as(value, Want::Owned)?;
             self.line(&format!("{r}.set_last_index({i});"));
+            return Ok(());
+        }
+        // `record.key = value`
+        if let ExprKind::Member { obj, prop, .. } = &t.kind
+            && let Ty::Map(_, v, true) = self.ty_of(obj)
+            && op == AssignOp::Assign
+        {
+            let m = self.expr_as(obj, Want::RefMut)?;
+            let m = m.trim_start_matches("&mut ").to_string();
+            let val = self.expr_to(value, &v)?;
+            self.line(&format!(
+                "{m}.insert({}.to_string(), {val});",
+                super::string_literal(prop)
+            ));
             return Ok(());
         }
         // `map[key] = value`
