@@ -884,7 +884,11 @@ impl<'a> Gen<'a> {
     /// The variant of union `to` that a value of type `from` fills, if `to` is a union
     /// and `from` one of its members.
     pub(super) fn union_variant(&self, from: &Ty, to: &Ty) -> Option<(String, String)> {
-        let u = self.union_of(to)?;
+        let to = match self.resolve(to) {
+            Ty::Option(inner) => self.resolve(&inner),
+            other => other,
+        };
+        let u = self.union_of(&to)?;
         let from = self.resolve(from);
         if matches!(&from, Ty::Named(n) if *n == u.name) {
             return None;

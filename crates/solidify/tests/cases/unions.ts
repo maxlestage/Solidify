@@ -82,3 +82,54 @@ console.log(picked, picked.kind === "square", area(picked));
 let value: string | number = 5;
 value = "five";
 console.log(value, value === "five", value === 5);
+
+// Tagged tokens, else-if chains, nullable unions.
+type Token = { type: "num"; value: number } | { type: "op"; symbol: string } | { type: "end" };
+
+class Lexer {
+  tokens: Token[] = [];
+  current: Token | null = null;
+
+  push(t: Token): void {
+    this.tokens.push(t);
+    this.current = t;
+  }
+
+  describe(): string {
+    const parts: string[] = [];
+    for (const t of this.tokens) {
+      if (t.type === "num") {
+        parts.push(`num(${t.value})`);
+      } else if (t.type === "op") {
+        parts.push(`op(${t.symbol})`);
+      } else {
+        parts.push("end");
+      }
+    }
+    return parts.join(" ");
+  }
+}
+
+function numberOf(t: Token): number {
+  if (t.type !== "num") {
+    return 0;
+  }
+  return t.value;
+}
+
+function show(x: number | string | boolean | null): string {
+  if (x === null) return "null";
+  if (typeof x === "number") return `n:${x}`;
+  if (typeof x === "string") return `s:${x}`;
+  return `b:${x}`;
+}
+
+const lx = new Lexer();
+lx.push({ type: "num", value: 4 });
+lx.push({ type: "op", symbol: "+" });
+lx.push({ type: "end" });
+console.log(lx.describe(), lx.tokens.length, numberOf(lx.tokens[0]), numberOf(lx.tokens[1]));
+const found = lx.tokens.find((t) => t.type === "op");
+console.log(found, show(3), show("x"), show(false), show(null));
+const kinds = lx.tokens.map((t) => t.type);
+console.log(kinds, lx.current);

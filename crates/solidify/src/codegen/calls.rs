@@ -175,11 +175,15 @@ impl<'a> Gen<'a> {
                         && mode != Mode::FnImpl
                         && self.union_variant(&at, pt).is_some()
                     {
-                        let wrapped = self.owned_as(x, &at, pt);
-                        list.push(if mode == Mode::RefMut {
-                            format!("&mut {wrapped}")
-                        } else {
-                            format!("&{wrapped}")
+                        let target = match self.resolve(pt) {
+                            Ty::Option(inner) => *inner,
+                            other => other,
+                        };
+                        let wrapped = self.owned_as(x, &at, &target);
+                        list.push(match mode {
+                            Mode::RefMut => format!("&mut {wrapped}"),
+                            Mode::OptRef => format!("Some(&{wrapped})"),
+                            _ => format!("&{wrapped}"),
                         });
                         continue;
                     }
