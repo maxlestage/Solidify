@@ -59,3 +59,12 @@ fn js_error_as<T: JsFromJson>(e: &str, class: &str) -> Option<T> {
     }
     js_error_parts(e).and_then(|(_, _, json)| js_json_parse_as::<T>(json).ok())
 }
+
+/// `String(e)`: `Name: message`, or a thrown value that was not an error as it is.
+#[allow(dead_code)]
+fn js_error_text_named(e: &str) -> String {
+    match e.strip_prefix('\u{3}') {
+        Some(value) => value.to_string(),
+        None => format!("{}: {}", js_error_name(e), js_error_message(e)),
+    }
+}

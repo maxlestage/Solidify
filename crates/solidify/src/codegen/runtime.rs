@@ -34,6 +34,8 @@ pub enum Helper {
     Random,
     NumToString,
     BlockOn,
+    /// `String(e)` of a caught value: `Error: message`, or a thrown string as it is.
+    ErrorText,
     /// `JsValue` and `JsInspect`: `console.log` and `String(…)` of objects, arrays, maps and sets.
     Inspect,
     /// A map in insertion order.
@@ -420,6 +422,17 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Node => include_str!("runtime/node.rs"),
             Helper::BigInt => include_str!("runtime/bigint.rs"),
             Helper::Error => include_str!("runtime/error.rs"),
+            Helper::ErrorText => {
+                r#"/// A caught value as `String(e)` writes it: `Error: message`, or a thrown value
+/// that was not an error as it is.
+#[allow(dead_code)]
+fn js_error_text(e: &str) -> String {
+    match e.strip_prefix('\u{3}') {
+        Some(value) => value.to_string(),
+        None => format!("Error: {e}"),
+    }
+}"#
+            }
             Helper::BlockOn => {
                 r#"/// Runs the top level, with the tasks and timers it waits for.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
