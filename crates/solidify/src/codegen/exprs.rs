@@ -11,6 +11,12 @@ use crate::types::Ty;
 
 impl<'a> Gen<'a> {
     pub(super) fn expr(&mut self, e: &'a Expr) -> GResult<E> {
+        if self.p.auto_awaits.contains(&e.id) && !self.casting.contains(&e.id) {
+            self.casting.insert(e.id);
+            let r = self.expr(e);
+            self.casting.remove(&e.id);
+            return Ok(self.await_code(&r?));
+        }
         if let Some((from, to)) = self.p.dyn_casts.get(&e.id).cloned()
             && !self.casting.contains(&e.id)
         {
@@ -312,22 +318,20 @@ impl<'a> Gen<'a> {
                 Ok(x)
             }
             ExprKind::Await(inner) => {
+                let t = self.ty_of(inner);
                 let x = self.expr(inner)?;
-                // Already awaited where it is made, or a value that was never a promise.
-                if x.code.ends_with(".await")
-                    || x.code.ends_with(".await?")
-                    || x.code.ends_with(".await.unwrap()")
-                    || matches!(
-                        self.p.calls.get(&inner.id),
-                        Some(Callee::Builtin("Promise.all" | "Promise.resolve"))
-                    )
-                {
-                    return Ok(x);
+                // A value that was never a promise: what follows still runs later.
+                if !self.is_promise(&t) {
+                    let h = self.helper(super::Helper::Promise);
+                    if matches!(inner.kind, ExprKind::Null | ExprKind::Undefined) {
+                        return Ok(E::owned(format!("{h}::resolved(()).await"), PREC_POSTFIX));
+                    }
+                    return Ok(E::owned(
+                        format!("{{ let v_ = {}; {h}::resolved(()).await; v_ }}", x.code),
+                        PREC_ATOM,
+                    ));
                 }
-                Ok(E::owned(
-                    format!("{}.await", Self::paren(&x, PREC_POSTFIX)),
-                    PREC_POSTFIX,
-                ))
+                Ok(self.await_code(&x))
             }
             ExprKind::Void(_) => Ok(E::atom("()", Repr::Owned)),
             ExprKind::Seq(items) => {
@@ -2196,8 +2200,28 @@ impl<'a> Gen<'a> {
             return self.err("`?.` on a value that is never null", obj.span);
         };
         let field_ty = match self.resolve(&inner) {
+            // `e?.message`, `e?.name`.
+            Ty::Named(n, ..) if n == "Error" => {
+                let code = if !self.p.error_classes.is_empty() {
+                    self.helper(super::Helper::Error);
+                    match prop {
+                        "message" => "js_error_message(v)",
+                        "name" => "js_error_name(v)",
+                        _ => "String::new()",
+                    }
+                } else {
+                    match prop {
+                        "message" => "v.clone()",
+                        "name" => "\"Error\".to_string()",
+                        _ => "String::new()",
+                    }
+                };
+                return Ok(E::owned(format!("{source}.map(|v| {code})"), PREC_POSTFIX));
+            }
             Ty::Named(n, ..) => {
-                let info = self.p.struct_info(&n).expect("struct");
+                let Some(info) = self.p.struct_info(&n) else {
+                    return self.err(format!("unsupported property `{prop}`"), obj.span);
+                };
                 match info.field(prop) {
                     Some(f) => {
                         if f.optional {
@@ -2415,10 +2439,14 @@ impl<'a> Gen<'a> {
                 );
             }
         }
-        let ret_ty = info.sig.ret.clone();
+        let ret_ty = if info.is_async {
+            self.promised(&info.sig.ret)
+        } else {
+            info.sig.ret.clone()
+        };
         self.fns.push(super::FnGen {
             id: f.id,
-            returns_result: false,
+            returns_result: info.is_async && info.throws,
             ret_ty: ret_ty.clone(),
             yield_ty: None,
             targets: Vec::new(),
@@ -2499,10 +2527,47 @@ impl<'a> Gen<'a> {
                 .unwrap_or(&body);
             format!("{{ {} {inner} }}", prelude.join(" "))
         };
-        let m = if info.escapes { "move " } else { "" };
+        // An async closure: each call starts a task, which owns copies of what it uses.
+        let body = if info.is_async {
+            let h = self.helper(super::Helper::Promise);
+            let spawn = if info.throws { "spawn_result" } else { "spawn" };
+            let block = if body.starts_with('{') {
+                body
+            } else {
+                format!("{{ {body} }}")
+            };
+            let block = if info.throws {
+                match block.strip_suffix('}') {
+                    Some(b) if matches!(f.body, FnBody::Expr(_)) => {
+                        let inner = b.trim_start_matches('{').trim();
+                        format!("{{ Ok({inner}) }}")
+                    }
+                    _ => block,
+                }
+            } else {
+                block
+            };
+            let copies: String = info
+                .captures
+                .iter()
+                .filter(|c| self.p.vars.contains_key(c) && !self.statics.contains_key(c))
+                .map(|c| {
+                    let n = self.name(*c);
+                    format!("let {n} = {n}.clone(); ")
+                })
+                .collect();
+            format!("{{ {copies}{h}::{spawn}(async move {block}) }}")
+        } else {
+            body
+        };
+        let m = if info.escapes || info.is_async {
+            "move "
+        } else {
+            ""
+        };
         let code = format!("{m}|{}| {body}", params.join(", "));
         // A kept closure takes its own handle on each shared variable.
-        let clones: Vec<String> = if info.escapes {
+        let clones: Vec<String> = if info.escapes || info.is_async {
             info.captures
                 .iter()
                 .filter(|c| self.shared.contains(c))

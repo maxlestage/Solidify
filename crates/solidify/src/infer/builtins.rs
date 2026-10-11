@@ -4,7 +4,7 @@
 use std::rc::Rc;
 
 use super::finish::leak;
-use super::{Callee, IResult, Infer};
+use super::{Callee, FieldInfo, IResult, Infer, StructInfo, StructKind};
 use crate::ast::*;
 use crate::error::Span;
 use crate::types::{Flavor, FuncTy, Ty};
@@ -279,22 +279,89 @@ impl<'m> Infer<'m> {
                 self.done(e, full, Ty::Bool)
             }
             ("Array", _) => self.err(format!("`Array.{prop}` is not supported"), span),
-            ("Promise", "all") => {
-                // Each value is already awaited where it is made: the array itself.
-                let t = self.arg_typed(args, 0, None, &full, span)?;
-                let Ty::Array(_) = self.types.resolve(&t) else {
-                    return self.err("`Promise.all` needs an array", span);
+            ("Promise", "all" | "race" | "any" | "allSettled") => {
+                self.no_more_than(args, 1, &full, span)?;
+                let t = match args.first().map(|a| &a.expr) {
+                    // `Promise.all([a, b])`: values of different types make a tuple.
+                    Some(
+                        a @ Expr {
+                            kind: ExprKind::Array(elems),
+                            ..
+                        },
+                    ) if prop == "all"
+                        && elems.len() > 1
+                        && elems.iter().all(|x| matches!(x, ArrayElem::Expr(_))) =>
+                    {
+                        let mut ts = Vec::new();
+                        for x in elems {
+                            let ArrayElem::Expr(x) = x else {
+                                unreachable!()
+                            };
+                            let t = self.expr(x, None)?;
+                            self.mark_stored(x);
+                            ts.push(t);
+                        }
+                        let first = self.promised(&ts[0]);
+                        let same = ts.iter().all(|t| {
+                            super::finish::same_shape_ty(
+                                &self.types.zonk(&self.promised(t)),
+                                &self.types.zonk(&first),
+                            ) && self.is_promise(t) == self.is_promise(&ts[0])
+                        });
+                        let t = if same {
+                            for t in &ts[1..] {
+                                self.unify(t, &ts[0], a.span)?;
+                            }
+                            Ty::Array(Box::new(ts[0].clone()))
+                        } else {
+                            Ty::Tuple(ts)
+                        };
+                        self.set_ty(a.id, t.clone());
+                        t
+                    }
+                    _ => self.arg_typed(args, 0, None, &full, span)?,
                 };
-                self.done(e, full, t)
+                self.mark_stored(&args[0].expr);
+                self.uses_timers = true;
+                let out = match (prop, self.types.resolve(&t)) {
+                    ("all", Ty::Array(x)) => Ty::Array(Box::new(self.promised(&x))),
+                    ("all", Ty::Tuple(xs)) => {
+                        Ty::Tuple(xs.iter().map(|x| self.promised(x)).collect())
+                    }
+                    ("race" | "any", Ty::Array(x)) => {
+                        if prop == "any" {
+                            self.rejects = true;
+                        }
+                        self.promised(&x)
+                    }
+                    ("allSettled", Ty::Array(x)) => {
+                        self.settled_struct();
+                        let x = self.promised(&x);
+                        Ty::Array(Box::new(Ty::Named(SETTLED.into(), vec![x])))
+                    }
+                    _ => return self.err(format!("`{full}` needs an array"), span),
+                };
+                self.done(e, full, Ty::promise(out))
             }
             ("Promise", "resolve") => {
+                self.no_more_than(args, 1, &full, span)?;
+                self.uses_timers = true;
+                if args.is_empty() {
+                    return self.done(e, full, Ty::promise(Ty::Void));
+                }
                 let t = self.arg_typed(args, 0, None, &full, span)?;
-                self.done(e, full, t)
+                let t = self.promised(&t);
+                self.done(e, full, Ty::promise(t))
             }
-            ("Promise", _) => self.err(
-                format!("`Promise.{prop}` is not supported: use `await` and async functions"),
-                span,
-            ),
+            ("Promise", "reject") => {
+                self.no_more_than(args, 1, &full, span)?;
+                self.arg_typed(args, 0, Some(Ty::named("Error")), &full, span)?;
+                self.uses_timers = true;
+                self.rejects = true;
+                let t = self.types.fresh();
+                self.done(e, full, Ty::promise(t))
+            }
+            ("Promise", _) => self.err(format!("`Promise.{prop}` is not supported"), span),
             ("JSON", "stringify") => {
                 self.no_more_than(args, 3, &full, span)?;
                 let t = self.arg_typed(args, 0, None, &full, span)?;
@@ -494,6 +561,59 @@ impl<'m> Infer<'m> {
                 "toString" => self.done(e, "boolean.toString".into(), Ty::Str),
                 _ => self.err(format!("booleans have no method `{prop}`"), span),
             },
+            Ty::Named(n, targs) if n == crate::types::PROMISE => {
+                let item = targs[0].clone();
+                let full = format!("promise.{prop}");
+                self.uses_timers = true;
+                let error = Ty::named("Error");
+                let callback = |params: Vec<Ty>, ret: Ty| Ty::Func(Rc::new(FuncTy { params, ret }));
+                match prop {
+                    "then" => {
+                        self.no_more_than(args, 2, &full, span)?;
+                        let r = self.types.fresh();
+                        let f = callback(vec![item.clone()], r.clone());
+                        self.arg_typed(args, 0, Some(f), &full, span)?;
+                        self.mark_stored(&args[0].expr);
+                        if args.len() > 1 {
+                            let g = callback(vec![error], r.clone());
+                            self.arg_typed(args, 1, Some(g), &full, span)?;
+                            self.mark_stored(&args[1].expr);
+                        }
+                        let out = self.promised(&r);
+                        self.done(e, full, Ty::promise(out))
+                    }
+                    "catch" => {
+                        self.no_more_than(args, 1, &full, span)?;
+                        let r = self.types.fresh();
+                        let g = callback(vec![error], r.clone());
+                        self.arg_typed(args, 0, Some(g), &full, span)?;
+                        self.mark_stored(&args[0].expr);
+                        let r = self.promised(&r);
+                        // A promise only ever rejected (`Promise.reject(e)`) has no value.
+                        if let Ty::Var(_) = self.types.resolve(&item) {
+                            self.types.unify(&item, &r).ok();
+                        }
+                        // `.catch(e => console.log(e))`: nothing when it fails.
+                        let out = match (self.types.resolve(&r), self.types.resolve(&item)) {
+                            (Ty::Void, Ty::Void) => Ty::Void,
+                            (Ty::Void, _) => Ty::Option(Box::new(item)),
+                            _ => {
+                                self.expect(&r, &item, span)?;
+                                item
+                            }
+                        };
+                        self.done(e, full, Ty::promise(out))
+                    }
+                    "finally" => {
+                        self.no_more_than(args, 1, &full, span)?;
+                        let h = callback(Vec::new(), Ty::Void);
+                        self.arg_typed(args, 0, Some(h), &full, span)?;
+                        self.mark_stored(&args[0].expr);
+                        self.done(e, full, Ty::promise(item))
+                    }
+                    _ => self.err(format!("Promise has no method `{prop}`"), span),
+                }
+            }
             Ty::Named(n, ..) if n == "Error" => match prop {
                 "toString" => self.done(e, "error.toString".into(), Ty::Str),
                 _ => self.err(format!("Error has no method `{prop}`"), span),
@@ -953,5 +1073,60 @@ impl<'m> Infer<'m> {
             "toString" => self.done(e, full, Ty::Str),
             _ => self.err(format!("arrays have no method `{prop}`"), span),
         }
+    }
+}
+
+/// The result of `Promise.allSettled`, one per promise.
+pub const SETTLED: &str = "PromiseSettledResult";
+
+impl Infer<'_> {
+    /// The value of a promise, or the value itself.
+    pub(super) fn promised(&self, t: &Ty) -> Ty {
+        match self.types.resolve(t) {
+            Ty::Named(n, args) if n == crate::types::PROMISE => args[0].clone(),
+            t => t,
+        }
+    }
+
+    fn is_promise(&self, t: &Ty) -> bool {
+        matches!(self.types.resolve(t), Ty::Named(n, _) if n == crate::types::PROMISE)
+    }
+
+    /// `{ status, value?, reason? }`, declared once.
+    fn settled_struct(&mut self) {
+        if self.struct_by_name(SETTLED).is_some() {
+            return;
+        }
+        let field = |name: &str, ty: Ty, optional: bool| FieldInfo {
+            name: name.into(),
+            ty,
+            optional,
+            access: None,
+            readonly: true,
+            has_init: false,
+            literal: None,
+            span: Span::default(),
+        };
+        self.structs.push(StructInfo {
+            name: SETTLED.into(),
+            kind: StructKind::Synth,
+            fields: vec![
+                field("status", Ty::Str, false),
+                field("value", Ty::named("T"), true),
+                field("reason", Ty::named("Error"), true),
+            ],
+            methods: Vec::new(),
+            ctor: None,
+            exported: false,
+            span: Span::default(),
+            statics: Vec::new(),
+            parent: None,
+            is_abstract: false,
+            implements: Vec::new(),
+            type_params: vec!["T".into()],
+            type_bounds: Vec::new(),
+            parent_args: Vec::new(),
+            implements_args: Vec::new(),
+        });
     }
 }
