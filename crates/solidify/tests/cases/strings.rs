@@ -16,7 +16,7 @@ fn main() {
         }
     }
     println!("{acc} {}", acc.chars().count());
-    println!("{} {} {} {} {}", format!("{:.*}", 2 as usize, N), 10.to_string(), format!("{}!", 42.to_string()), format!("7{}", 7), format!("{}7", 7));
+    println!("{} {} {} {} {}", format!("{:.2}", N), 10.to_string(), format!("{}!", 42.to_string()), format!("7{}", 7), format!("{}7", 7));
     println!("{} {} {} {}", js_parse_int("42px").as_ref().map_or("NaN".to_string(), |v| v.to_string()), js_parse_float("2.5kg"), js_number("12") + 1.0, js_number("x"));
     let mut words = vec!["b".to_string(), "a".to_string(), "c".to_string()];
     words.sort();

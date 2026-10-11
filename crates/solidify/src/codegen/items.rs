@@ -83,12 +83,14 @@ impl<'a> Gen<'a> {
         let traits = self.trait_items()?;
         out.push_str(&traits);
         let impls = self.inspect_impls()?;
+        let json = self.json_impls()?;
         for h in self.helpers.clone() {
             out.push('\n');
             out.push_str(h.source());
             out.push('\n');
         }
         out.push_str(&impls);
+        out.push_str(&json);
         Ok(out)
     }
 
@@ -210,6 +212,133 @@ impl<'a> Gen<'a> {
                 }
                 out.push_str("    }\n}\n");
             }
+        }
+        Ok(out)
+    }
+
+    /// `JsFromJson` for the types `JSON.parse` builds.
+    fn json_impls(&mut self) -> GResult<String> {
+        let mut out = String::new();
+        if !self.helpers.contains(&Helper::Json) {
+            return Ok(out);
+        }
+        if self.helpers.contains(&Helper::JsMap) {
+            out.push_str(
+                "\nimpl<V: JsFromJson> JsFromJson for JsMap<String, V> {\n    fn from_json(v: &JsonValue) -> Result<Self, String> {\n        let mut out = JsMap::new();\n        for (k, x) in v.object(\"an object\")? {\n            out.insert(k.clone(), V::from_json(x).map_err(|e| format!(\"{e} (in \\\"{k}\\\")\"))?);\n        }\n        Ok(out)\n    }\n}\n",
+            );
+        }
+        for name in self.json_types.clone() {
+            let rust_name = pascal(&name);
+            let name_lit = string_literal(&name);
+            out.push_str(&format!(
+                "\nimpl JsFromJson for {rust_name} {{\n    fn from_json(v: &JsonValue) -> Result<Self, String> {{\n"
+            ));
+            if let Some(u) = self.p.union_info(&name).cloned() {
+                if let Some(d) = &u.discriminant {
+                    let d_lit = string_literal(d);
+                    out.push_str(&format!(
+                        "        let o = v.object({name_lit})?;\n        match JsonValue::get(o, {d_lit}) {{\n            Some(JsonValue::Str(tag)) => match tag.as_str() {{\n"
+                    ));
+                    for m in &u.members {
+                        let Some(tag) = &m.tag else { continue };
+                        let t = self.rust_ty(&m.ty, u.span)?;
+                        out.push_str(&format!(
+                            "                {} => Ok({rust_name}::{}(<{t}>::from_json(v)?)),\n",
+                            string_literal(tag),
+                            m.name
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "                _ => Err(format!(\"JSON: {{tag:?}} is not a {d} of {name}\")),\n            }},\n            _ => Err(\"JSON: a {name} needs a string field {d}\".to_string()),\n        }}\n"
+                    ));
+                } else {
+                    // Each member by the kind of JSON value it is; objects are tried in order.
+                    let mut arms: Vec<(&str, Vec<String>)> = Vec::new();
+                    for m in &u.members {
+                        let kind = match self.resolve(&m.ty) {
+                            Ty::Str => "JsonValue::Str(_)",
+                            Ty::Num(_) => "JsonValue::Num(_)",
+                            Ty::Bool => "JsonValue::Bool(_)",
+                            Ty::Null | Ty::Void => "JsonValue::Null",
+                            Ty::Array(_) | Ty::Tuple(_) => "JsonValue::Array(_)",
+                            _ => "JsonValue::Object(_)",
+                        };
+                        let t = self.rust_ty(&m.ty, u.span)?;
+                        let read = format!("<{t}>::from_json(v).map({rust_name}::{})", m.name);
+                        match arms.iter_mut().find(|(k, _)| *k == kind) {
+                            Some((_, reads)) => reads.push(read),
+                            None => arms.push((kind, vec![read])),
+                        }
+                    }
+                    out.push_str("        match v {\n");
+                    for (kind, reads) in arms {
+                        let mut chain = reads[0].clone();
+                        for r in &reads[1..] {
+                            chain = format!("{chain}.or_else(|_| {r})");
+                        }
+                        out.push_str(&format!("            {kind} => {chain},\n"));
+                    }
+                    out.push_str(&format!(
+                        "            other => Err(format!(\"JSON: expected a {name}, got {{}}\", other.kind())),\n        }}\n"
+                    ));
+                }
+            } else if let Some(en) = self.p.enum_info(&name).cloned() {
+                if en.kind == EnumKind::Numeric {
+                    out.push_str("        let JsonValue::Num(n) = v else {\n");
+                    out.push_str(&format!(
+                        "            return Err(format!(\"JSON: expected a number for {name}, got {{}}\", v.kind()));\n        }};\n"
+                    ));
+                    for v in &en.variants {
+                        let Some(EnumValue::Num(n)) = &v.value else {
+                            continue;
+                        };
+                        let lit = if n.fract() == 0.0 {
+                            format!("{}.0", *n as i64)
+                        } else {
+                            format!("{n:?}")
+                        };
+                        out.push_str(&format!(
+                            "        if *n == {lit} {{\n            return Ok({rust_name}::{});\n        }}\n",
+                            v.name
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "        Err(format!(\"JSON: {{}} is not a value of {name}\", js_number_text(*n)))\n"
+                    ));
+                } else {
+                    out.push_str(
+                        "        match v {\n            JsonValue::Str(s) => match s.as_str() {\n",
+                    );
+                    for v in &en.variants {
+                        let text = match &v.value {
+                            Some(EnumValue::Str(s)) => s.clone(),
+                            Some(EnumValue::Num(n)) => format_num(*n),
+                            None => v.source.clone(),
+                        };
+                        out.push_str(&format!(
+                            "                {} => Ok({rust_name}::{}),\n",
+                            string_literal(&text),
+                            v.name
+                        ));
+                    }
+                    out.push_str(&format!(
+                        "                _ => Err(format!(\"JSON: {{s:?}} is not a value of {name}\")),\n            }},\n            other => Err(format!(\"JSON: expected a string for {name}, got {{}}\", other.kind())),\n        }}\n"
+                    ));
+                }
+            } else if let Some(info) = self.p.struct_info(&name).cloned() {
+                out.push_str(&format!(
+                    "        let o = v.object({name_lit})?;\n        Ok({rust_name} {{\n"
+                ));
+                for f in &info.fields {
+                    out.push_str(&format!(
+                        "            {}: js_json_field(o, {})?,\n",
+                        snake(&f.name),
+                        string_literal(&f.name)
+                    ));
+                }
+                out.push_str("        })\n");
+            }
+            out.push_str("    }\n}\n");
         }
         Ok(out)
     }

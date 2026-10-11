@@ -26,7 +26,7 @@ impl Circle {
     }
 
     pub fn describe(&self) -> String {
-        format!("{} with area {}", self.name, format!("{:.*}", 2 as usize, self.area()))
+        format!("{} with area {}", self.name, format!("{:.2}", self.area()))
     }
 }
 
@@ -52,7 +52,7 @@ impl Rect {
     }
 
     pub fn shape_describe(&self) -> String {
-        format!("{} with area {}", self.name, format!("{:.*}", 2 as usize, self.area()))
+        format!("{} with area {}", self.name, format!("{:.2}", self.area()))
     }
 }
 
@@ -78,7 +78,7 @@ impl Square {
     }
 
     pub fn shape_describe(&self) -> String {
-        format!("{} with area {}", self.name, format!("{:.*}", 2 as usize, self.area()))
+        format!("{} with area {}", self.name, format!("{:.2}", self.area()))
     }
 }
 
@@ -164,7 +164,7 @@ fn main() {
         println!("{}", s.describe());
     }
     let total = shapes.iter().fold(0.0, |sum, s| sum + s.area());
-    println!("{} {}", format!("{:.*}", 3 as usize, total), shapes.len());
+    println!("{} {}", format!("{:.3}", total), shapes.len());
     let mut rex = Box::new(Dog::new("Rex", Vec::new())) as Box<dyn DogLike>;
     rex.learn("sit".to_string());
     rex.learn("roll".to_string());

@@ -162,6 +162,8 @@ pub(super) struct Gen<'a> {
     /// Structs and enums shown by `console.log` or converted to strings: they get a
     /// `JsInspect` implementation.
     pub inspected: BTreeSet<String>,
+    /// The structs, enums and unions that `JSON.parse` builds: they get a `JsFromJson`.
+    pub json_types: BTreeSet<String>,
     /// Fields read (or written: `true`) on union values: accessors on the enum.
     pub union_accessors: BTreeSet<(String, String, bool)>,
     /// Unions whose `typeof` is taken.
@@ -214,6 +216,7 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         uses_hashset: false,
         ordered: false,
         inspected: BTreeSet::new(),
+        json_types: BTreeSet::new(),
         union_accessors: BTreeSet::new(),
         union_typeof: BTreeSet::new(),
         current_class: None,
@@ -779,6 +782,9 @@ impl<'a> Gen<'a> {
         if h == Helper::BlockOn {
             self.helpers.insert(Helper::Timers);
         }
+        if h == Helper::Json {
+            self.helpers.insert(Helper::Inspect);
+        }
         match h {
             Helper::StrSlice => "js_slice",
             Helper::StrSubstring => "js_substring",
@@ -811,6 +817,7 @@ impl<'a> Gen<'a> {
             Helper::Timers => "js_run_timers",
             Helper::Promise => "JsPromise",
             Helper::Regex => "JsRegex",
+            Helper::Json => "js_json_stringify",
         }
     }
 
@@ -982,6 +989,84 @@ impl<'a> Gen<'a> {
     }
 
     /// `js_inspect(&x.js_value())` or `js_to_string(&x.js_value())` for a value of type `ty`.
+    /// Registers the types `JSON.parse` must build for `ty`, refusing those JSON cannot
+    /// describe.
+    pub(super) fn mark_json(&mut self, ty: &Ty, span: Span) -> GResult<()> {
+        match self.resolve(ty) {
+            Ty::Num(_) | Ty::Str | Ty::Bool | Ty::Null | Ty::Void | Ty::Never => Ok(()),
+            Ty::Var(_) | Ty::Any => self.err(
+                "the type of the parsed JSON is not known: write `const x: T = JSON.parse(…)` or `JSON.parse(…) as T`",
+                span,
+            ),
+            Ty::Option(t) | Ty::Array(t) => self.mark_json(&t, span),
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.mark_json(t, span)?;
+                }
+                Ok(())
+            }
+            Ty::Map(k, v, _) => {
+                if !self.is_str(&k) {
+                    return self.err(
+                        "JSON object keys are strings: a map read from JSON needs string keys",
+                        span,
+                    );
+                }
+                self.mark_json(&v, span)
+            }
+            Ty::Set(_) => self.err(
+                "a `Set` cannot be read from JSON, which only has arrays and objects",
+                span,
+            ),
+            Ty::Func(_) => self.err("a function cannot be read from JSON", span),
+            Ty::Gen(_) => self.err("a generator cannot be read from JSON", span),
+            Ty::Named(n) => {
+                if n == "Error" || n == "RegExp" || n == "RegExpMatch" {
+                    return self.err(format!("a `{n}` cannot be read from JSON"), span);
+                }
+                if self.is_type_param(&n) {
+                    return self.err(
+                        "`JSON.parse` needs a concrete type here, not a type parameter",
+                        span,
+                    );
+                }
+                if self.p.is_dyn(&n) {
+                    return self.err(
+                        format!(
+                            "`{n}` has subclasses: `JSON.parse` cannot tell which one to build; parse the exact class"
+                        ),
+                        span,
+                    );
+                }
+                if !self.json_types.insert(n.clone()) {
+                    return Ok(());
+                }
+                if self.p.is_enum(&n) {
+                    return Ok(());
+                }
+                if let Some(u) = self.p.union_info(&n).cloned() {
+                    for m in &u.members {
+                        self.mark_json(&m.ty, span)?;
+                    }
+                    return Ok(());
+                }
+                let Some(info) = self.p.struct_info(&n).cloned() else {
+                    return self.err(format!("`{n}` cannot be read from JSON"), span);
+                };
+                for f in &info.fields {
+                    if matches!(self.resolve(&f.ty), Ty::Func(_)) {
+                        return self.err(
+                            format!("`{n}.{}` is a function: it cannot be read from JSON", f.name),
+                            span,
+                        );
+                    }
+                    self.mark_json(&f.ty, span)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub(super) fn inspect_call(&mut self, code: &str, ty: &Ty, inspect: bool) -> String {
         let f = if inspect {
             "js_inspect"

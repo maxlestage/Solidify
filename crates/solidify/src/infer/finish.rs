@@ -13,6 +13,7 @@ impl<'m> Infer<'m> {
     pub(super) fn finish(mut self) -> IResult<Program> {
         self.propagate_throws();
         self.propagate_mutation();
+        self.float_json_numbers();
         // A narrowed value whose alias is changed is bound mutably.
         for (binding, test) in self.alias_of_narrow.clone() {
             if self.vars.get(&binding).is_some_and(|v| v.mutated)
@@ -142,6 +143,62 @@ impl<'m> Infer<'m> {
             }
         }
         out
+    }
+
+    /// JSON numbers are doubles: a number read by `JSON.parse` that nothing in the program
+    /// constrains to an integer is a float.
+    fn float_json_numbers(&mut self) {
+        let targets = std::mem::take(&mut self.json_targets);
+        let mut seen = HashSet::new();
+        for t in &targets {
+            self.float_unknown_numbers(t, &mut seen);
+        }
+    }
+
+    fn float_unknown_numbers(&mut self, t: &Ty, seen: &mut HashSet<String>) {
+        match self.types.resolve(t) {
+            Ty::Num(f) => {
+                if self.types.flavor(f) == Flavor::Unknown || self.types.soft_int(f) {
+                    self.types.set_flavor(f, Flavor::Float);
+                }
+            }
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => {
+                self.float_unknown_numbers(&t, seen);
+            }
+            Ty::Map(k, v, _) => {
+                self.float_unknown_numbers(&k, seen);
+                self.float_unknown_numbers(&v, seen);
+            }
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.float_unknown_numbers(t, seen);
+                }
+            }
+            Ty::Named(n) => {
+                if !seen.insert(n.clone()) {
+                    return;
+                }
+                let fields: Vec<Ty> = self
+                    .structs
+                    .iter()
+                    .find(|s| s.name == n)
+                    .map(|s| s.fields.iter().map(|f| f.ty.clone()).collect())
+                    .unwrap_or_default();
+                for t in &fields {
+                    self.float_unknown_numbers(t, seen);
+                }
+                let members: Vec<Ty> = self
+                    .unions
+                    .iter()
+                    .find(|u| u.name == n)
+                    .map(|u| u.members.iter().map(|m| m.ty.clone()).collect())
+                    .unwrap_or_default();
+                for t in &members {
+                    self.float_unknown_numbers(t, seen);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// A function throws if it throws itself or calls, outside a `try`, one that does.

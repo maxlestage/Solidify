@@ -127,7 +127,9 @@ impl<'a> Gen<'a> {
                 let receiver_kind = name.split('.').next().unwrap_or("");
                 match receiver_kind {
                     "console" | "Math" | "Number" | "String" | "Object" | "Array" | "Date"
-                    | "performance" | "process" | "Promise" => self.namespace_call(e, name, args),
+                    | "performance" | "process" | "Promise" | "JSON" => {
+                        self.namespace_call(e, name, args)
+                    }
                     _ => self.method_builtin(e, obj, name, args),
                 }
             }
@@ -829,6 +831,39 @@ impl<'a> Gen<'a> {
                 }
             }
             "Promise.all" | "Promise.resolve" => self.expr(&args[0].expr)?,
+            "JSON.stringify" => {
+                let value = self.json_value_of(&args[0].expr)?;
+                let h = self.helper(Helper::Json);
+                let indent = match args.get(2) {
+                    None => "\"\"".to_string(),
+                    Some(a) => {
+                        let at = self.ty_of(&a.expr);
+                        if self.is_str(&at) {
+                            self.expr_as(&a.expr, Want::StrRef)?
+                        } else if let ExprKind::Num { value, .. } = a.expr.kind {
+                            string_literal(&" ".repeat((value as i64).clamp(0, 10) as usize))
+                        } else {
+                            let n = self.expr_as(&a.expr, Want::Owned)?;
+                            format!("&\" \".repeat(({n}).clamp(0, 10) as usize)")
+                        }
+                    }
+                };
+                E::owned(format!("{h}(&{value}, {indent})"), PREC_POSTFIX)
+            }
+            "JSON.parse" => {
+                let ty = self.ty_of(e);
+                self.mark_json(&ty, e.span)?;
+                let rt = self.rust_ty(&ty, e.span)?;
+                self.helper(Helper::Json);
+                let text = self.expr_as(&args[0].expr, Want::StrRef)?;
+                let mut code = format!("js_json_parse_as::<{rt}>({text})");
+                if self.fn_ctx().returns_result || !self.fn_ctx().try_ctx.is_empty() {
+                    code.push('?');
+                } else {
+                    code.push_str(".unwrap()");
+                }
+                E::owned(code, PREC_POSTFIX)
+            }
             "Date.now" => E::owned(
                 "std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)",
                 PREC_POSTFIX,
@@ -845,6 +880,27 @@ impl<'a> Gen<'a> {
                 E::owned(format!("std::process::exit({code} as i32)"), PREC_POSTFIX)
             }
             _ => return self.err(format!("`{name}` is not supported"), e.span),
+        })
+    }
+
+    /// The `JsValue` of an expression, for `JSON.stringify`.
+    fn json_value_of(&mut self, e: &'a Expr) -> GResult<String> {
+        let ty = self.ty_of(e);
+        Ok(match self.resolve(&ty) {
+            Ty::Num(_) if self.is_float(&ty) => {
+                let x = self.expr(e)?;
+                let x = self.as_f64(&x);
+                format!("JsValue::Float({x})")
+            }
+            Ty::Num(_) => format!("JsValue::Int({})", self.expr_as(e, Want::Owned)?),
+            Ty::Str => format!("JsValue::Str({})", self.expr_as(e, Want::Owned)?),
+            Ty::Bool => format!("JsValue::Bool({})", self.expr_as(e, Want::Owned)?),
+            Ty::Void | Ty::Null => "JsValue::Null".to_string(),
+            _ => {
+                let x = self.expr(e)?;
+                let code = self.coerce(x, &ty, Want::Display);
+                self.js_value_of(&code, &ty)
+            }
         })
     }
 
@@ -917,7 +973,7 @@ impl<'a> Gen<'a> {
         } else if super::is_int_literal(&x) {
             format!("{x}.0_f64")
         } else {
-            format!("({x} as f64)")
+            format!("({} as f64)", paren_num(&x))
         })
     }
 
@@ -983,10 +1039,14 @@ impl<'a> Gen<'a> {
                         } else {
                             format!("({x} as f64)")
                         };
-                        E::owned(
-                            format!("format!(\"{{:.*}}\", {d} as usize, {x})"),
-                            PREC_ATOM,
-                        )
+                        if super::is_int_literal(&d) {
+                            E::owned(format!("format!(\"{{:.{d}}}\", {x})"), PREC_ATOM)
+                        } else {
+                            E::owned(
+                                format!("format!(\"{{:.*}}\", {d} as usize, {x})"),
+                                PREC_ATOM,
+                            )
+                        }
                     }
                     "toString" => match args.first() {
                         Some(a) if self.is_int(&ot) => {
@@ -1796,7 +1856,7 @@ impl<'a> Gen<'a> {
             let n = if self.is_float(&bt) {
                 n
             } else {
-                format!("{n} as f64")
+                format!("{} as f64", paren_num(&n))
             };
             Ok(format!("|{a}, {b}| {h}({n})"))
         })();

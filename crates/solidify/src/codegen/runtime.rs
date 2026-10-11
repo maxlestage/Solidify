@@ -42,6 +42,8 @@ pub enum Helper {
     Promise,
     /// `JsRegex`: regular expressions.
     Regex,
+    /// `JSON.stringify` and `JSON.parse` (`JsonValue`, `JsFromJson`).
+    Json,
 }
 
 /// The regular expression engine, compiled into Solidify too: patterns are checked when
@@ -344,6 +346,7 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Timers => include_str!("runtime/timers.rs"),
             Helper::Promise => include_str!("runtime/promise.rs"),
             Helper::Regex => include_str!("runtime/regex.rs"),
+            Helper::Json => include_str!("runtime/json.rs"),
             Helper::BlockOn => {
                 r#"/// Runs a future to completion, running the timers it waits on.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
