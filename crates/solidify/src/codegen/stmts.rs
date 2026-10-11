@@ -579,6 +579,17 @@ impl<'a> Gen<'a> {
         let var = self.p.var(id).clone();
         let it = self.ty_of(init);
         if var.shared {
+            // `const b = a`: the same cell.
+            if let Some(a) = var.shares_with
+                && self.shared.contains(&a)
+                && matches!(init.kind, ExprKind::Ident(_))
+            {
+                let source = self.name(a);
+                let name = self.bind(id, Repr::Owned);
+                self.shared.insert(id);
+                self.line(&format!("let {name} = {source}.clone();"));
+                return Ok(());
+            }
             // Shared with a closure that outlives this scope.
             let x = match &init.kind {
                 ExprKind::Arrow(f) | ExprKind::Func(f) => self.closure(f, &[], true)?,
@@ -638,7 +649,7 @@ impl<'a> Gen<'a> {
             && var.alias
             && !var.stored
             && !var.captured
-            && (fixed || !matches!(self.resolve(&it), Ty::Option(_)) || true)
+            && !self.holds_shared(&it)
         {
             let x = self.expr(init)?;
             if matches!(x.repr, Repr::Place | Repr::Ref | Repr::RefMut) {
@@ -881,6 +892,24 @@ impl<'a> Gen<'a> {
             self.line(&line);
             return Ok(());
         }
+        // A field sharing its collection: a new value is a new cell.
+        if let ExprKind::Member { obj, prop, .. } = &t.kind
+            && op == AssignOp::Assign
+            && let Ty::Named(n, ..) = self.ty_of(obj)
+            && self.p.is_shared_field(&n, prop)
+        {
+            let o = self.expr(obj)?;
+            let base = Self::paren(&o, PREC_POSTFIX);
+            let holder = if self.through_handle(obj, &n) {
+                format!("{base}.borrow_mut()")
+            } else {
+                base
+            };
+            let val = self.expr_to(value, &tt)?;
+            self.line(&format!("let value_ = Rc::new(RefCell::new({val}));"));
+            self.line(&format!("{holder}.{} = value_;", snake(prop)));
+            return Ok(());
+        }
         // `re.lastIndex = i`
         if let ExprKind::Member { obj, prop, .. } = &t.kind
             && prop == "lastIndex"
@@ -957,7 +986,8 @@ impl<'a> Gen<'a> {
             let o = self.expr(obj)?;
             let base = Self::paren(&o, PREC_POSTFIX);
             let val = self.expr_to(value, &tt)?;
-            self.line(&format!("{base}.set_{}({val});", snake(prop)));
+            self.line(&format!("let value_ = {val};"));
+            self.line(&format!("{base}.set_{}(value_);", snake(prop)));
             return Ok(());
         }
         // `arr.length = 0`
@@ -1005,7 +1035,7 @@ impl<'a> Gen<'a> {
                 let place = if self.shared.contains(&b) {
                     format!("(*{}.borrow_mut())", self.name(b))
                 } else {
-                    format!("(*{}.lock().unwrap())", self.name(b))
+                    format!("(*{}.write())", self.name(b))
                 };
                 if matches!(op, AssignOp::Assign) {
                     let val = self.expr_to(value, &tt)?;
@@ -1040,7 +1070,13 @@ impl<'a> Gen<'a> {
         match op {
             AssignOp::Assign => {
                 let val = self.expr_to(value, &tt)?;
-                self.line(&format!("{place} = {val};"));
+                // A value read through a cell is taken before the place is written.
+                if val.contains(".borrow") {
+                    self.line(&format!("let value_ = {val};"));
+                    self.line(&format!("{place} = value_;"));
+                } else {
+                    self.line(&format!("{place} = {val};"));
+                }
             }
             AssignOp::Add if self.is_str(&tt) => {
                 if let ExprKind::Str(s) = &value.kind {

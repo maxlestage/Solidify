@@ -31,7 +31,7 @@ impl<'m> Infer<'m> {
     /// integer: an index, a length).
     pub(super) fn float_growing_numbers(&mut self) {
         let mut edges = Vec::new();
-        for (target, op, value) in std::mem::take(&mut self.assigns) {
+        for (target, op, value) in self.assigns.clone() {
             self.assign_edges(target, op, value, &mut edges);
         }
         for (b, init) in self.var_inits.clone() {

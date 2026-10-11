@@ -471,6 +471,11 @@ impl<T: JsInspect> JsInspect for Option<T> {
         }
     }
 }
+impl<T: JsInspect> JsInspect for std::rc::Rc<std::cell::RefCell<T>> {
+    fn js_value(&self) -> JsValue {
+        self.borrow().js_value()
+    }
+}
 impl<T: JsInspect> JsInspect for Vec<T> {
     fn js_value(&self) -> JsValue {
         JsValue::Array(self.iter().map(JsInspect::js_value).collect())
@@ -707,7 +712,9 @@ fn js_format(v: &JsValue, recurse_times: usize, ctx: &mut JsInspectCtx) -> Strin
         output = js_group_array(ctx, output, items);
     }
     if ctx.current_depth - recurse_times < 3 && entries == output.len() {
-        let start = output.len() + ctx.indentation + open.chars().count() + 10;
+        // Node counts a `<ref *1>` marker apart from the braces, without the space.
+        let marker = usize::from(open.starts_with("<ref *"));
+        let start = output.len() + ctx.indentation + open.chars().count() - marker + 10;
         let mut total = output.len() + start;
         let fits = total + output.len() <= 80 && output.iter().all(|s| {
             total += s.chars().count();
@@ -1192,6 +1199,11 @@ impl<T: JsFromJson> JsFromJson for Option<T> {
 impl<T: JsFromJson> JsFromJson for Box<T> {
     fn from_json(v: &JsonValue) -> Result<Self, String> {
         T::from_json(v).map(Box::new)
+    }
+}
+impl<T: JsFromJson> JsFromJson for std::rc::Rc<std::cell::RefCell<T>> {
+    fn from_json(v: &JsonValue) -> Result<Self, String> {
+        T::from_json(v).map(|x| std::rc::Rc::new(std::cell::RefCell::new(x)))
     }
 }
 impl<T: JsFromJson> JsFromJson for Vec<T> {

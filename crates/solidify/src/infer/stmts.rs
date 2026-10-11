@@ -361,6 +361,10 @@ impl<'m> Infer<'m> {
             if let Some(init) = &d.init {
                 self.hints.insert(init.id, hint.clone());
             }
+            let from_var = d
+                .init
+                .as_ref()
+                .filter(|i| matches!(i.kind, ExprKind::Ident(_)));
             let ty = match (&d.init, &declared) {
                 (Some(init), Some(t)) => {
                     let it = self.expr(init, Some(t))?;
@@ -371,6 +375,15 @@ impl<'m> Infer<'m> {
                 (None, Some(t)) => t.clone(),
                 (None, None) => self.types.fresh(),
             };
+            // `const b = a`: two variables, one object.
+            if let Some(init) = from_var {
+                self.copied_types.push(ty.clone());
+                if let (Pattern::Ident { id, .. }, Some(source)) =
+                    (&d.pat, self.refs.get(&init.id).copied())
+                {
+                    self.var_aliases.push((*id, source));
+                }
+            }
             let ty = match self.types.resolve(&ty) {
                 // `let x = null`: nullable, content decided by a later assignment.
                 Ty::Null => {
@@ -1024,7 +1037,34 @@ impl<'m> Infer<'m> {
 
     // ----- mutation and escape marking -----
 
+    /// The struct types a change through `target` goes through: `list[0].items.push(x)`
+    /// changes an instance held in `list`.
+    pub(super) fn note_changed_types(&mut self, target: &Expr) {
+        let mut e = target;
+        loop {
+            match &e.kind {
+                ExprKind::Member { obj, .. } | ExprKind::Index { obj, .. } => {
+                    if let Some(t) = self.expr_ty.get(&obj.id)
+                        && let Ty::Named(n, _) = self.types.resolve(t)
+                        && self.struct_by_name(&n).is_some()
+                    {
+                        if let ExprKind::Member { prop, .. } = &e.kind {
+                            self.changed_fields.insert((n.clone(), prop.clone()));
+                        }
+                        if !matches!(obj.kind, ExprKind::This) {
+                            self.changed_types.insert(n);
+                        }
+                    }
+                    e = obj;
+                }
+                ExprKind::NonNull(inner) => e = inner,
+                _ => break,
+            }
+        }
+    }
+
     pub(super) fn mark_mutated(&mut self, target: &Expr) {
+        self.note_changed_types(target);
         if let Some(path) = self.path_of(target)
             && !matches!(target.kind, ExprKind::Ident(_))
         {
@@ -1065,6 +1105,7 @@ impl<'m> Infer<'m> {
 
     /// The receiver of a method that changes it (`list.push(x)`, `map.set(k, v)`).
     pub(super) fn mark_receiver_mutated(&mut self, obj: &Expr) {
+        self.note_changed_types(obj);
         if let Some(path) = self.path_of(obj) {
             for n in self.narrows.iter().rev() {
                 if n.root == path.root && path.fields.starts_with(&n.path) {
@@ -1109,6 +1150,13 @@ impl<'m> Infer<'m> {
             ExprKind::NonNull(inner) => inner,
             _ => e,
         };
+        // A copy of what a place holds: the place and the copy are one object in
+        // JavaScript.
+        if is_place(e)
+            && let Some(t) = self.expr_ty.get(&e.id)
+        {
+            self.copied_types.push(t.clone());
+        }
         if let ExprKind::Ident(name) = &e.kind
             && let Some(id) = self.lookup(name)
             && let Some(v) = self.vars.get_mut(&id)
