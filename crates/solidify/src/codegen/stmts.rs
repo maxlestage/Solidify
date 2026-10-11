@@ -114,6 +114,7 @@ impl<'a> Gen<'a> {
             | StmtKind::Enum(_)
             | StmtKind::Empty
             | StmtKind::ExportNames(_)
+            | StmtKind::ExportFrom { .. }
             | StmtKind::Import(_) => Ok(()),
             StmtKind::Return(value) => {
                 match value {
@@ -1795,6 +1796,16 @@ impl<'a> Gen<'a> {
             }
         };
         let var_name = self.bind(*id, if usize_loop { Repr::Usize } else { Repr::Owned });
+        // A counter the body never reads: `_`.
+        let mut read = false;
+        let mut on_stmt = |_: &Stmt| {};
+        let mut on_expr = |x: &Expr| {
+            if self.p.refs.get(&x.id) == Some(id) {
+                read = true;
+            }
+        };
+        super::visit_stmt(body, &mut on_stmt, &mut on_expr);
+        let var_name = if read { var_name } else { "_".to_string() };
         let head = if ascending {
             let r = if *op == BinOp::Lt {
                 format!("{s}..{e}")

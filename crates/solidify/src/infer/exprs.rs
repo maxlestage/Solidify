@@ -962,6 +962,12 @@ impl<'m> Infer<'m> {
     }
 
     fn member(&mut self, e: &'m Expr, obj: &'m Expr, prop: &str, optional: bool) -> IResult<Ty> {
+        // `ns.x` for `import * as ns`: the exported name itself.
+        if let Some(file) = self.namespace_of(obj) {
+            let actual = self.namespace_member(file, prop, e.span)?;
+            self.set_ty(obj.id, Ty::Void);
+            return self.ident(&actual, e);
+        }
         // Globals: `Math.PI`, `Number.MAX_SAFE_INTEGER`.
         if let ExprKind::Ident(name) = &obj.kind
             && self.lookup(name).is_none()
@@ -1001,6 +1007,8 @@ impl<'m> Infer<'m> {
         if let ExprKind::Ident(name) = &obj.kind
             && let Some(id) = self.lookup(name)
         {
+            let canonical = self.vars[&id].name.clone();
+            let name = &canonical;
             match self.vars[&id].role {
                 Role::Enum => {
                     self.refs.insert(obj.id, id);
@@ -1237,6 +1245,9 @@ impl<'m> Infer<'m> {
             if self.vars[&id].role != Role::Class {
                 return self.err(format!("`{name}` is not a class"), callee.span);
             }
+            // The class may be imported under another name.
+            let canonical = self.vars[&id].name.clone();
+            let name = &canonical;
             self.refs.insert(callee.id, id);
             self.set_ty(callee.id, Ty::Named(name.clone()));
             let s = self.struct_by_name(name).expect("class");
@@ -1451,57 +1462,13 @@ impl<'m> Infer<'m> {
             ExprKind::Member { obj, prop, .. } if matches!(obj.kind, ExprKind::Super) => {
                 self.super_method_call(e, prop, args)
             }
-            ExprKind::Ident(name) => {
-                if let Some(id) = self.lookup(name) {
-                    self.refs.insert(callee.id, id);
-                    self.record_use(id, callee.id);
-                    let v = self.vars[&id].clone();
-                    match v.role {
-                        Role::Func => {
-                            let fn_id = self.fn_bindings[&id];
-                            let info = self.funcs[&fn_id].clone();
-                            self.set_ty(callee.id, Ty::Func(Rc::new(info.sig.clone())));
-                            self.args(args, &info, fn_id, e.span)?;
-                            self.calls.insert(e.id, Callee::Fn(id));
-                            let caller = self.ctx().id;
-                            self.funcs
-                                .get_mut(&caller)
-                                .expect("fn")
-                                .calls
-                                .push((fn_id, e.id));
-                            if !info.type_params.is_empty() {
-                                return self.instantiate_ret(&info, args);
-                            }
-                            return Ok(info.sig.ret.clone());
-                        }
-                        Role::Class => {
-                            return self.err(
-                                format!("`{name}` is a class: use `new {name}(…)`"),
-                                callee.span,
-                            );
-                        }
-                        _ => {
-                            let ft = self.types.resolve(&v.ty);
-                            let Ty::Func(f) = ft else {
-                                if let Ty::Var(_) = ft {
-                                    return self.err(
-                                        format!("the type of `{name}` is not known yet"),
-                                        callee.span,
-                                    );
-                                }
-                                let d = self.describe(&ft);
-                                return self
-                                    .err(format!("`{name}` is {d}, not a function"), callee.span);
-                            };
-                            self.set_ty(callee.id, Ty::Func(f.clone()));
-                            self.dynamic_args(args, &f, e.span)?;
-                            self.calls.insert(e.id, Callee::Closure(id));
-                            return Ok(f.ret.clone());
-                        }
-                    }
-                }
-                self.global_call(e, name, args, callee.span)
+            ExprKind::Member { obj, prop, .. } if self.namespace_of(obj).is_some() => {
+                let file = self.namespace_of(obj).expect("namespace");
+                let actual = self.namespace_member(file, prop, callee.span)?;
+                self.set_ty(obj.id, Ty::Void);
+                self.named_call(e, callee, &actual, args)
             }
+            ExprKind::Ident(name) => self.named_call(e, callee, name, args),
             ExprKind::Member {
                 obj,
                 prop,
@@ -1789,6 +1756,64 @@ impl<'m> Infer<'m> {
         Ok(t)
     }
 
+    /// A call to a name: a function, a closure variable, a class used as a function…
+    fn named_call(
+        &mut self,
+        e: &'m Expr,
+        callee: &'m Expr,
+        name: &str,
+        args: &'m [Arg],
+    ) -> IResult<Ty> {
+        if let Some(id) = self.lookup(name) {
+            self.refs.insert(callee.id, id);
+            self.record_use(id, callee.id);
+            let v = self.vars[&id].clone();
+            match v.role {
+                Role::Func => {
+                    let fn_id = self.fn_bindings[&id];
+                    let info = self.funcs[&fn_id].clone();
+                    self.set_ty(callee.id, Ty::Func(Rc::new(info.sig.clone())));
+                    self.args(args, &info, fn_id, e.span)?;
+                    self.calls.insert(e.id, Callee::Fn(id));
+                    let caller = self.ctx().id;
+                    self.funcs
+                        .get_mut(&caller)
+                        .expect("fn")
+                        .calls
+                        .push((fn_id, e.id));
+                    if !info.type_params.is_empty() {
+                        return self.instantiate_ret(&info, args);
+                    }
+                    return Ok(info.sig.ret.clone());
+                }
+                Role::Class => {
+                    return self.err(
+                        format!("`{name}` is a class: use `new {name}(…)`"),
+                        callee.span,
+                    );
+                }
+                _ => {
+                    let ft = self.types.resolve(&v.ty);
+                    let Ty::Func(f) = ft else {
+                        if let Ty::Var(_) = ft {
+                            return self.err(
+                                format!("the type of `{name}` is not known yet"),
+                                callee.span,
+                            );
+                        }
+                        let d = self.describe(&ft);
+                        return self.err(format!("`{name}` is {d}, not a function"), callee.span);
+                    };
+                    self.set_ty(callee.id, Ty::Func(f.clone()));
+                    self.dynamic_args(args, &f, e.span)?;
+                    self.calls.insert(e.id, Callee::Closure(id));
+                    return Ok(f.ret.clone());
+                }
+            }
+        }
+        self.global_call(e, name, args, callee.span)
+    }
+
     fn method_call(
         &mut self,
         e: &'m Expr,
@@ -1810,6 +1835,8 @@ impl<'m> Infer<'m> {
             && let Some(id) = self.lookup(name)
             && self.vars[&id].role == Role::Class
         {
+            let canonical = self.vars[&id].name.clone();
+            let name = &canonical;
             self.refs.insert(obj.id, id);
             self.set_ty(obj.id, Ty::Named(name.clone()));
             let Some((owner, m)) = self

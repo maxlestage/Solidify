@@ -47,15 +47,35 @@ const RESERVED: &[&str] = &[
 ];
 
 pub fn parse(src: &str) -> Result<Module, Error> {
-    let (tokens, comments) = lex(src)?;
+    parse_at(src, 0..src.len(), 0)
+}
+
+/// Parses the part `range` of `src` (one file of a program held in one text): spans point
+/// into `src`, node ids start at `first_id`.
+pub fn parse_at(
+    src: &str,
+    range: std::ops::Range<usize>,
+    first_id: NodeId,
+) -> Result<Module, Error> {
+    let base = range.start;
+    let shift = |s: Span| Span::new(s.start + base, s.end + base);
+    let (mut tokens, mut comments) =
+        lex(&src[range]).map_err(|e| Error::new(e.message, shift(e.span)))?;
+    for t in &mut tokens {
+        t.span = shift(t.span);
+    }
+    for c in &mut comments {
+        c.span = shift(c.span);
+    }
     let mut p = Parser {
         src,
         tokens,
         pos: 0,
         comments,
         comment_idx: 0,
-        next_id: 0,
+        next_id: first_id,
         no_in: false,
+        default_export: None,
     };
     let mut body = Vec::new();
     while !p.at_eof() {
@@ -64,6 +84,7 @@ pub fn parse(src: &str) -> Result<Module, Error> {
     Ok(Module {
         body,
         node_count: p.next_id,
+        default_export: p.default_export,
     })
 }
 
@@ -76,6 +97,8 @@ struct Parser<'a> {
     next_id: NodeId,
     /// Inside the head of a `for`: `in` is not a binary operator.
     no_in: bool,
+    /// The name given to `export default`.
+    default_export: Option<String>,
 }
 
 type PResult<T> = Result<T, Error>;
@@ -744,23 +767,35 @@ impl<'a> Parser<'a> {
             if self.at_word("function") {
                 let mut f = self.function(false, false)?;
                 f.exported = true;
+                self.default_export = f.name.clone();
                 return Ok(StmtKind::Func(f));
             }
             if self.at_word("async") && self.at_word_at(1, "function") {
                 self.next();
                 let mut f = self.function(true, false)?;
                 f.exported = true;
+                self.default_export = f.name.clone();
                 return Ok(StmtKind::Func(f));
             }
             if self.at_word("class") {
-                return Ok(StmtKind::Class(self.class(true)?));
+                let c = self.class(true)?;
+                self.default_export = Some(c.name.clone());
+                return Ok(StmtKind::Class(c));
             }
             let e = self.assignment()?;
             self.semicolon()?;
             return Ok(StmtKind::ExportDefault(e));
         }
         if self.eat_punct("*") {
-            return Err(Error::new("`export *` is not supported", start));
+            let _ = start;
+            self.expect_word("from")?;
+            let from = self.string_literal()?;
+            self.semicolon()?;
+            return Ok(StmtKind::ExportFrom {
+                names: Vec::new(),
+                all: true,
+                from,
+            });
         }
         if self.at_punct("{") || (self.at_word("type") && self.at_punct_at(1, "{")) {
             self.eat_word("type");
@@ -780,9 +815,13 @@ impl<'a> Parser<'a> {
             }
             self.expect_punct("}")?;
             if self.eat_word("from") {
-                self.string_literal()?;
+                let from = self.string_literal()?;
                 self.semicolon()?;
-                return Ok(StmtKind::Empty);
+                return Ok(StmtKind::ExportFrom {
+                    names,
+                    all: false,
+                    from,
+                });
             }
             self.semicolon()?;
             return Ok(StmtKind::ExportNames(names));
@@ -2512,6 +2551,7 @@ impl<'a> Parser<'a> {
                 comment_idx: 0,
                 next_id: self.next_id,
                 no_in: false,
+                default_export: None,
             };
             let e = sub.expression()?;
             if !sub.at_eof() {

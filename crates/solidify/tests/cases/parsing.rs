@@ -32,7 +32,7 @@ fn shout(s: &str) -> String {
 
 fn label<T: std::fmt::Display>(value: T, times: i64) -> String {
     let mut out = "".to_string();
-    for i in 0..times {
+    for _ in 0..times {
         out.push_str(&format!("{value}"));
     }
     out

@@ -10,6 +10,8 @@ pub struct Module {
     pub body: Vec<Stmt>,
     /// One more than the largest [`NodeId`] in the tree.
     pub node_count: usize,
+    /// The function or class exported with `export default`.
+    pub default_export: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -81,6 +83,12 @@ pub enum StmtKind {
     Import(Import),
     /// `export { a, b as c }`.
     ExportNames(Vec<(String, Option<String>)>),
+    /// `export { a as b } from "./x"` or `export * from "./x"`.
+    ExportFrom {
+        names: Vec<(String, Option<String>)>,
+        all: bool,
+        from: String,
+    },
     ExportDefault(Expr),
     Labeled {
         label: String,

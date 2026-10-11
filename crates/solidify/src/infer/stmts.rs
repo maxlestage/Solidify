@@ -39,7 +39,9 @@ impl<'m> Infer<'m> {
             | StmtKind::TypeAlias(_)
             | StmtKind::Enum(_)
             | StmtKind::Empty
-            | StmtKind::ExportNames(_) => Ok(()),
+            | StmtKind::ExportNames(_)
+            | StmtKind::ExportFrom { .. }
+            | StmtKind::Import(_) => Ok(()),
             StmtKind::Return(value) => {
                 let ret = self.ctx().ret.clone();
                 match value {
@@ -286,15 +288,6 @@ impl<'m> Infer<'m> {
             StmtKind::Expr(e) => {
                 self.expr(e, None)?;
                 Ok(())
-            }
-            StmtKind::Import(i) => {
-                if i.type_only {
-                    return Ok(());
-                }
-                self.err(
-                    "imports are not supported yet: Solidify translates one file at a time",
-                    s.span,
-                )
             }
             StmtKind::ExportDefault(e) => {
                 self.err("`export default` of a value is not supported", e.span)

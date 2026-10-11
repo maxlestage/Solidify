@@ -6,9 +6,11 @@ pub mod error;
 pub mod infer;
 pub mod lexer;
 pub mod parser;
+pub mod project;
 pub mod types;
 
 pub use error::Error;
+pub use project::{FileInfo, LoadError, Project};
 
 /// Options of a translation.
 #[derive(Clone, Debug, Default)]
@@ -19,13 +21,14 @@ pub struct Options {
     pub no_header: bool,
 }
 
-/// Translates a TypeScript (or JavaScript) module to Rust.
+/// Translates one TypeScript (or JavaScript) file to Rust. A file importing others is
+/// translated with [`Project::load`], which follows the imports.
 pub fn transpile(src: &str, options: &Options) -> Result<String, Error> {
-    let module = parser::parse(src)?;
-    let program = infer::infer(&module, src)?;
-    let opts = codegen::Options {
-        file_name: options.file_name.clone(),
-        no_header: options.no_header,
-    };
-    codegen::generate(&module, &program, &opts)
+    Project::single(options.file_name.as_deref(), src)?.transpile(options)
+}
+
+/// Translates the file at `path` and every file it imports to one Rust file.
+pub fn transpile_file(path: &std::path::Path, options: &Options) -> Result<String, String> {
+    let project = Project::load(path).map_err(|e| e.0)?;
+    project.transpile(options).map_err(|e| project.pretty(&e))
 }

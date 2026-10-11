@@ -376,8 +376,11 @@ impl<'a> Gen<'a> {
     }
 
     pub(super) fn ident(&mut self, e: &'a Expr) -> GResult<E> {
-        let ExprKind::Ident(name) = &e.kind else {
-            unreachable!()
+        let name = match &e.kind {
+            ExprKind::Ident(name) => name,
+            // `ns.x` for `import * as ns`.
+            ExprKind::Member { prop, .. } => prop,
+            _ => unreachable!(),
         };
         let Some(&binding) = self.p.refs.get(&e.id) else {
             return match name.as_str() {
@@ -1495,6 +1498,10 @@ impl<'a> Gen<'a> {
     }
 
     fn member(&mut self, e: &'a Expr, obj: &'a Expr, prop: &str, optional: bool) -> GResult<E> {
+        // `ns.x` for `import * as ns`: the name itself.
+        if self.p.refs.contains_key(&e.id) {
+            return self.ident(e);
+        }
         let ty = self.ty_of(e);
         if let Some(Callee::Builtin(name)) = self.p.calls.get(&e.id) {
             return Ok(E::atom(

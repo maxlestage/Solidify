@@ -1,6 +1,7 @@
 //! Every `tests/cases/<name>.ts` is translated, compared with `<name>.rs` (the expected
 //! output), compiled with `rustc`, and run: its output must match `<name>.out`, which holds
-//! what Node.js prints for the TypeScript file.
+//! what Node.js prints for the TypeScript file. A directory `tests/cases/<name>/` holds a
+//! program of several files, entered at `main.ts`.
 //!
 //! `UPDATE_CASES=1 cargo test --test cases` rewrites the `.rs` files, and the `.out` files
 //! when `node` is installed.
@@ -17,19 +18,39 @@ fn cases() -> Vec<PathBuf> {
         .expect("tests/cases")
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "ts"))
+        .filter_map(|p| {
+            if p.extension().is_some_and(|e| e == "ts") {
+                Some(p)
+            } else if p.is_dir() && p.join("main.ts").is_file() {
+                Some(p.join("main.ts"))
+            } else {
+                None
+            }
+        })
         .collect();
     files.sort();
     files
 }
 
+fn case_name(path: &Path) -> String {
+    let stem = path.file_stem().unwrap().to_string_lossy().into_owned();
+    if stem == "main" {
+        // A program of several files: named after its directory.
+        return path
+            .parent()
+            .and_then(|d| d.file_name())
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or(stem);
+    }
+    stem
+}
+
 fn transpile(path: &Path) -> Result<String, String> {
-    let src = std::fs::read_to_string(path).expect("read case");
     let options = solidify::Options {
         file_name: path.file_name().map(|f| f.to_string_lossy().into_owned()),
         no_header: true,
     };
-    solidify::transpile(&src, &options).map_err(|e| e.pretty(&src))
+    solidify::transpile_file(path, &options)
 }
 
 #[test]
@@ -39,7 +60,7 @@ fn every_case_translates_compiles_and_runs() {
     std::fs::create_dir_all(&out_dir).expect("temp dir");
     let mut failures = Vec::new();
     for case in cases() {
-        let name = case.file_stem().unwrap().to_string_lossy().into_owned();
+        let name = case_name(&case);
         let expected_rs = case.with_extension("rs");
         let expected_out = case.with_extension("out");
         let rust = match transpile(&case) {
