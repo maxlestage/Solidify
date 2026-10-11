@@ -27,6 +27,8 @@ pub struct Options {
     pub file_name: Option<String>,
     /// Omit the header comment.
     pub no_header: bool,
+    /// The files of the program: the imported ones become modules.
+    pub files: Vec<crate::project::FileInfo>,
 }
 
 /// How an emitted expression holds its value.
@@ -200,6 +202,8 @@ pub(super) struct Gen<'a> {
     /// Names bound by narrowing, innermost last.
     pub narrowed: Vec<(String, Repr)>,
     pub opts: &'a Options,
+    /// Writing the items of an imported file, inside its module.
+    pub in_module: bool,
 }
 
 pub(super) type GResult<T> = Result<T, Error>;
@@ -215,6 +219,7 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         uses_hashmap: false,
         uses_hashset: false,
         ordered: false,
+        in_module: false,
         inspected: BTreeSet::new(),
         json_types: BTreeSet::new(),
         union_accessors: BTreeSet::new(),
@@ -1132,6 +1137,43 @@ impl<'a> Gen<'a> {
             }
             _ => format!("{recv}.js_value()"),
         }
+    }
+
+    /// Visibility of an item: inside a module, what is not exported stays in the crate.
+    pub(super) fn vis(&self, exported: bool) -> &'static str {
+        if exported {
+            "pub "
+        } else if self.in_module {
+            "pub(crate) "
+        } else {
+            ""
+        }
+    }
+
+    /// The file a source offset is in.
+    pub(super) fn file_of(&self, offset: usize) -> usize {
+        self.opts
+            .files
+            .iter()
+            .position(|f| f.contains(offset))
+            .unwrap_or(0)
+    }
+
+    /// Whether an item at `span` belongs to the file being written (`None`: every file).
+    pub(super) fn owned_by(&self, span: Span, file: Option<usize>) -> bool {
+        file.is_none_or(|i| self.file_of(span.start) == i)
+    }
+
+    /// The file declaring a type.
+    pub(super) fn type_file(&self, name: &str) -> usize {
+        let span = self
+            .p
+            .struct_info(name)
+            .map(|s| s.span)
+            .or_else(|| self.p.enum_info(name).map(|e| e.span))
+            .or_else(|| self.p.union_info(name).map(|u| u.span))
+            .unwrap_or_default();
+        self.file_of(span.start)
     }
 
     pub(super) fn err<T>(&self, msg: impl Into<String>, span: Span) -> GResult<T> {

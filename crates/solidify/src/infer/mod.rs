@@ -10,6 +10,7 @@ mod annotations;
 mod builtins;
 mod decls;
 mod exprs;
+mod files;
 mod finish;
 mod stmts;
 mod unions;
@@ -33,6 +34,8 @@ pub enum Role {
     Catch,
     /// The variable of a `for … of` loop.
     Loop,
+    /// `import * as ns from "./file"`.
+    Namespace,
 }
 
 #[derive(Clone, Debug)]
@@ -514,6 +517,12 @@ pub(super) struct Path {
 
 pub(super) struct Infer<'m> {
     pub(super) src: &'m str,
+    /// The files of the program (one when translating a single source).
+    pub(super) files: &'m [crate::project::FileInfo],
+    /// `import * as ns`: the file each namespace binding stands for.
+    pub(super) namespaces: HashMap<NodeId, usize>,
+    /// For each file, its exported names and the global name each one stands for.
+    pub(super) exports: Vec<HashMap<String, String>>,
     pub(super) types: Types,
     pub(super) node_count: usize,
     pub(super) next_synth: usize,
@@ -617,10 +626,17 @@ pub(super) const GLOBALS: &[&str] = &[
     "BigInt",
 ];
 
-pub fn infer(module: &Module, src: &str) -> IResult<Program> {
+pub fn infer<'m>(
+    module: &'m Module,
+    src: &'m str,
+    files: &'m [crate::project::FileInfo],
+) -> IResult<Program> {
     let main_id = module.node_count;
     let mut inf = Infer {
         src,
+        files,
+        namespaces: HashMap::new(),
+        exports: Vec::new(),
         types: Types::default(),
         node_count: module.node_count,
         next_synth: module.node_count + 1,

@@ -61,8 +61,12 @@ impl<'m> Infer<'m> {
                 span: Span::default(),
             },
         );
+        self.check_cross_file_names(&module.body)?;
         self.collect_types(&module.body)?;
+        // Imported types first: annotations of top-level values may name them.
+        self.bind_imports(&module.body, true)?;
         self.collect_values(&module.body, true)?;
+        self.bind_imports(&module.body, false)?;
         for s in &module.body {
             self.stmt(s)?;
             if !matches!(
@@ -75,6 +79,7 @@ impl<'m> Infer<'m> {
                     | StmtKind::Empty
                     | StmtKind::Import(_)
                     | StmtKind::ExportNames(_)
+                    | StmtKind::ExportFrom { .. }
             ) {
                 self.has_main = true;
             }
