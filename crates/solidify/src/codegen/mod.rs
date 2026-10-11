@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::{Error, Span};
-use crate::infer::{Callee, Program, Role};
+use crate::infer::{Callee, FnInfo, Program, Role};
 use crate::types::{Flavor, Ty};
 pub use runtime::Helper;
 pub use runtime::regex_rt;
@@ -206,13 +206,60 @@ pub(super) struct Gen<'a> {
     pub in_module: bool,
     /// The call that is the whole current statement: its result is not used.
     pub stmt_call: Option<NodeId>,
+    /// The type parameters of the generic struct whose items are being written.
+    pub class_params: Vec<String>,
+    /// The traits its methods need of them.
+    pub class_bounds: BTreeMap<String, BTreeSet<&'static str>>,
+    /// A type parameter is shown (`JsInspect`): every type of the program may be its
+    /// argument, and is given the trait.
+    pub generic_inspect: bool,
+    /// Writing the methods a class inherits from a generic base (`extends Stack<number>`):
+    /// the base's parameters as the class gives them.
+    pub class_subst: HashMap<String, Ty>,
+    /// The array being shown has `undefined` (not `null`) for its missing elements.
+    pub elems_undefined: bool,
+    /// Fields written through a constrained type parameter: (constraint, field).
+    pub bound_setters: BTreeSet<(String, String)>,
+    /// The bounds of the generic items found by the previous pass (`fn:<id>`,
+    /// `struct:<name>`), and those found by this one.
+    pub known_bounds: HashMap<String, Bounds>,
+    pub found_bounds: HashMap<String, Bounds>,
 }
 
 pub(super) type GResult<T> = Result<T, Error>;
 
 /// Generates the Rust source of a typed program.
 pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<String> {
+    // What generic functions and structs need of their type parameters depends on what
+    // the generic items they use need: written again until nothing changes.
+    let mut known: HashMap<String, Bounds> = HashMap::new();
+    let mut text = String::new();
+    for _ in 0..8 {
+        let (out, found) = generate_with(module, prog, opts, &known)?;
+        text = out;
+        if found == known {
+            break;
+        }
+        known = found;
+    }
+    Ok(text)
+}
+
+/// The traits each type parameter of an item needs.
+pub(super) type Bounds = BTreeMap<String, BTreeSet<&'static str>>;
+
+fn generate_with(
+    module: &Module,
+    prog: &Program,
+    opts: &Options,
+    known: &HashMap<String, Bounds>,
+) -> GResult<(String, HashMap<String, Bounds>)> {
     let mut g = Gen {
+        known_bounds: known.clone(),
+        bound_setters: BTreeSet::new(),
+        elems_undefined: false,
+        class_subst: HashMap::new(),
+        found_bounds: HashMap::new(),
         m: module,
         p: prog,
         out: String::new(),
@@ -223,6 +270,9 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         ordered: false,
         in_module: false,
         stmt_call: None,
+        class_params: Vec::new(),
+        class_bounds: BTreeMap::new(),
+        generic_inspect: false,
         inspected: BTreeSet::new(),
         json_types: BTreeSet::new(),
         union_accessors: BTreeSet::new(),
@@ -249,7 +299,8 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
     };
     collect_asts(&module.body, &mut g.fn_asts, &mut g.class_asts);
     g.ordered = g.needs_ordered();
-    g.module()
+    let text = g.module()?;
+    Ok((text, g.found_bounds))
 }
 
 /// Visits every statement and every expression of a list of statements, nested
@@ -717,7 +768,54 @@ pub fn screaming(name: &str) -> String {
 /// `point` → `Point`.
 pub fn pascal(name: &str) -> String {
     let p = crate::infer::pascal(name);
-    if p.is_empty() { "X".into() } else { p }
+    if p.is_empty() {
+        return "X".into();
+    }
+    // A type of the program named like one the generated code uses.
+    const TAKEN: &[&str] = &[
+        "Box",
+        "Vec",
+        "Option",
+        "Result",
+        "Some",
+        "None",
+        "Ok",
+        "Err",
+        "String",
+        "Rc",
+        "RefCell",
+        "Cell",
+        "HashMap",
+        "HashSet",
+        "Self",
+        "LazyLock",
+        "Mutex",
+        "Fn",
+        "FnMut",
+        "Ordering",
+        "Iterator",
+        "Display",
+        "Debug",
+        "Clone",
+        "PartialEq",
+        "Default",
+        "JsMap",
+        "JsSet",
+        "JsValue",
+        "JsInspect",
+        "JsFromJson",
+        "JsonValue",
+        "JsRegex",
+        "JsMatch",
+        "JsDate",
+        "JsGenerator",
+        "JsPromise",
+    ];
+    if TAKEN.contains(&p.as_str()) {
+        format!("{p}_")
+    } else {
+        p
+    }
 }
 
 fn escape_keyword(name: String) -> String {
@@ -924,11 +1022,11 @@ impl<'a> Gen<'a> {
         match self.resolve(ty) {
             Ty::Array(_) | Ty::Tuple(_) | Ty::Map(..) | Ty::Set(_) => true,
             Ty::Option(inner) => self.is_inspect_ty(&inner),
-            Ty::Named(n) => {
+            Ty::Named(n, ..) => {
                 n != "Error"
                     && n != "RegExp"
-                    && !self.is_type_param(&n)
-                    && (n == "RegExpMatch"
+                    && ((self.is_type_param(&n) && !self.plain_param(ty))
+                        || n == "RegExpMatch"
                         || n == "Date"
                         || self.p.struct_info(&n).is_some()
                         || self.p.union_info(&n).is_some())
@@ -951,7 +1049,7 @@ impl<'a> Gen<'a> {
         };
         let u = self.union_of(&to)?;
         let from = self.resolve(from);
-        if matches!(&from, Ty::Named(n) if *n == u.name) {
+        if matches!(&from, Ty::Named(n, ..) if *n == u.name) {
             return None;
         }
         let zf = self.p.types.zonk(&from);
@@ -965,6 +1063,11 @@ impl<'a> Gen<'a> {
     /// Records that the structs and enums reachable from this type are shown.
     pub(super) fn mark_inspected(&mut self, ty: &Ty) {
         self.helpers.insert(Helper::Inspect);
+        if let Ty::Named(_, args) = self.resolve(ty) {
+            for a in &args {
+                self.mark_inspected(a);
+            }
+        }
         match self.resolve(ty) {
             Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.mark_inspected(&t),
             Ty::Map(k, v, _) => {
@@ -976,7 +1079,7 @@ impl<'a> Gen<'a> {
                     self.mark_inspected(t);
                 }
             }
-            Ty::Named(n)
+            Ty::Named(n, ..)
                 if (self.p.struct_info(&n).is_some()
                     || self.p.is_enum(&n)
                     || self.p.union_info(&n).is_some())
@@ -1031,12 +1134,19 @@ impl<'a> Gen<'a> {
             ),
             Ty::Func(_) => self.err("a function cannot be read from JSON", span),
             Ty::Gen(_) => self.err("a generator cannot be read from JSON", span),
-            Ty::Named(n) => {
+            Ty::Named(n, args) => {
                 if n == "Error" || n == "RegExp" || n == "RegExpMatch" || n == "Date" {
                     return self.err(
                         format!("a `{n}` cannot be read from JSON: read a string and parse it"),
                         span,
                     );
+                }
+                // A parameter of the generic struct being registered: its argument is.
+                if self.class_params.contains(&n) {
+                    return Ok(());
+                }
+                for a in &args {
+                    self.mark_json(a, span)?;
                 }
                 if self.is_type_param(&n) {
                     return self.err(
@@ -1067,16 +1177,23 @@ impl<'a> Gen<'a> {
                 let Some(info) = self.p.struct_info(&n).cloned() else {
                     return self.err(format!("`{n}` cannot be read from JSON"), span);
                 };
+                let prev = std::mem::replace(&mut self.class_params, info.type_params.clone());
+                let mut r = Ok(());
                 for f in &info.fields {
                     if matches!(self.resolve(&f.ty), Ty::Func(_)) {
-                        return self.err(
+                        r = self.err(
                             format!("`{n}.{}` is a function: it cannot be read from JSON", f.name),
                             span,
                         );
+                        break;
                     }
-                    self.mark_json(&f.ty, span)?;
+                    r = self.mark_json(&f.ty, span);
+                    if r.is_err() {
+                        break;
+                    }
                 }
-                Ok(())
+                self.class_params = prev;
+                r
             }
         }
     }
@@ -1105,11 +1222,22 @@ impl<'a> Gen<'a> {
     /// are shown as objects, not as maps.
     pub(super) fn js_value_of(&mut self, code: &str, ty: &Ty) -> String {
         self.mark_inspected(ty);
+        self.bound_needed(ty, "JsInspect");
         let recv = if code.contains(' ') && !(code.starts_with('(') && code.ends_with(')')) {
             format!("({code})")
         } else {
             code.to_string()
         };
+        if self.elems_undefined
+            && let Ty::Array(t) = self.resolve(ty)
+            && let Ty::Option(inner) = self.resolve(&t)
+        {
+            self.elems_undefined = false;
+            let shown = self.js_value_of("v", &inner);
+            return format!(
+                "JsValue::Array({recv}.iter().map(|x| x.as_ref().map_or(JsValue::Undefined, |v| {shown})).collect())"
+            );
+        }
         if !self.contains_record(ty) {
             return format!("{recv}.js_value()");
         }
@@ -1207,7 +1335,48 @@ impl<'a> Gen<'a> {
     // ----- types -----
 
     pub(super) fn resolve(&self, ty: &Ty) -> Ty {
-        self.p.types.resolve(ty)
+        let t = self.p.types.resolve(ty);
+        if !self.class_subst.is_empty()
+            && let Ty::Named(n, args) = &t
+            && args.is_empty()
+            && let Some(given) = self.class_subst.get(n)
+            && !matches!(given, Ty::Named(g, a) if g == n && a.is_empty())
+        {
+            return self.resolve(given);
+        }
+        t
+    }
+
+    /// The parameters of `class`'s generic ancestors, as each class gives them to its
+    /// base (`class NumberStack extends Stack<number>`: `T → number`).
+    pub(super) fn ancestor_subst(&self, class: &str) -> HashMap<String, Ty> {
+        let mut out: HashMap<String, Ty> = HashMap::new();
+        let own: Vec<String> = self
+            .p
+            .struct_info(class)
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        let mut current = class.to_string();
+        let mut seen = HashSet::new();
+        while seen.insert(current.clone()) {
+            let Some(s) = self.p.struct_info(&current) else {
+                break;
+            };
+            let Some(parent) = s.parent.clone() else {
+                break;
+            };
+            if let Some(p) = self.p.struct_info(&parent) {
+                for (name, t) in p.type_params.iter().zip(&s.parent_args) {
+                    if own.contains(name) {
+                        continue;
+                    }
+                    let t = crate::infer::substitute(t, &out, &self.p.types);
+                    out.entry(name.clone()).or_insert(t);
+                }
+            }
+            current = parent;
+        }
+        out
     }
 
     pub(super) fn ty_of(&self, e: &Expr) -> Ty {
@@ -1232,7 +1401,7 @@ impl<'a> Gen<'a> {
 
     /// A struct that contains itself: held in a `Box` inside `Option`.
     pub(super) fn is_boxed(&self, ty: &Ty) -> bool {
-        matches!(self.resolve(ty), Ty::Named(n) if self.p.boxed.contains(&n))
+        matches!(self.resolve(ty), Ty::Named(n, ..) if self.p.boxed.contains(&n))
     }
 
     pub(super) fn is_type_param(&self, name: &str) -> bool {
@@ -1240,6 +1409,232 @@ impl<'a> Gen<'a> {
             .iter()
             .rev()
             .any(|f| f.type_params.iter().any(|t| t == name))
+            || self.class_params.iter().any(|t| t == name)
+    }
+
+    /// A method returning `this` that returns `&mut Self` (or `&Self`): not for classes
+    /// held as `dyn`, whose traits cannot name `Self`.
+    pub(super) fn fluent(&self, info: &FnInfo) -> bool {
+        info.returns_this
+            && info.method_of.as_ref().is_some_and(|c| {
+                !self.p.ancestry(c).iter().any(|a| {
+                    self.p.is_dyn(a)
+                        || self
+                            .p
+                            .struct_info(a)
+                            .is_some_and(|s| s.implements.iter().any(|i| self.p.is_dyn(i)))
+                })
+            })
+    }
+
+    /// `T extends HasId`: the struct a type parameter in scope is constrained to.
+    pub(super) fn constraint_of(&self, param: &str) -> Option<String> {
+        for ctx in self.fns.iter().rev() {
+            if let Some(f) = self.p.funcs.get(&ctx.id)
+                && let Some((_, c)) = f.type_bounds.iter().find(|(p, _)| p == param)
+            {
+                return Some(c.clone());
+            }
+            if ctx.type_params.iter().any(|t| t == param) {
+                return None;
+            }
+        }
+        if !self.class_params.iter().any(|t| t == param) {
+            return None;
+        }
+        let s = self.p.struct_info(self.current_class.as_ref()?)?;
+        s.type_bounds
+            .iter()
+            .find(|(p, _)| p == param)
+            .map(|(_, c)| c.clone())
+    }
+
+    /// The constrained type parameter a type is, with its constraint.
+    pub(super) fn constrained(&self, ty: &Ty) -> Option<(String, String)> {
+        match self.resolve(ty) {
+            Ty::Named(n, args) if args.is_empty() && self.is_type_param(&n) => {
+                let c = self.constraint_of(&n)?;
+                Some((n, c))
+            }
+            _ => None,
+        }
+    }
+
+    /// The trait standing for a constraint: `HasIdLike`.
+    pub(super) fn bound_trait(c: &str) -> &'static str {
+        Box::leak(format!("{}Like", pascal(c)).into_boxed_str())
+    }
+
+    /// The type parameters a function sees: its own, and its class's.
+    pub(super) fn all_type_params(&self, info: &FnInfo) -> Vec<String> {
+        let mut out = info.type_params.clone();
+        if let Some(s) = info.method_of.as_ref().and_then(|c| self.p.struct_info(c)) {
+            out.extend(s.type_params.iter().cloned());
+        }
+        out
+    }
+
+    /// A value of a generic struct (`Page<String>`): its `let` names the type, which the
+    /// value alone may not tell (`Page { items: Vec::new() }`).
+    pub(super) fn generic_instance(&self, ty: &Ty) -> bool {
+        matches!(self.resolve(ty), Ty::Named(n, args) if !args.is_empty() && !self.p.is_dyn(&n))
+    }
+
+    /// Notes the parameters of a generic item given something else than a number, a
+    /// string or a boolean: shown through `JsInspect` rather than `Display`.
+    pub(super) fn note_instances(&mut self, key: &str, subst: &HashMap<String, Ty>) {
+        for (p, t) in subst {
+            let plain = matches!(self.resolve(t), Ty::Num(_) | Ty::Str | Ty::Bool)
+                || matches!(self.resolve(t), Ty::Named(ref n, ..) if self.p.is_enum(n));
+            if !plain {
+                self.found_bounds
+                    .entry(format!("inst:{key}"))
+                    .or_default()
+                    .entry(p.clone())
+                    .or_default()
+                    .insert("other");
+            }
+        }
+    }
+
+    /// A type parameter only ever given numbers, strings or booleans: shown with
+    /// `Display`, like them.
+    pub(super) fn plain_param(&self, ty: &Ty) -> bool {
+        let Ty::Named(n, args) = self.resolve(ty) else {
+            return false;
+        };
+        if !args.is_empty() || !self.is_type_param(&n) {
+            return false;
+        }
+        let key = self
+            .fns
+            .iter()
+            .rev()
+            .find(|f| f.type_params.contains(&n))
+            .map(|f| format!("fn:{}", f.id))
+            .or_else(|| {
+                self.class_params
+                    .contains(&n)
+                    .then(|| format!("struct:{}", self.current_class.clone().unwrap_or_default()))
+            });
+        let Some(key) = key else {
+            return false;
+        };
+        !self
+            .known_bounds
+            .get(&format!("inst:{key}"))
+            .is_some_and(|b| b.contains_key(&n))
+    }
+
+    /// What a generic item (`fn:<id>`, `struct:<name>`) needs of its type parameters,
+    /// required of the types `subst` gives them.
+    pub(super) fn propagate_bounds(&mut self, key: &str, subst: &HashMap<String, Ty>) {
+        self.note_instances(key, subst);
+        let Some(bounds) = self.known_bounds.get(key).cloned() else {
+            return;
+        };
+        for (p, traits) in bounds {
+            if let Some(t) = subst.get(&p) {
+                for tr in traits {
+                    self.bound_needed(t, tr);
+                }
+            }
+        }
+    }
+
+    /// The types a call gives to type parameters: `params` found in `pattern` (a
+    /// parameter's type) matched against `actual` (the argument's type).
+    pub(super) fn match_params(
+        &self,
+        pattern: &Ty,
+        actual: &Ty,
+        params: &[String],
+        out: &mut HashMap<String, Ty>,
+    ) {
+        match (self.resolve(pattern), self.resolve(actual)) {
+            (Ty::Named(n, args), a) if args.is_empty() && params.contains(&n) => {
+                out.entry(n).or_insert(a);
+            }
+            (Ty::Named(_, xs), Ty::Named(_, ys)) | (Ty::Tuple(xs), Ty::Tuple(ys)) => {
+                for (x, y) in xs.iter().zip(&ys) {
+                    self.match_params(x, y, params, out);
+                }
+            }
+            (Ty::Option(x), Ty::Option(y))
+            | (Ty::Array(x), Ty::Array(y))
+            | (Ty::Set(x), Ty::Set(y))
+            | (Ty::Gen(x), Ty::Gen(y)) => self.match_params(&x, &y, params, out),
+            (Ty::Option(x), y) => self.match_params(&x, &y, params, out),
+            (Ty::Map(k1, v1, _), Ty::Map(k2, v2, _)) => {
+                self.match_params(&k1, &k2, params, out);
+                self.match_params(&v1, &v2, params, out);
+            }
+            (Ty::Func(f), Ty::Func(g)) => {
+                for (x, y) in f.params.iter().zip(&g.params) {
+                    self.match_params(x, y, params, out);
+                }
+                self.match_params(&f.ret, &g.ret, params, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// The type arguments of a generic struct type, by parameter.
+    pub(super) fn instance_subst(&self, ty: &Ty) -> HashMap<String, Ty> {
+        let mut out = HashMap::new();
+        if let Ty::Named(n, args) = self.resolve(ty)
+            && let Some(s) = self.p.struct_info(&n)
+            && s.type_params.len() == args.len()
+        {
+            for (p, a) in s.type_params.iter().zip(args) {
+                out.insert(p.clone(), a);
+            }
+        }
+        out
+    }
+
+    /// `<T, U>` after a generic struct's name: its parameters, or the given arguments.
+    pub(super) fn type_args(&mut self, name: &str, args: &[Ty], span: Span) -> GResult<String> {
+        let params = self
+            .p
+            .struct_info(name)
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        if params.is_empty() {
+            return Ok(String::new());
+        }
+        let mut parts = Vec::new();
+        if args.len() == params.len() {
+            for a in args {
+                parts.push(self.rust_ty(a, span)?);
+            }
+        } else {
+            parts = params;
+        }
+        Ok(format!("<{}>", parts.join(", ")))
+    }
+
+    /// `impl<T: Clone + …>`: the parameters of a generic struct with what its methods
+    /// need of them (and `extra` for every one).
+    pub(super) fn generic_header(&self, params: &[String], extra: &[&'static str]) -> String {
+        if params.is_empty() {
+            return String::new();
+        }
+        let parts: Vec<String> = params
+            .iter()
+            .map(|p| {
+                let mut b: BTreeSet<&'static str> = extra.iter().copied().collect();
+                if let Some(more) = self.class_bounds.get(p) {
+                    b.extend(more.iter().copied());
+                }
+                if b.is_empty() {
+                    p.clone()
+                } else {
+                    format!("{p}: {}", b.into_iter().collect::<Vec<_>>().join(" + "))
+                }
+            })
+            .collect();
+        format!("<{}>", parts.join(", "))
     }
 
     /// The Rust type of an owned value.
@@ -1292,7 +1687,7 @@ impl<'a> Gen<'a> {
                 let name = self.helper(Helper::Generator);
                 format!("{name}<{}>", self.rust_ty(&t, span)?)
             }
-            Ty::Named(n) => {
+            Ty::Named(n, ..) => {
                 if n == "Error" {
                     "String".into()
                 } else if n == "RegExp" {
@@ -1307,7 +1702,12 @@ impl<'a> Gen<'a> {
                 } else if self.p.is_dyn(&n) {
                     format!("Box<dyn {}Like>", pascal(&n))
                 } else {
-                    pascal(&n)
+                    let args = match self.resolve(ty) {
+                        Ty::Named(_, args) => args,
+                        _ => Vec::new(),
+                    };
+                    let generics = self.type_args(&n, &args, span)?;
+                    format!("{}{generics}", pascal(&n))
                 }
             }
             Ty::Func(f) => {
@@ -1373,6 +1773,13 @@ impl<'a> Gen<'a> {
         mutated: bool,
         type_params: &[String],
     ) -> Mode {
+        // A type parameter, even when this class gives it a type: by value.
+        if let Ty::Named(n, a) = self.p.types.resolve(ty)
+            && a.is_empty()
+            && type_params.contains(&n)
+        {
+            return Mode::Value;
+        }
         let ty = self.resolve(ty);
         if let Ty::Func(_) = ty {
             return if stored { Mode::Value } else { Mode::FnImpl };
@@ -1384,7 +1791,7 @@ impl<'a> Gen<'a> {
         if stored || reassigned {
             return Mode::Value;
         }
-        if let Ty::Named(n) = &ty
+        if let Ty::Named(n, ..) = &ty
             && (self.is_type_param(n) || type_params.contains(n))
         {
             return Mode::Value;
@@ -1403,7 +1810,7 @@ impl<'a> Gen<'a> {
     /// `dyn CLike` for a class held dynamically, else `None`.
     pub(super) fn dyn_name(&self, ty: &Ty) -> Option<String> {
         match self.resolve(ty) {
-            Ty::Named(n) if self.p.is_dyn(&n) => Some(format!("dyn {}Like", pascal(&n))),
+            Ty::Named(n, ..) if self.p.is_dyn(&n) => Some(format!("dyn {}Like", pascal(&n))),
             _ => None,
         }
     }
@@ -1411,7 +1818,7 @@ impl<'a> Gen<'a> {
     /// Whether a value of this type holds a `dyn` class somewhere (no `PartialEq` then).
     pub(super) fn contains_dyn(&self, ty: &Ty) -> bool {
         match self.resolve(ty) {
-            Ty::Named(n) => self.p.is_dyn(&n),
+            Ty::Named(n, ..) => self.p.is_dyn(&n),
             Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.contains_dyn(&t),
             Ty::Map(k, v, _) => self.contains_dyn(&k) || self.contains_dyn(&v),
             Ty::Tuple(ts) => ts.iter().any(|t| self.contains_dyn(t)),
@@ -1463,7 +1870,7 @@ impl<'a> Gen<'a> {
     pub(super) fn fmt_spec(&self, ty: &Ty) -> &'static str {
         match self.resolve(ty) {
             Ty::Num(_) | Ty::Str | Ty::Bool => "{}",
-            Ty::Named(n) => {
+            Ty::Named(n, ..) => {
                 let prints = n == "Error"
                     || n == "RegExp"
                     || self.is_type_param(&n)
@@ -1739,7 +2146,7 @@ impl<'a> Gen<'a> {
             code = format!("{en}::{variant}({code})");
         }
         // An instance of a subclass where the base class is held dynamically.
-        if let (Ty::Named(from_class), Ty::Named(base)) = (&from_r, &target)
+        if let (Ty::Named(from_class, ..), Ty::Named(base, ..)) = (&from_r, &target)
             && from_class != base
             && self.p.is_dyn(base)
             && self.p.is_subclass(from_class, base)
@@ -1764,10 +2171,41 @@ impl<'a> Gen<'a> {
 
     /// Records that a type parameter needs a trait.
     pub(super) fn bound_needed(&mut self, ty: &Ty, bound: &'static str) {
-        if let Ty::Named(n) = self.resolve(ty)
+        // `Vec<T>: Clone` needs `T: Clone`.
+        match self.resolve(ty) {
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => {
+                return self.bound_needed(&t, bound);
+            }
+            Ty::Map(k, v, _) => {
+                self.bound_needed(&k, bound);
+                return self.bound_needed(&v, bound);
+            }
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.bound_needed(t, bound);
+                }
+                return;
+            }
+            Ty::Named(_, args) if !args.is_empty() => {
+                for t in &args {
+                    self.bound_needed(t, bound);
+                }
+                return;
+            }
+            _ => {}
+        }
+        if let Ty::Named(n, ..) = self.resolve(ty)
             && self.is_type_param(&n)
         {
-            self.fn_ctx_mut().bounds.entry(n).or_default().insert(bound);
+            if bound == "JsInspect" {
+                self.generic_inspect = true;
+            }
+            let own = self.fns.last().is_some_and(|f| f.type_params.contains(&n));
+            if !own && self.class_params.contains(&n) {
+                self.class_bounds.entry(n).or_default().insert(bound);
+            } else {
+                self.fn_ctx_mut().bounds.entry(n).or_default().insert(bound);
+            }
         }
     }
 }

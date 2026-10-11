@@ -147,7 +147,7 @@ fn main() -> Result<(), String> {
     p.label = Some("hyp".to_string());
     println!("{} {}", js_json_stringify(&p.js_value(), ""), p.norm());
     let q = js_json_parse_as::<Point>(&js_json_stringify(&p.js_value(), ""))?;
-    println!("{} {}", q.x + q.y, q.label.as_ref().map_or("null".to_string(), |v| v.to_string()));
+    println!("{} {}", q.x + q.y, q.label.as_ref().map_or("undefined".to_string(), |v| v.to_string()));
     let data = Data { a: vec![1, 2, 3], b: DataB { c: "c\"d\n".to_string(), d: Vec::new() }, f: true, g: ((-1) as f64).sqrt(), h: 1.5e-7, i: vec![("k".to_string(), 1)].into_iter().collect::<JsMap<_, _>>() };
     println!("{}", js_json_stringify(&data.js_value(), ""));
     println!("{}", js_json_stringify(&data.js_value(), "\t"));
@@ -1373,7 +1373,8 @@ impl<K: JsInspect + std::hash::Hash + Eq + Clone, V: JsInspect> JsInspect for Js
 
 impl JsInspect for Address {
     fn js_value(&self) -> JsValue {
-        let mut props: Vec<(String, JsValue)> = vec![("city".to_string(), self.city.js_value())];
+        let mut props: Vec<(String, JsValue)> = Vec::new();
+        props.push(("city".to_string(), self.city.js_value()));
         if let Some(v) = &self.zip {
             props.push(("zip".to_string(), v.js_value()));
         }

@@ -30,7 +30,7 @@ fn shout(s: &str) -> String {
     format!("{}!", s.to_uppercase())
 }
 
-fn label<T: std::fmt::Display>(value: T, times: i64) -> String {
+fn label<T: Clone + std::fmt::Display>(value: T, times: i64) -> String {
     let mut out = "".to_string();
     for _ in 0..times {
         out.push_str(&format!("{value}"));

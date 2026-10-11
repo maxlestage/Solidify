@@ -42,6 +42,7 @@ impl<'m> Infer<'m> {
                     ret: Ty::Void,
                 },
                 type_params: Vec::new(),
+                type_bounds: Vec::new(),
                 throws: false,
                 throw_direct: false,
                 is_async: false,
@@ -57,6 +58,7 @@ impl<'m> Infer<'m> {
                 parent: None,
                 calls: Vec::new(),
                 uses_this: false,
+                returns_this: false,
                 exported: false,
                 rest: false,
                 span: Span::default(),
@@ -114,6 +116,9 @@ impl<'m> Infer<'m> {
                         parent: None,
                         is_abstract: false,
                         implements: Vec::new(),
+                        type_params: i.type_params.iter().map(|t| t.name.clone()).collect(),
+                        type_bounds: Vec::new(),
+                        parent_args: Vec::new(),
                     });
                 }
                 StmtKind::Class(c) => {
@@ -130,6 +135,9 @@ impl<'m> Infer<'m> {
                         parent: None,
                         is_abstract: false,
                         implements: Vec::new(),
+                        type_params: c.type_params.iter().map(|t| t.name.clone()).collect(),
+                        type_bounds: Vec::new(),
+                        parent_args: Vec::new(),
                     });
                 }
                 StmtKind::Enum(e) => {
@@ -138,9 +146,6 @@ impl<'m> Infer<'m> {
                 }
                 StmtKind::TypeAlias(a) => {
                     self.check_type_name(&a.name, a.span)?;
-                    if !a.type_params.is_empty() {
-                        return self.err("generic type aliases are not supported", a.span);
-                    }
                     match &a.ty {
                         TypeAnn::Object(_, _) => self.structs.push(StructInfo {
                             name: a.name.clone(),
@@ -154,6 +159,9 @@ impl<'m> Infer<'m> {
                             parent: None,
                             is_abstract: false,
                             implements: Vec::new(),
+                            type_params: a.type_params.iter().map(|t| t.name.clone()).collect(),
+                            type_bounds: Vec::new(),
+                            parent_args: Vec::new(),
                         }),
                         TypeAnn::Union(members, span)
                             if members.len() > 1
@@ -182,9 +190,25 @@ impl<'m> Infer<'m> {
                 && !self.type_exists(&a.name)
             {
                 let before = self.unions.len();
+                if !a.type_params.is_empty() {
+                    let params: Vec<String> =
+                        a.type_params.iter().map(|t| t.name.clone()).collect();
+                    self.param_scope.push(params.clone());
+                    let ty = self.ann(&a.ty, &a.name);
+                    self.param_scope.pop();
+                    let ty = ty?;
+                    if self.unions.len() > before {
+                        return self.err(
+                            "a generic alias cannot be a union of object types: declare a generic interface per member, or give the alias no parameter",
+                            a.span,
+                        );
+                    }
+                    self.generic_aliases.insert(a.name.clone(), (params, ty));
+                    continue;
+                }
                 let ty = self.ann(&a.ty, &a.name)?;
                 // A union made for this alias takes its name.
-                if let Ty::Named(n) = &ty
+                if let Ty::Named(n, ..) = &ty
                     && self.unions.len() > before
                     && self.unions.last().is_some_and(|u| u.name == *n)
                 {
@@ -192,7 +216,7 @@ impl<'m> Infer<'m> {
                     u.name = a.name.clone();
                     u.exported = a.exported;
                     self.aliases
-                        .insert(a.name.clone(), Ty::Named(a.name.clone()));
+                        .insert(a.name.clone(), Ty::named(a.name.clone()));
                     continue;
                 }
                 self.aliases.insert(a.name.clone(), ty);
@@ -207,9 +231,8 @@ impl<'m> Infer<'m> {
         for s in stmts {
             match &s.kind {
                 StmtKind::Interface(i) => {
-                    if !i.type_params.is_empty() {
-                        return self.err("generic interfaces are not supported", i.span);
-                    }
+                    self.param_scope
+                        .push(i.type_params.iter().map(|t| t.name.clone()).collect());
                     let mut fields = Vec::new();
                     let mut methods = Vec::new();
                     for base in &i.extends {
@@ -231,13 +254,18 @@ impl<'m> Infer<'m> {
                     let (own_fields, own_methods) = self.members_of(&i.name, &i.members)?;
                     fields.extend(own_fields);
                     methods.extend(own_methods);
+                    self.param_scope.pop();
                     let s = self.struct_mut(&i.name).expect("interface");
                     s.fields = fields;
                     s.methods = methods;
                 }
                 StmtKind::TypeAlias(a) => {
                     if let TypeAnn::Object(members, _) = &a.ty {
-                        let fields = self.fields_from_members(&a.name, members)?;
+                        self.param_scope
+                            .push(a.type_params.iter().map(|t| t.name.clone()).collect());
+                        let fields = self.fields_from_members(&a.name, members);
+                        self.param_scope.pop();
+                        let fields = fields?;
                         self.struct_mut(&a.name).expect("alias").fields = fields;
                     }
                 }
@@ -319,8 +347,17 @@ impl<'m> Infer<'m> {
         if !self.collected_classes.insert(c.name.clone()) {
             return Ok(());
         }
-        if !c.type_params.is_empty() {
-            return self.err("generic classes are not supported", c.span);
+        self.param_scope
+            .push(c.type_params.iter().map(|t| t.name.clone()).collect());
+        let r = self.collect_class_members(c);
+        self.param_scope.pop();
+        r
+    }
+
+    fn collect_class_members(&mut self, c: &'m Class) -> IResult<()> {
+        let bounds = self.bounds_of(&c.type_params, &c.name);
+        if let Some(s) = self.struct_mut(&c.name) {
+            s.type_bounds = bounds;
         }
         if c.name.is_empty() {
             return self.err("classes need a name", c.span);
@@ -349,7 +386,37 @@ impl<'m> Infer<'m> {
             }
             self.collect_class(base_ast)?;
             let base_info = self.struct_by_name(base_name).expect("base").clone();
-            fields.extend(base_info.fields.iter().cloned());
+            // `extends Base<number>`: the base's fields with its parameters given.
+            let n = base_info.type_params.len();
+            if !c.extends_args.is_empty() && c.extends_args.len() != n {
+                return self.err(
+                    format!(
+                        "{base_name} takes {n} type argument{}",
+                        if n == 1 { "" } else { "s" }
+                    ),
+                    base.span,
+                );
+            }
+            let mut args = Vec::new();
+            for i in 0..n {
+                args.push(match c.extends_args.get(i) {
+                    Some(a) => self.ann(a, &c.name)?,
+                    None => self.types.fresh(),
+                });
+            }
+            let subst: std::collections::HashMap<String, Ty> = base_info
+                .type_params
+                .iter()
+                .cloned()
+                .zip(args.iter().cloned())
+                .collect();
+            fields.extend(base_info.fields.iter().map(|f| FieldInfo {
+                ty: super::finish::substitute(&f.ty, &subst, &self.types),
+                ..f.clone()
+            }));
+            if let Some(s) = self.struct_mut(&c.name) {
+                s.parent_args = args;
+            }
             parent = Some(base_name.clone());
         }
         self.this_class_stack.push(c.name.clone());
@@ -384,6 +451,9 @@ impl<'m> Infer<'m> {
                         ) if f.readonly => Some(s.clone()),
                         _ => None,
                     };
+                    if f.ty.as_ref().is_some_and(super::says_undefined) {
+                        self.undef_fields.insert((c.name.clone(), f.name.clone()));
+                    }
                     let field = FieldInfo {
                         name: f.name.clone(),
                         ty,
@@ -455,6 +525,16 @@ impl<'m> Infer<'m> {
                         && let Some((_, base_m)) = self.find_method(p, &m.name, m.kind)
                     {
                         let base_sig = self.funcs[&base_m.fn_id].sig.clone();
+                        // A generic base: its parameters as this class gives them.
+                        let given = self.ancestor_subst(&c.name, std::collections::HashMap::new());
+                        let base_sig = FuncTy {
+                            params: base_sig
+                                .params
+                                .iter()
+                                .map(|t| super::finish::substitute(t, &given, &self.types))
+                                .collect(),
+                            ret: super::finish::substitute(&base_sig.ret, &given, &self.types),
+                        };
                         if base_sig.params.len() != info.sig.params.len() {
                             return self.err(
                                 format!("`{}` takes a different number of parameters than in the base class", m.name),
@@ -614,9 +694,46 @@ impl<'m> Infer<'m> {
             has_return_value: false,
             yield_ty: None,
         });
-        let result = self.signature_inner(f, method_of, method_kind, is_static, type_params);
+        let result = self
+            .signature_inner(f, method_of, method_kind, is_static, type_params)
+            .map(|mut info| {
+                if f.ret.as_ref().is_some_and(super::says_undefined) {
+                    self.undef_fns.insert(f.id);
+                }
+                for (i, p) in f.params.iter().enumerate() {
+                    if p.ty.as_ref().is_some_and(super::says_undefined) {
+                        self.undef_params.insert((f.id, i));
+                    }
+                }
+                let owner = f.name.clone().unwrap_or_else(|| "fn".into());
+                info.type_bounds = self.bounds_of(&f.type_params, &owner);
+                info
+            });
         self.fns.pop();
         result
+    }
+
+    /// `<T extends HasId>`: the parameters constrained to an interface or a class. Other
+    /// constraints (`extends string`, `keyof`) only check the arguments in TypeScript:
+    /// they are not needed here.
+    pub(super) fn bounds_of(
+        &mut self,
+        params: &'m [TypeParam],
+        owner: &str,
+    ) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for tp in params {
+            let Some(c) = &tp.constraint else { continue };
+            // An inline object type (`T extends { id: number }`) is named after its owner.
+            if let Ok(t) = self.ann(c, &format!("{owner} {}", tp.name))
+                && let Ty::Named(n, _) = self.types.resolve(&t)
+                && self.struct_by_name(&n).is_some()
+                && n != tp.name
+            {
+                out.push((tp.name.clone(), n));
+            }
+        }
+        out
     }
 
     fn signature_inner(
@@ -684,6 +801,7 @@ impl<'m> Infer<'m> {
             defaults,
             sig: FuncTy { params, ret },
             type_params,
+            type_bounds: Vec::new(),
             throws: false,
             throw_direct: false,
             // A function giving a `Promise` is awaited by its callers: async in Rust.
@@ -702,6 +820,7 @@ impl<'m> Infer<'m> {
             parent: None,
             calls: Vec::new(),
             uses_this: false,
+            returns_this: false,
             exported: f.exported,
             span: f.span,
         })
@@ -724,11 +843,11 @@ impl<'m> Infer<'m> {
                 }
                 StmtKind::Class(c) => {
                     let id = self.synth_id();
-                    self.declare(&c.name, id, Ty::Named(c.name.clone()), Role::Class, c.span);
+                    self.declare(&c.name, id, Ty::named(c.name.clone()), Role::Class, c.span);
                 }
                 StmtKind::Enum(e) => {
                     let id = self.synth_id();
-                    self.declare(&e.name, id, Ty::Named(e.name.clone()), Role::Enum, e.span);
+                    self.declare(&e.name, id, Ty::named(e.name.clone()), Role::Enum, e.span);
                 }
                 StmtKind::Var(v) if top => {
                     for d in &v.decls {

@@ -467,6 +467,7 @@ impl<'a> Gen<'a> {
         if self.is_inspect_ty(ty) {
             self.inspect_call(code, ty, false)
         } else {
+            self.bound_needed(ty, "std::fmt::Display");
             format!("{code}.to_string()")
         }
     }
@@ -494,9 +495,13 @@ impl<'a> Gen<'a> {
             ));
         }
         let code = self.coerce(e, &ty, Want::Display);
+        self.elems_undefined = self.p.elements_undefinedish(x);
         let call = self.inspect_call(&code, &ty, true);
-        // A union may hold a string, shown as it is.
-        let call = if self.union_of(&ty).is_some() {
+        self.elems_undefined = false;
+        // A union, or a type parameter, may hold a string, shown as it is.
+        let call = if self.union_of(&ty).is_some()
+            || matches!(self.resolve(&ty), Ty::Named(ref n, ..) if self.is_type_param(n))
+        {
             call.replacen("js_inspect(", "js_show(", 1)
         } else {
             call
@@ -506,34 +511,16 @@ impl<'a> Gen<'a> {
 
     /// `undefined` for the methods that give it, `null` otherwise.
     fn missing_word(&self, x: &Expr) -> &'static str {
-        // `a?.b`, `f?.()`: `undefined` when the chain stops.
         if matches!(
-            x.kind,
-            ExprKind::Member { optional: true, .. }
-                | ExprKind::Index { optional: true, .. }
-                | ExprKind::Call { optional: true, .. }
-        ) || matches!(
             self.p.calls.get(&x.id),
-            Some(Callee::OptionalCall | Callee::OptionalMethod { .. })
+            Some(Callee::Builtin("global.parseInt"))
         ) {
-            return "undefined";
+            return "NaN";
         }
-        match self.p.calls.get(&x.id) {
-            Some(Callee::Builtin(n))
-                if matches!(
-                    *n,
-                    "map.get"
-                        | "array.find"
-                        | "array.findLast"
-                        | "array.pop"
-                        | "array.shift"
-                        | "array.at"
-                ) =>
-            {
-                "undefined"
-            }
-            Some(Callee::Builtin("global.parseInt")) => "NaN",
-            _ => "null",
+        if self.p.undefinedish(x) {
+            "undefined"
+        } else {
+            "null"
         }
     }
 
@@ -545,7 +532,7 @@ impl<'a> Gen<'a> {
         let e = self.expr(x)?;
         // Objects, arrays, maps and sets become strings the way JavaScript does it.
         if self.is_inspect_ty(&ty)
-            && !matches!(self.resolve(&ty), Ty::Named(ref n) if self.p.find_method(n, "toString", MethodKind::Method).is_some())
+            && !matches!(self.resolve(&ty), Ty::Named(ref n, ..) if self.p.find_method(n, "toString", MethodKind::Method).is_some())
         {
             if let Some((_, text)) = empty_literal(x) {
                 return Ok((format_text(text), None));
@@ -562,10 +549,13 @@ impl<'a> Gen<'a> {
                 ));
             }
             let code = self.coerce(e, &ty, Want::Display);
-            return Ok(("{}".into(), Some(self.inspect_call(&code, &ty, false))));
+            self.elems_undefined = self.p.elements_undefinedish(x);
+            let call = self.inspect_call(&code, &ty, false);
+            self.elems_undefined = false;
+            return Ok(("{}".into(), Some(call)));
         }
         // A struct with `toString()` prints through it.
-        if let Ty::Named(n) = self.resolve(&ty)
+        if let Ty::Named(n, ..) = self.resolve(&ty)
             && n != "Error"
             && !self.p.is_enum(&n)
             && self
@@ -734,11 +724,11 @@ impl<'a> Gen<'a> {
                     let st = self.ty_of(s);
                     let x = self.expr(s)?;
                     match self.resolve(&st) {
-                        Ty::Named(n) if n == struct_name => {
+                        Ty::Named(n, ..) if n == struct_name => {
                             base = Some(self.owned(x, &st));
                             copied.clear();
                         }
-                        Ty::Named(n) => {
+                        Ty::Named(n, ..) => {
                             let Some(src) = self.p.struct_info(&n).cloned() else {
                                 return self.err("cannot spread this value", s.span);
                             };
@@ -927,7 +917,7 @@ impl<'a> Gen<'a> {
         let ty = self.ty_of(e);
         let (lt, rt) = (self.ty_of(left), self.ty_of(right));
         // `later - earlier` on dates: milliseconds.
-        if op == BinOp::Sub && matches!(self.resolve(&lt), Ty::Named(ref n) if n == "Date") {
+        if op == BinOp::Sub && matches!(self.resolve(&lt), Ty::Named(ref n, ..) if n == "Date") {
             let l = self.expr(left)?;
             let r = self.expr(right)?;
             return Ok(E::owned(
@@ -1027,7 +1017,7 @@ impl<'a> Gen<'a> {
                 Ok(E::owned(format!("{lc} {sym} {rc}"), prec))
             }
             BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
-                if let Ty::Named(n) = self.resolve(&lt)
+                if let Ty::Named(n, ..) = self.resolve(&lt)
                     && self.is_type_param(&n)
                 {
                     self.bound_needed(&lt, "PartialOrd");
@@ -1100,7 +1090,7 @@ impl<'a> Gen<'a> {
                     _ => return self.err("`instanceof` needs a class name", right.span),
                 };
                 let sub = &sub;
-                let Ty::Named(class) = self.resolve(&lt) else {
+                let Ty::Named(class, ..) = self.resolve(&lt) else {
                     self.expr(left)?;
                     return Ok(E::atom("false", Repr::Owned));
                 };
@@ -1153,7 +1143,7 @@ impl<'a> Gen<'a> {
             return (paren_cmp(&lc), paren_cmp(&rc));
         }
         self.bound_needed(&lt, "PartialEq");
-        if let Ty::Named(n) = &lt
+        if let Ty::Named(n, ..) = &lt
             && self.is_type_param(n)
         {
             let lc = self.coerce(l, &lt, Want::Ref);
@@ -1458,7 +1448,7 @@ impl<'a> Gen<'a> {
         let (source, repr) = if let Some(sub) = &n.instance_of {
             // `x.as_sub()` gives the subclass when `x` is one.
             let base = match self.resolve(path_ty) {
-                Ty::Named(b) => b,
+                Ty::Named(b, ..) => b,
                 _ => String::new(),
             };
             self.instance_tests.insert((base, sub.clone(), mutated));
@@ -1677,7 +1667,7 @@ impl<'a> Gen<'a> {
             });
         }
         match self.resolve(&ot) {
-            Ty::Named(n) if n == "RegExp" => Ok(match prop {
+            Ty::Named(n, ..) if n == "RegExp" => Ok(match prop {
                 "source" => E::owned(format!("{base}.source()"), PREC_POSTFIX),
                 "flags" => E::owned(format!("{base}.flags()"), PREC_POSTFIX),
                 "lastIndex" => E::owned(format!("{base}.last_index()"), PREC_POSTFIX),
@@ -1693,12 +1683,12 @@ impl<'a> Gen<'a> {
                     E::owned(format!("{base}.flags().contains('{flag}')"), PREC_POSTFIX)
                 }
             }),
-            Ty::Named(n) if n == "RegExpMatch" => Ok(match prop {
+            Ty::Named(n, ..) if n == "RegExpMatch" => Ok(match prop {
                 "index" => E::new(format!("{base}.index"), PREC_POSTFIX, Repr::Place),
                 "input" => E::new(format!("{base}.input"), PREC_POSTFIX, Repr::Place),
                 _ => E::new(format!("{base}.len()"), PREC_POSTFIX, Repr::Usize),
             }),
-            Ty::Named(n) if n == "Error" => Ok(match prop {
+            Ty::Named(n, ..) if n == "Error" => Ok(match prop {
                 "message" => {
                     let mut x = E::atom(
                         base,
@@ -1714,7 +1704,7 @@ impl<'a> Gen<'a> {
                 "name" => E::atom("\"Error\"", Repr::Str),
                 _ => E::atom("String::new()", Repr::Owned),
             }),
-            Ty::Named(n) if self.p.union_info(&n).is_some() => {
+            Ty::Named(n, ..) if self.p.union_info(&n).is_some() => {
                 self.union_accessors
                     .insert((n.clone(), prop.to_string(), false));
                 Ok(E::new(
@@ -1723,7 +1713,15 @@ impl<'a> Gen<'a> {
                     Repr::Ref,
                 ))
             }
-            Ty::Named(n) => {
+            Ty::Named(..) if self.constrained(&ot).is_some() => {
+                // `T extends HasId`: the field through the constraint's trait.
+                Ok(E::new(
+                    format!("{base}.{}()", snake(prop)),
+                    PREC_POSTFIX,
+                    Repr::Ref,
+                ))
+            }
+            Ty::Named(n, ..) => {
                 let info = self.p.struct_info(&n).expect("struct");
                 if info.field(prop).is_some() {
                     // Through a `dyn` value, a field is read with its accessor.
@@ -1785,7 +1783,7 @@ impl<'a> Gen<'a> {
             return self.err("`?.` on a value that is never null", obj.span);
         };
         let field_ty = match self.resolve(&inner) {
-            Ty::Named(n) => {
+            Ty::Named(n, ..) => {
                 let info = self.p.struct_info(&n).expect("struct");
                 match info.field(prop) {
                     Some(f) => {
@@ -1847,7 +1845,7 @@ impl<'a> Gen<'a> {
             return self.err("`?.[` on a value that is never null", obj.span);
         };
         Ok(match self.resolve(&inner) {
-            Ty::Named(n) if n == "RegExpMatch" => {
+            Ty::Named(n, ..) if n == "RegExpMatch" => {
                 let i = self.expr_as(index, Want::Owned)?;
                 E::owned(format!("{source}.map(|v| v.get({i}))"), PREC_POSTFIX)
             }
@@ -1916,11 +1914,11 @@ impl<'a> Gen<'a> {
                 )?;
                 Ok(E::new(format!("{base}[{key}]"), PREC_POSTFIX, Repr::Place))
             }
-            Ty::Named(n) if n == "RegExpMatch" => {
+            Ty::Named(n, ..) if n == "RegExpMatch" => {
                 let i = self.expr_as(index, Want::Owned)?;
                 Ok(E::owned(format!("{base}.get({i})"), PREC_POSTFIX))
             }
-            Ty::Named(_) => {
+            Ty::Named(..) => {
                 let ExprKind::Str(key) = &index.kind else {
                     return self.err("unsupported index", index.span);
                 };

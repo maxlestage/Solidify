@@ -23,6 +23,8 @@ impl<'a> Gen<'a> {
                     snake(&self.p.var(binding).name)
                 };
                 let list = self.user_args(&info, args, e.span)?;
+                let rt = self.ty_of(e);
+                self.propagate_call(&info, args, Some(&rt), None);
                 let code = format!("{name}({list})");
                 self.finish_call(code, &info, e)
             }
@@ -73,6 +75,12 @@ impl<'a> Gen<'a> {
             } => {
                 let info = self.p.funcs[&fn_id].clone();
                 let list = self.user_args(&info, args, e.span)?;
+                let rt = self.ty_of(e);
+                let receiver = match &callee.kind {
+                    ExprKind::Member { obj, .. } if !is_static => Some(self.ty_of(obj)),
+                    _ => None,
+                };
+                self.propagate_call(&info, args, Some(&rt), receiver.as_ref());
                 let method = snake(&name);
                 let code = if is_static {
                     format!("{}::{method}({list})", pascal(&class))
@@ -95,7 +103,16 @@ impl<'a> Gen<'a> {
                     };
                     format!("{base}.{method}({list})")
                 };
-                self.finish_call(code, &info, e)
+                let mut x = self.finish_call(code, &info, e)?;
+                if !is_static && self.fluent(&info) {
+                    // A reference to the receiver: chained calls change the same object.
+                    x.repr = if self.p.method_mutates(info.id) {
+                        Repr::RefMut
+                    } else {
+                        Repr::Ref
+                    };
+                }
+                Ok(x)
             }
             Callee::OptionalCall => {
                 // `f?.()`: the call when there is a function.
@@ -239,6 +256,43 @@ impl<'a> Gen<'a> {
         Ok(E::owned(code, PREC_POSTFIX))
     }
 
+    /// What a generic callee needs of its type parameters is required of the types this
+    /// call gives them: from the arguments, the result and the receiver.
+    pub(super) fn propagate_call(
+        &mut self,
+        info: &FnInfo,
+        args: &'a [Arg],
+        result: Option<&Ty>,
+        receiver: Option<&Ty>,
+    ) {
+        let class_params = info
+            .method_of
+            .as_ref()
+            .and_then(|c| self.p.struct_info(c))
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        if info.type_params.is_empty() && class_params.is_empty() {
+            return;
+        }
+        let mut params = info.type_params.clone();
+        params.extend(class_params.iter().cloned());
+        let mut subst = match receiver {
+            Some(r) => self.instance_subst(r),
+            None => Default::default(),
+        };
+        for (a, pt) in args.iter().zip(&info.sig.params) {
+            let at = self.ty_of(&a.expr);
+            self.match_params(pt, &at, &params, &mut subst);
+        }
+        if let Some(r) = result {
+            self.match_params(&info.sig.ret, r, &params, &mut subst);
+        }
+        self.propagate_bounds(&format!("fn:{}", info.id), &subst);
+        if let Some(c) = info.method_of.clone() {
+            self.propagate_bounds(&format!("struct:{c}"), &subst);
+        }
+    }
+
     /// Arguments of a call to a user function, each passed the way the parameter wants.
     pub(super) fn user_args(
         &mut self,
@@ -248,7 +302,23 @@ impl<'a> Gen<'a> {
     ) -> GResult<String> {
         let mut list = Vec::new();
         let f_ast = self.fn_asts.get(&info.id).copied();
+        // A method of a generic class: its parameters of type `T` take the type argument
+        // of this call (`String` for a `Stack<string>`).
+        let class_params = info
+            .method_of
+            .as_ref()
+            .and_then(|c| self.p.struct_info(c))
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        let mut class_subst = std::collections::HashMap::new();
+        if !class_params.is_empty() {
+            for (a, pt) in args.iter().zip(&info.sig.params) {
+                let at = self.ty_of(&a.expr);
+                self.match_params(pt, &at, &class_params, &mut class_subst);
+            }
+        }
         for (i, pt) in info.sig.params.iter().enumerate() {
+            let pt_given = crate::infer::substitute(pt, &class_subst, &self.p.types);
             let binding = info.params.get(i).copied();
             let (stored, reassigned, mutated) = match binding {
                 Some(b) => {
@@ -257,7 +327,8 @@ impl<'a> Gen<'a> {
                 }
                 None => (true, false, false),
             };
-            let mode = self.param_mode(pt, stored, reassigned, mutated, &info.type_params);
+            let all_params = self.all_type_params(info);
+            let mode = self.param_mode(pt, stored, reassigned, mutated, &all_params);
             // `...rest`: the extra arguments as one array (a slice, or a `Vec` when kept).
             if info.rest && i + 1 == info.sig.params.len() {
                 let extra = &args[i.min(args.len())..];
@@ -314,12 +385,12 @@ impl<'a> Gen<'a> {
                     }
                     let code = match mode {
                         Mode::Value => {
-                            let generic = matches!(self.resolve(pt), Ty::Named(ref n) if info.type_params.contains(n));
+                            let generic = matches!(self.resolve(pt), Ty::Named(ref n, ..) if info.type_params.contains(n));
                             if generic && x.repr == Repr::Str {
                                 // A string literal for a type parameter: `&str` does.
                                 x.code
                             } else {
-                                self.owned_as(x, &at, pt)
+                                self.owned_as(x, &at, &pt_given)
                             }
                         }
                         Mode::FnImpl => {
@@ -417,6 +488,10 @@ impl<'a> Gen<'a> {
         match self.p.calls.get(&e.id).cloned() {
             Some(Callee::Ctor(class)) => {
                 let name = pascal(&class);
+                // A generic class: what its methods need of the type arguments.
+                let built_ty = self.ty_of(e);
+                let subst = self.instance_subst(&built_ty);
+                self.propagate_bounds(&format!("struct:{class}"), &subst);
                 let ctor = self
                     .p
                     .ancestry(&class)
@@ -513,7 +588,7 @@ impl<'a> Gen<'a> {
                                 let s = self.expr_as(&args[0].expr, Want::StrRef)?;
                                 format!("{d}::parse({s})")
                             }
-                            Ty::Named(_) => self.expr_as(&args[0].expr, Want::Owned)?,
+                            Ty::Named(..) => self.expr_as(&args[0].expr, Want::Owned)?,
                             _ => {
                                 let n = self.expr_as(&args[0].expr, Want::Owned)?;
                                 format!("{d}::from_ms({n})")
@@ -566,7 +641,7 @@ impl<'a> Gen<'a> {
             Ty::Map(..) => format!("{}::new()", self.map_name()),
             Ty::Set(_) => format!("{}::new()", self.set_name()),
             Ty::Void | Ty::Null => "()".into(),
-            Ty::Named(n) if self.p.enum_info(&n).is_some() => {
+            Ty::Named(n, ..) if self.p.enum_info(&n).is_some() => {
                 let en = self.p.enum_info(&n).expect("enum");
                 format!("{}::{}", pascal(&n), en.variants[0].name)
             }
@@ -1620,7 +1695,13 @@ impl<'a> Gen<'a> {
                                             (v.stored, v.reassigned, v.mutated)
                                         })
                                         .unwrap_or((true, false, false));
-                                    g.param_mode(pt, stored, reassigned, mutated, &info.type_params)
+                                    g.param_mode(
+                                        pt,
+                                        stored,
+                                        reassigned,
+                                        mutated,
+                                        &g.all_type_params(&info),
+                                    )
                                 })
                                 .collect()
                         }

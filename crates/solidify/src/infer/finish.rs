@@ -1,7 +1,7 @@
 //! The end of inference: fixpoints across functions (throws, mutation of parameters),
 //! generalization of unconstrained parameters, last uses, resolved types.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use super::{IResult, Infer, Program, Role};
@@ -11,6 +11,28 @@ use crate::types::{Flavor, FuncTy, Ty, Types};
 
 impl<'m> Infer<'m> {
     pub(super) fn finish(mut self) -> IResult<Program> {
+        let var_inits = std::mem::take(&mut self.var_inits);
+        let fn_returns = std::mem::take(&mut self.fn_returns);
+        let mut undef_vars = std::mem::take(&mut self.undef_vars);
+        let undef_fns = std::mem::take(&mut self.undef_fns);
+        let mut undef_fields = std::mem::take(&mut self.undef_fields);
+        // Optional parameters and fields (`x?: T`) are `undefined` when not given.
+        for (&id, f) in &self.funcs {
+            for (i, b) in f.params.iter().enumerate() {
+                if f.optional.get(i).copied().unwrap_or(false)
+                    || self.undef_params.contains(&(id, i))
+                {
+                    undef_vars.insert(*b);
+                }
+            }
+        }
+        for s in &self.structs {
+            for fi in &s.fields {
+                if fi.optional {
+                    undef_fields.insert((s.name.clone(), fi.name.clone()));
+                }
+            }
+        }
         self.propagate_throws();
         self.propagate_mutation();
         // A method is mutating when any implementation or override of it is.
@@ -21,6 +43,20 @@ impl<'m> Infer<'m> {
             }
         }
         self.float_json_numbers();
+        let bound_impls = self.check_bound_uses()?;
+        // Methods that return `this` on every path.
+        for (id, (this, other)) in std::mem::take(&mut self.this_returns) {
+            if this > 0
+                && other == 0
+                && let Some(f) = self.funcs.get_mut(&id)
+                && f.method_kind == Some(crate::ast::MethodKind::Method)
+                && !f.is_static
+                && !f.is_async
+                && !self.overrides.contains_key(&id)
+            {
+                f.returns_this = true;
+            }
+        }
         // A narrowed value whose alias is changed is bound mutably.
         for (binding, test) in self.alias_of_narrow.clone() {
             if self.vars.get(&binding).is_some_and(|v| v.mutated)
@@ -84,7 +120,7 @@ impl<'m> Infer<'m> {
                 m.ty = zonk(&m.ty);
             }
         }
-        Ok(Program {
+        let mut program = Program {
             types,
             node_count: self.node_count,
             expr_ty,
@@ -110,7 +146,68 @@ impl<'m> Infer<'m> {
             polymorphic: self.polymorphic,
             overrides: self.overrides,
             uses_timers: self.uses_timers,
-        })
+            bound_impls,
+            undef_vars,
+            undef_fns,
+            undef_fields,
+            undef_elem_vars: HashSet::new(),
+        };
+        program.settle_undefined(&var_inits, &fn_returns);
+        Ok(program)
+    }
+
+    /// Each type given for a constrained parameter (`T extends HasId`) must have the
+    /// constraint's fields and methods: it gets the constraint's trait. Returns the
+    /// constraints and the (constraint, type) pairs to implement.
+    fn check_bound_uses(&mut self) -> IResult<BTreeSet<(String, String)>> {
+        let uses = std::mem::take(&mut self.bound_uses);
+        let mut impls = BTreeSet::new();
+        for (c, t, span) in uses {
+            let n = match self.types.resolve(&t) {
+                Ty::Named(n, _) if self.struct_by_name(&n).is_some() => n,
+                // Another type parameter (checked where it is given), or never known.
+                Ty::Named(n, _)
+                    if self.enum_by_name(&n).is_none() && self.union_by_name(&n).is_none() =>
+                {
+                    continue;
+                }
+                Ty::Var(_) => continue,
+                other => {
+                    let d = self.describe(&other);
+                    return self.err(format!("{d} does not have the fields of {c}"), span);
+                }
+            };
+            let cs = self.struct_by_name(&c).expect("constraint").clone();
+            for f in &cs.fields {
+                let Some(g) = self
+                    .struct_by_name(&n)
+                    .and_then(|s| s.field(&f.name))
+                    .cloned()
+                else {
+                    return self.err(
+                        format!("{n} has no field `{}`, which {c} requires", f.name),
+                        span,
+                    );
+                };
+                if f.optional != g.optional {
+                    return self.err(
+                        format!("`{}` is optional in only one of {n} and {c}", f.name),
+                        span,
+                    );
+                }
+                self.unify(&f.ty, &g.ty, span)?;
+            }
+            for m in &cs.methods {
+                if self.find_method(&n, &m.name, m.kind).is_none() {
+                    return self.err(
+                        format!("{n} has no method `{}`, which {c} requires", m.name),
+                        span,
+                    );
+                }
+            }
+            impls.insert((c, n));
+        }
+        Ok(impls)
     }
 
     /// Structs holding themselves directly (through `Option` or a tuple): a `Box` is needed.
@@ -123,7 +220,7 @@ impl<'m> Infer<'m> {
             seen: &mut HashSet<String>,
         ) -> bool {
             match types.resolve(ty) {
-                Ty::Named(n) => {
+                Ty::Named(n, ..) => {
                     if n == target {
                         return true;
                     }
@@ -183,7 +280,10 @@ impl<'m> Infer<'m> {
                     self.float_unknown_numbers(t, seen);
                 }
             }
-            Ty::Named(n) => {
+            Ty::Named(n, args) => {
+                for a in &args {
+                    self.float_unknown_numbers(a, seen);
+                }
                 if !seen.insert(n.clone()) {
                     return;
                 }
@@ -357,7 +457,7 @@ impl<'m> Infer<'m> {
                             break name;
                         }
                     };
-                    types.bind(v, Ty::Named(name.clone()));
+                    types.bind(v, Ty::named(name.clone()));
                     type_params.push(name);
                 }
             };
@@ -478,7 +578,7 @@ pub(super) fn collect_vars(types: &Types, t: &Ty, out: &mut Vec<usize>) {
             collect_vars(types, &k, out);
             collect_vars(types, &v, out);
         }
-        Ty::Tuple(ts) => ts.iter().for_each(|t| collect_vars(types, t, out)),
+        Ty::Tuple(ts) | Ty::Named(_, ts) => ts.iter().for_each(|t| collect_vars(types, t, out)),
         Ty::Func(f) => {
             f.params.iter().for_each(|t| collect_vars(types, t, out));
             collect_vars(types, &f.ret, out);
@@ -488,9 +588,13 @@ pub(super) fn collect_vars(types: &Types, t: &Ty, out: &mut Vec<usize>) {
 }
 
 /// Replaces type parameters by the given types.
-pub(super) fn substitute(t: &Ty, subst: &HashMap<String, Ty>, types: &Types) -> Ty {
+pub fn substitute(t: &Ty, subst: &HashMap<String, Ty>, types: &Types) -> Ty {
     match types.resolve(t) {
-        Ty::Named(n) => subst.get(&n).cloned().unwrap_or(Ty::Named(n)),
+        Ty::Named(n, args) if args.is_empty() => subst.get(&n).cloned().unwrap_or(Ty::named(n)),
+        Ty::Named(n, args) => Ty::Named(
+            n,
+            args.iter().map(|t| substitute(t, subst, types)).collect(),
+        ),
         Ty::Option(t) => Ty::Option(Box::new(substitute(&t, subst, types))),
         Ty::Array(t) => Ty::Array(Box::new(substitute(&t, subst, types))),
         Ty::Set(t) => Ty::Set(Box::new(substitute(&t, subst, types))),

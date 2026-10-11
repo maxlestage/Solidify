@@ -36,7 +36,9 @@ impl<'m> Infer<'m> {
             ExprKind::Ident(name) => self
                 .lookup(name)
                 .map(|id| self.vars[&id].ty.clone())
-                .is_some_and(|t| matches!(self.types.resolve(&t), Ty::Named(n) if n == "RegExp")),
+                .is_some_and(
+                    |t| matches!(self.types.resolve(&t), Ty::Named(n, ..) if n == "RegExp"),
+                ),
             _ => false,
         }
     }
@@ -437,11 +439,11 @@ impl<'m> Infer<'m> {
                 "toString" => self.done(e, "boolean.toString".into(), Ty::Str),
                 _ => self.err(format!("booleans have no method `{prop}`"), span),
             },
-            Ty::Named(n) if n == "Error" => match prop {
+            Ty::Named(n, ..) if n == "Error" => match prop {
                 "toString" => self.done(e, "error.toString".into(), Ty::Str),
                 _ => self.err(format!("Error has no method `{prop}`"), span),
             },
-            Ty::Named(n) if n == "RegExp" => {
+            Ty::Named(n, ..) if n == "RegExp" => {
                 let full = format!("regex.{prop}");
                 match prop {
                     "test" => {
@@ -450,21 +452,17 @@ impl<'m> Infer<'m> {
                     }
                     "exec" => {
                         self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
-                        self.done(
-                            e,
-                            full,
-                            Ty::Option(Box::new(Ty::Named("RegExpMatch".into()))),
-                        )
+                        self.done(e, full, Ty::Option(Box::new(Ty::named("RegExpMatch"))))
                     }
                     "toString" => self.done(e, full, Ty::Str),
                     _ => self.err(format!("RegExp has no method `{prop}`"), span),
                 }
             }
-            Ty::Named(n) if n == "RegExpMatch" => self.err(
+            Ty::Named(n, ..) if n == "RegExpMatch" => self.err(
                 format!("a match has no method `{prop}`: its groups are `m[i]`"),
                 span,
             ),
-            Ty::Named(n) if n == "Date" => {
+            Ty::Named(n, ..) if n == "Date" => {
                 let full = format!("date.{prop}");
                 self.no_more_than(args, 0, &full, span)?;
                 match prop {
@@ -639,11 +637,7 @@ impl<'m> Infer<'m> {
                         Ty::Option(Box::new(Ty::Array(Box::new(Ty::Str)))),
                     )
                 } else {
-                    self.done(
-                        e,
-                        full,
-                        Ty::Option(Box::new(Ty::Named("RegExpMatch".into()))),
-                    )
+                    self.done(e, full, Ty::Option(Box::new(Ty::named("RegExpMatch"))))
                 }
             }
             "matchAll" => {
@@ -654,7 +648,7 @@ impl<'m> Infer<'m> {
                 self.done(
                     e,
                     "string.matches".into(),
-                    Ty::Array(Box::new(Ty::Named("RegExpMatch".into()))),
+                    Ty::Array(Box::new(Ty::named("RegExpMatch"))),
                 )
             }
             "search" => {

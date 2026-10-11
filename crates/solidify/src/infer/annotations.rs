@@ -1,6 +1,6 @@
 //! From type annotations to types.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use super::{
@@ -73,7 +73,7 @@ impl<'m> Infer<'m> {
             TypeAnn::Object(members, span) => {
                 let name = self.synth_name(hint);
                 self.define_struct_from_members(&name, members, StructKind::Synth, false, *span)?;
-                Ok(Ty::Named(name))
+                Ok(Ty::named(name))
             }
             TypeAnn::Func {
                 params,
@@ -146,7 +146,7 @@ impl<'m> Infer<'m> {
             "Record" => {
                 let k = arg(self, 0)?;
                 let v = arg(self, 1)?;
-                if let Ty::Named(n) = self.types.resolve(&k)
+                if let Ty::Named(n, ..) = self.types.resolve(&k)
                     && self.enum_by_name(&n).is_none()
                 {
                     return self.err("Record keys must be strings, numbers or an enum", span);
@@ -158,29 +158,83 @@ impl<'m> Infer<'m> {
                 Ty::Gen(Box::new(arg(self, 0)?))
             }
             "Partial" | "Required" | "Readonly" | "NonNullable" | "Awaited" => arg(self, 0)?,
-            "Error" => Ty::Named("Error".into()),
+            "Error" => Ty::named("Error"),
             "Function" => {
                 return self.err("`Function` is too vague: write `(x: T) => U`", span);
             }
-            "Date" => Ty::Named("Date".into()),
-            "RegExp" => Ty::Named("RegExp".into()),
-            "RegExpMatchArray" | "RegExpExecArray" => Ty::Named("RegExpMatch".into()),
+            "Date" => Ty::named("Date"),
+            "RegExp" => Ty::named("RegExp"),
+            "RegExpMatchArray" | "RegExpExecArray" => Ty::named("RegExpMatch"),
             "this" => match self.this_class_stack.last() {
-                Some(c) => Ty::Named(c.clone()),
+                Some(c) => self.self_type(&c.clone()),
                 None => return self.err("`this` type outside a class", span),
             },
             _ => {
                 if self.is_type_param(name) {
-                    return Ok(Ty::Named(name.to_string()));
+                    return Ok(Ty::named(name.to_string()));
                 }
                 if let Some(t) = self.aliases.get(name) {
                     return Ok(t.clone());
                 }
-                if self.struct_by_name(name).is_some() || self.enum_by_name(name).is_some() {
-                    if !args.is_empty() {
-                        return self.err("generic classes and interfaces are not supported", span);
+                if let Some((params, body)) = self.generic_aliases.get(name).cloned() {
+                    if args.len() != params.len() {
+                        return self.err(
+                            format!(
+                                "{name} takes {} type argument{}",
+                                params.len(),
+                                if params.len() == 1 { "" } else { "s" }
+                            ),
+                            span,
+                        );
                     }
-                    return Ok(Ty::Named(name.to_string()));
+                    let mut subst = HashMap::new();
+                    for (i, p) in params.iter().enumerate() {
+                        subst.insert(p.clone(), arg(self, i)?);
+                    }
+                    return Ok(super::finish::substitute(&body, &subst, &self.types));
+                }
+                if self.enum_by_name(name).is_some() {
+                    if !args.is_empty() {
+                        return self.err(
+                            format!("{name} is an enum: it takes no type argument"),
+                            span,
+                        );
+                    }
+                    return Ok(Ty::named(name.to_string()));
+                }
+                if let Some(s) = self.struct_by_name(name) {
+                    let n = s.type_params.len();
+                    if args.is_empty() {
+                        // `Stack` alone: the arguments are inferred.
+                        return Ok(self.fresh_instance(name).0);
+                    }
+                    if args.len() != n {
+                        return self.err(
+                            if n == 0 {
+                                format!("{name} is not generic: it takes no type argument")
+                            } else {
+                                format!(
+                                    "{name} takes {n} type argument{}",
+                                    if n == 1 { "" } else { "s" }
+                                )
+                            },
+                            span,
+                        );
+                    }
+                    let mut tys = Vec::new();
+                    for i in 0..n {
+                        tys.push(arg(self, i)?);
+                    }
+                    let s = self.struct_by_name(name).expect("struct");
+                    let subst: HashMap<String, Ty> = s
+                        .type_params
+                        .iter()
+                        .cloned()
+                        .zip(tys.iter().cloned())
+                        .collect();
+                    let bounds = s.type_bounds.clone();
+                    self.record_bound_uses(&bounds, &subst, span);
+                    return Ok(Ty::Named(name.to_string(), tys));
                 }
                 return self.err(format!("unknown type `{name}`"), span);
             }
@@ -218,7 +272,7 @@ impl<'m> Infer<'m> {
                 .collect();
             let name = self.synth_name(hint);
             self.define_literal_enum(&name, &literals, false, span);
-            Ty::Named(name)
+            Ty::named(name)
         } else if rest
             .iter()
             .all(|t| matches!(t, TypeAnn::Lit(Lit::Num(_), _)))
@@ -344,6 +398,9 @@ impl<'m> Infer<'m> {
             parent: None,
             is_abstract: false,
             implements: Vec::new(),
+            type_params: Vec::new(),
+            type_bounds: Vec::new(),
+            parent_args: Vec::new(),
         });
         let fields = self.fields_from_members(name, members)?;
         self.struct_mut(name).expect("struct").fields = fields;
@@ -386,6 +443,9 @@ impl<'m> Infer<'m> {
                     span,
                 } => {
                     let fty = self.ann(ty, &format!("{owner} {name}"))?;
+                    if super::says_undefined(ty) {
+                        self.undef_fields.insert((owner.to_string(), name.clone()));
+                    }
                     let (fty, optional) = match (self.types.resolve(&fty), *optional) {
                         (Ty::Option(inner), true) => (*inner, true),
                         (_, o) => (fty, o),
@@ -495,6 +555,7 @@ impl<'m> Infer<'m> {
                     ret: ret_ty,
                 },
                 type_params: Vec::new(),
+                type_bounds: Vec::new(),
                 throws: false,
                 throw_direct: false,
                 is_async: matches!(ret, Some(TypeAnn::Named { name, .. }) if name == "Promise"),
@@ -511,6 +572,7 @@ impl<'m> Infer<'m> {
                 parent: None,
                 calls: Vec::new(),
                 uses_this: false,
+                returns_this: false,
                 exported: false,
                 span,
             },
