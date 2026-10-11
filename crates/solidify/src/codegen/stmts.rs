@@ -123,7 +123,7 @@ impl<'a> Gen<'a> {
                     }
                     None => {
                         if self.fn_ctx().try_ctx.last().is_some_and(|t| t.returns) {
-                            self.line("return Ok(None);");
+                            self.line("return Ok(Some(()));");
                         } else if self.fn_ctx().returns_result || !self.fn_ctx().try_ctx.is_empty()
                         {
                             self.line("return Ok(());");
@@ -2375,7 +2375,13 @@ impl<'a> Gen<'a> {
         catch: Option<&'a Catch>,
         finally: Option<&'a Block>,
     ) -> GResult<()> {
-        let returns = self.p.try_returns.contains(&block.span.start);
+        // `return` inside the block: the closure gives back `Some(value)`.
+        let returns = block
+            .stmts
+            .iter()
+            .any(|s| walk(s, &mut |st| matches!(st.kind, StmtKind::Return(_)), false));
+        // Every path of the block returns or throws: nothing runs after the closure.
+        let always = self.p.try_returns.contains(&block.span.start);
         if contains_break_or_continue(&block.stmts) {
             return self.err(
                 "`break` and `continue` inside `try` are not supported",
@@ -2393,7 +2399,9 @@ impl<'a> Gen<'a> {
         let body = self.capture(|g| {
             g.indent += 1;
             g.block_body(&block.stmts, false)?;
-            g.line(if returns { "Ok(None)" } else { "Ok(())" });
+            if !always {
+                g.line(if returns { "Ok(None)" } else { "Ok(())" });
+            }
             g.indent -= 1;
             Ok(())
         });
@@ -2405,6 +2413,11 @@ impl<'a> Gen<'a> {
         if let Some(f) = finally {
             self.block_body(&f.stmts, false)?;
         }
+        let ret = if self.fn_ctx().returns_result {
+            "return Ok(v)"
+        } else {
+            "return v"
+        };
         match catch {
             Some(c) => {
                 let param = match &c.param {
@@ -2415,13 +2428,12 @@ impl<'a> Gen<'a> {
                 if returns {
                     self.line("match result_ {");
                     self.indent += 1;
-                    let ret = if self.fn_ctx().returns_result {
-                        "return Ok(v)"
-                    } else {
-                        "return v"
-                    };
                     self.line(&format!("Ok(Some(v)) => {ret},"));
-                    self.line("Ok(None) => {}");
+                    self.line(if always {
+                        "Ok(None) => unreachable!(),"
+                    } else {
+                        "Ok(None) => {}"
+                    });
                     self.line(&format!("Err({param}) => {{"));
                     self.indent += 1;
                     self.block_body(&c.body.stmts, false)?;
@@ -2439,18 +2451,24 @@ impl<'a> Gen<'a> {
             }
             None => {
                 // `try … finally`: errors go on.
-                if self.fn_ctx().returns_result {
-                    if returns {
-                        self.line("if let Some(v) = result_? {");
-                        self.indent += 1;
-                        self.line("return Ok(v);");
-                        self.indent -= 1;
-                        self.line("}");
-                    } else {
-                        self.line("result_?;");
-                    }
+                let outcome = if self.fn_ctx().returns_result {
+                    "result_?"
                 } else {
-                    self.line("let _ = result_.expect(\"unhandled error\");");
+                    "result_.expect(\"unhandled error\")"
+                };
+                if !returns {
+                    self.line(&format!("{outcome};"));
+                } else if always {
+                    self.line(&format!(
+                        "let Some(v) = {outcome} else {{ unreachable!() }};"
+                    ));
+                    self.line(&format!("{ret};"));
+                } else {
+                    self.line(&format!("if let Some(v) = {outcome} {{"));
+                    self.indent += 1;
+                    self.line(&format!("{ret};"));
+                    self.indent -= 1;
+                    self.line("}");
                 }
             }
         }

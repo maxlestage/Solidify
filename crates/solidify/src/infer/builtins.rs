@@ -83,7 +83,10 @@ impl<'m> Infer<'m> {
                     }
                     let t = self.expr(&a.expr, None)?;
                     if let Ty::Var(_) = self.types.resolve(&t) {
-                        return self.err("the type of this value is not known yet: add an annotation", a.expr.span);
+                        return self.err(
+                            "the type of this value is not known yet: add an annotation",
+                            a.expr.span,
+                        );
                     }
                 }
                 self.done(e, full, Ty::Void)
@@ -104,8 +107,8 @@ impl<'m> Infer<'m> {
             }
             (
                 "Math",
-                "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "exp"
-                | "log" | "log2" | "log10" | "fround",
+                "sqrt" | "cbrt" | "sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh"
+                | "cosh" | "tanh" | "exp" | "log" | "log2" | "log10" | "fround",
             ) => {
                 let n = self.types.num(Flavor::Unknown);
                 self.arg_typed(args, 0, Some(n), &full, span)?;
@@ -235,7 +238,10 @@ impl<'m> Infer<'m> {
                 }
                 self.done(e, full, Ty::Array(Box::new(item)))
             }
-            ("Array", "isArray") => self.err("`Array.isArray` is not needed: types are known at compile time", span),
+            ("Array", "isArray") => self.err(
+                "`Array.isArray` is not needed: types are known at compile time",
+                span,
+            ),
             ("Array", _) => self.err(format!("`Array.{prop}` is not supported"), span),
             ("Promise", "all") => {
                 // Each value is already awaited where it is made: the array itself.
@@ -253,10 +259,50 @@ impl<'m> Infer<'m> {
                 format!("`Promise.{prop}` is not supported: use `await` and async functions"),
                 span,
             ),
-            ("JSON", _) => self.err(
-                "`JSON` is not supported: Rust uses the serde crate for that, which Solidify does not generate",
-                span,
-            ),
+            ("JSON", "stringify") => {
+                self.no_more_than(args, 3, &full, span)?;
+                let t = self.arg_typed(args, 0, None, &full, span)?;
+                if let Ty::Var(_) = self.types.resolve(&t) {
+                    return self.err(
+                        "the type of this value is not known yet: add an annotation",
+                        args[0].expr.span,
+                    );
+                }
+                if let Some(a) = args.get(1)
+                    && !matches!(a.expr.kind, ExprKind::Null | ExprKind::Undefined)
+                {
+                    return self.err(
+                        "replacer functions are not supported in `JSON.stringify`: pass `null`",
+                        a.expr.span,
+                    );
+                }
+                if args.len() == 3 {
+                    let it = self.arg_typed(args, 2, None, &full, span)?;
+                    if !matches!(self.types.resolve(&it), Ty::Str) {
+                        let i = self.types.int();
+                        self.expect(&it, &i, args[2].expr.span)?;
+                    }
+                }
+                self.done(e, full, Ty::Str)
+            }
+            ("JSON", "parse") => {
+                if args.len() > 1 {
+                    return self.err(
+                        "reviver functions are not supported in `JSON.parse`",
+                        args[1].expr.span,
+                    );
+                }
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                // It throws on bad text: the function fails like one with a `throw`.
+                if self.ctx().try_depth == 0 {
+                    let id = self.ctx().id;
+                    self.funcs.get_mut(&id).expect("fn").throw_direct = true;
+                }
+                let t = self.types.fresh();
+                self.json_targets.push(t.clone());
+                self.done(e, full, t)
+            }
+            ("JSON", _) => self.err(format!("`JSON.{prop}` is not supported"), span),
             ("Date", "now") => {
                 let i = self.types.int();
                 self.done(e, full, i)

@@ -59,6 +59,9 @@ enum Slot<T> {
 pub struct Types {
     vars: Vec<Slot<Ty>>,
     flavors: Vec<Slot<Flavor>>,
+    /// Integer flavors that come from an integer-only use (an index, a length, `parseInt`…),
+    /// not only from integer literals.
+    hard: Vec<bool>,
 }
 
 impl Types {
@@ -73,6 +76,7 @@ impl Types {
         } else {
             Slot::Value(flavor)
         });
+        self.hard.push(flavor == Flavor::Int);
         Ty::Num(self.flavors.len() - 1)
     }
 
@@ -82,6 +86,22 @@ impl Types {
 
     pub fn float(&mut self) -> Ty {
         self.num(Flavor::Float)
+    }
+
+    /// The type of an integer literal: an integer unless something makes it a float.
+    pub fn int_literal(&mut self) -> Ty {
+        let t = self.num(Flavor::Int);
+        if let Ty::Num(v) = t {
+            self.hard[v] = false;
+        }
+        t
+    }
+
+    /// An integer only because of integer literals: data read at run time (JSON) may make
+    /// it a float.
+    pub fn soft_int(&self, v: TyVar) -> bool {
+        let root = self.find_flavor(v);
+        matches!(self.flavors[root], Slot::Value(Flavor::Int)) && !self.hard[root]
     }
 
     fn find_var(&self, mut v: TyVar) -> TyVar {
@@ -115,6 +135,9 @@ impl Types {
         if flavor > current {
             self.flavors[root] = Slot::Value(flavor);
         }
+        if flavor == Flavor::Int {
+            self.hard[root] = true;
+        }
     }
 
     fn union_flavors(&mut self, a: TyVar, b: TyVar) {
@@ -124,6 +147,7 @@ impl Types {
         }
         let fa = self.flavor(ra);
         let fb = self.flavor(rb);
+        self.hard[rb] = self.hard[ra] || self.hard[rb];
         self.flavors[ra] = Slot::Link(rb);
         self.flavors[rb] = Slot::Value(fa.max(fb));
         if fa.max(fb) == Flavor::Unknown {

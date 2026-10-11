@@ -31,7 +31,7 @@ impl<'m> Infer<'m> {
         };
         match &e.kind {
             ExprKind::Num { int, .. } => Ok(if *int {
-                self.types.int()
+                self.types.int_literal()
             } else {
                 self.types.float()
             }),

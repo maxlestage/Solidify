@@ -243,7 +243,7 @@ fn show(x: Option<&NumberOrStringOrBoolean>) -> String {
 fn main() {
     let shapes = vec![Shape::Circle(Circle { kind: "circle".to_string(), radius: 1.0 }), Shape::Square(Square { kind: "square".to_string(), side: 2.0 }), Shape::Rect(Rect { kind: "rect".to_string(), width: 2.0, height: 3.0 })];
     for s in &shapes {
-        println!("{} {}", s.kind(), format!("{:.*}", 2 as usize, area(s)));
+        println!("{} {}", s.kind(), format!("{:.2}", area(s)));
     }
     println!("{} {} {} {} {}", describe(&StringOrNumber::String("hello".to_string())), describe(&StringOrNumber::Number(21)), first(StringOrStringArray::StringArray(vec!["a".to_string(), "b".to_string()])), first(StringOrStringArray::String("solo".to_string())), first(StringOrStringArray::StringArray(Vec::new())));
     let mut pets = vec![Pet::Cat(Cat { name: "Tom".to_string(), lives: 9 }), Pet::Robot(Robot { name: "R2".to_string(), battery: 50 })];

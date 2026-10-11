@@ -442,10 +442,7 @@ impl<'a> Gen<'a> {
 
     fn template(&mut self, quasis: &[String], exprs: &'a [Expr]) -> GResult<E> {
         if exprs.is_empty() {
-            return Ok(E::owned(
-                format!("{}.to_string()", string_literal(&quasis[0])),
-                PREC_POSTFIX,
-            ));
+            return Ok(E::atom(string_literal(&quasis[0]), Repr::Str));
         }
         let mut fmt = String::new();
         let mut args = Vec::new();

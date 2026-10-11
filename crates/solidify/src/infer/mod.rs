@@ -531,6 +531,8 @@ pub(super) struct Infer<'m> {
     pub(super) narrow_tests: HashMap<NodeId, NarrowTest>,
     pub(super) narrowed_uses: HashMap<NodeId, (String, NodeId)>,
     pub(super) calls_in_try: HashSet<NodeId>,
+    /// The types `JSON.parse` fills: their unconstrained numbers are floats, as in JSON.
+    pub(super) json_targets: Vec<Ty>,
     pub(super) try_returns: HashSet<usize>,
     pub(super) scopes: Vec<Scope>,
     pub(super) fns: Vec<FnCtx>,
@@ -636,6 +638,7 @@ pub fn infer(module: &Module, src: &str) -> IResult<Program> {
         narrow_tests: HashMap::new(),
         narrowed_uses: HashMap::new(),
         calls_in_try: HashSet::new(),
+        json_targets: Vec::new(),
         try_returns: HashSet::new(),
         scopes: vec![Scope {
             vars: HashMap::new(),
