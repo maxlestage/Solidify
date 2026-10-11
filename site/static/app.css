@@ -468,7 +468,7 @@ li code {
   pointer-events: none;
 }
 
-/* A soft light under the pointer (desktop only, see app.js). */
+/* A soft light under the pointer (desktop only, moved by the WebAssembly client). */
 .glow {
   position: fixed;
   left: 0;
@@ -1159,9 +1159,10 @@ pre .m {
 }
 
 /* ---------------------------------------------------------------------------------
-   Motion. The hidden starting states only apply with scripts (`.js`, set in <head>) and
-   when the system allows motion, so the page never stays blank. app.js adds `.ready` to
-   start the hero, and `.in` to what scrolls into view.
+   Motion. The hero's entrance and the counters are CSS alone: they play as the page
+   opens, with or without WebAssembly. What waits for the scroll is hidden only once the
+   WebAssembly client runs (it adds `.motion` to <html>, then `.in` to what comes into
+   view), so the page never stays blank. Nothing moves when the system asks for less.
    --------------------------------------------------------------------------------- */
 
 /* Hero: the light, the words that rise, the elements that follow. */
@@ -1319,7 +1320,7 @@ h1 em {
   transform: translateX(4px);
 }
 
-/* Cards: a light follows the pointer (app.js sets --mx and --my), they lift a little. */
+/* Cards: a light follows the pointer (the client sets --mx and --my), they lift a little. */
 .spot {
   position: relative;
   isolation: isolate;
@@ -1469,48 +1470,28 @@ h1 em {
 }
 
 @media (prefers-reduced-motion: no-preference) {
-  .js .hero .split .w-in {
-    transform: translateY(110%) rotate(4deg);
+  /* The hero, as the page opens: the header slides down, the title's words rise out of
+     their masks, the rest arrives from a blur, the light fades in. */
+  .hero .split .w-in {
     transform-origin: 0 100%;
+    animation: rise 1.1s var(--ease) calc(var(--i) * 85ms + 120ms) both;
   }
 
-  .js.ready .hero .split .w-in {
-    transform: none;
-    transition: transform 1.1s var(--ease) calc(var(--i) * 85ms + 120ms);
+  .intro {
+    animation: arrive 0.9s var(--ease) calc(var(--d) * 70ms + 200ms) both;
   }
 
-  .js .intro {
-    opacity: 0;
-    transform: translateY(18px);
-    filter: blur(6px);
+  .top {
+    animation: descend 0.9s var(--ease) 0.1s both;
   }
 
-  .js.ready .intro {
-    opacity: 1;
-    transform: none;
-    filter: none;
-    transition:
-      opacity 0.9s var(--ease) calc(var(--d) * 70ms + 200ms),
-      transform 0.9s var(--ease) calc(var(--d) * 70ms + 200ms),
-      filter 0.9s var(--ease) calc(var(--d) * 70ms + 200ms);
+  .aurora {
+    animation: fade-in 2s ease 0.2s both;
   }
 
-  .js .top {
-    transform: translateY(-100%);
-  }
-
-  .js.ready .top {
-    transform: none;
-    transition: transform 0.9s var(--ease) 0.1s;
-  }
-
-  .js .aurora {
-    opacity: 0;
-  }
-
-  .js.ready .aurora {
-    opacity: 1;
-    transition: opacity 2s ease 0.2s;
+  /* The hero's figures count up (see `.facts strong[data-count]`). */
+  .facts strong[data-count] {
+    animation: count 1.6s var(--ease) 0.9s both;
   }
 
   /* What scrolls into view. */
@@ -1561,6 +1542,66 @@ h1 em {
       background 0.3s,
       box-shadow 0.3s;
   }
+}
+
+@keyframes rise {
+  from {
+    transform: translateY(110%) rotate(4deg);
+  }
+}
+
+@keyframes arrive {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+    filter: blur(6px);
+  }
+}
+
+@keyframes descend {
+  from {
+    transform: translateY(-100%);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes count {
+  from {
+    --n: 0;
+  }
+}
+
+/* A figure that counts: `--n` is an integer the browser can animate, shown through a
+   CSS counter; the figure itself stays in the page for screen readers and search
+   engines (`.value`). Browsers without @property show the figure at once. */
+@property --n {
+  syntax: "<integer>";
+  inherits: false;
+  initial-value: 0;
+}
+
+.facts strong[data-count] {
+  --n: var(--to);
+  counter-reset: n var(--n);
+}
+
+.facts strong[data-count]::before {
+  content: counter(n);
+  content: counter(n) / "";
+}
+
+.value {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 @keyframes drift1 {
@@ -1657,7 +1698,7 @@ h1 em {
 /* Small screens: the sections behind a menu button, the footer in two columns. */
 
 @media (max-width: 860px) {
-  html.js .menu {
+  html.app .menu {
     position: fixed;
     inset: var(--header) 0 0;
     z-index: 15;
@@ -1673,12 +1714,12 @@ h1 em {
     transition: opacity 0.35s, visibility 0.35s;
   }
 
-  html.js.menu-open .menu {
+  html.app.menu-open .menu {
     visibility: visible;
     opacity: 1;
   }
 
-  html.js .menu a {
+  html.app .menu a {
     padding: 18px 0;
     border-bottom: 1px solid var(--line);
     border-radius: 0;
@@ -1688,27 +1729,27 @@ h1 em {
     letter-spacing: -0.02em;
   }
 
-  html.js .menu a::after {
+  html.app .menu a::after {
     display: none;
   }
 
-  html.js.menu-open .menu a {
+  html.app.menu-open .menu a {
     animation: menu-in 0.6s var(--ease) both;
   }
 
-  html.js.menu-open .menu a:nth-child(2) {
+  html.app.menu-open .menu a:nth-child(2) {
     animation-delay: 0.05s;
   }
 
-  html.js.menu-open .menu a:nth-child(3) {
+  html.app.menu-open .menu a:nth-child(3) {
     animation-delay: 0.1s;
   }
 
-  html.js.menu-open .menu a:nth-child(4) {
+  html.app.menu-open .menu a:nth-child(4) {
     animation-delay: 0.15s;
   }
 
-  html.js.menu-open .menu a:nth-child(5) {
+  html.app.menu-open .menu a:nth-child(5) {
     animation-delay: 0.2s;
   }
 
@@ -1716,13 +1757,13 @@ h1 em {
     overflow: hidden;
   }
 
-  html.js .menu-toggle {
+  html.app .menu-toggle {
     display: grid;
     place-items: center;
   }
 
   /* Without scripts, the sections stay in a row that scrolls. */
-  html:not(.js) .menu {
+  html:not(.app) .menu {
     overflow-x: auto;
     scrollbar-width: none;
   }
