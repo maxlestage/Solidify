@@ -93,8 +93,49 @@ impl<'a> Gen<'a> {
                     } else {
                         self.expr(obj)?
                     };
+                    // A shared object in a hierarchy: its methods borrow the data, the
+                    // arguments computed first (they may read it).
+                    if self.p.is_shared_hierarchy(&class) && !matches!(obj.kind, ExprKind::This) {
+                        let borrow = if info.mutates_self {
+                            "borrow_mut"
+                        } else {
+                            "borrow"
+                        };
+                        let base = Self::paren(&o, PREC_POSTFIX);
+                        let n = info.sig.params.len();
+                        let hoist = n > 0 && list.contains(".borrow") && !list.contains("&mut ");
+                        let (pre, list) = if hoist {
+                            let names: Vec<String> = (0..n).map(|i| format!("a{i}_")).collect();
+                            let pattern = if n == 1 {
+                                names[0].clone()
+                            } else {
+                                format!("({})", names.join(", "))
+                            };
+                            (format!("let {pattern} = ({list}); "), names.join(", "))
+                        } else {
+                            (String::new(), list)
+                        };
+                        let call = if info.is_async {
+                            format!("{base}.{borrow}().{method}({list})")
+                        } else {
+                            // The object is borrowed for the call only.
+                            let with = if info.mutates_self {
+                                "with_mut"
+                            } else {
+                                "with"
+                            };
+                            format!("{base}.{with}(|o| o.{method}({list}))")
+                        };
+                        let call = self.finish_call(call, &info, e)?.code;
+                        let code = if pre.is_empty() {
+                            call
+                        } else {
+                            format!("{{ {pre}{call} }}")
+                        };
+                        return Ok(E::owned(code, PREC_ATOM));
+                    }
                     // A shared object: its methods take the handle.
-                    if self.p.is_shared(&class) {
+                    if self.p.is_shared(&class) && !self.p.is_shared_hierarchy(&class) {
                         let base = Self::paren(&o, PREC_POSTFIX);
                         let code = format!("{base}.{method}({list})");
                         return self.finish_call(code, &info, e);
@@ -525,6 +566,21 @@ impl<'a> Gen<'a> {
                     }
                     None => E::owned(format!("{name}::new()"), PREC_POSTFIX),
                 };
+                if self.p.is_dyn(&class) && self.p.is_shared(&class) {
+                    let h = self.helper(Helper::Shared);
+                    let args = match self.resolve(&built_ty) {
+                        Ty::Named(_, args) => args,
+                        _ => Vec::new(),
+                    };
+                    let g = self.dyn_generics(&class, &args, true, e.span)?;
+                    return Ok(E::owned(
+                        format!(
+                            "{h}(std::rc::Rc::new(std::cell::RefCell::new({})) as std::rc::Rc<std::cell::RefCell<dyn {name}Like{g}>>)",
+                            built.code
+                        ),
+                        PREC_POSTFIX,
+                    ));
+                }
                 if self.p.is_shared(&class) && !self.ctor_gives_handle.contains(&class) {
                     let h = self.helper(Helper::Shared);
                     return Ok(E::owned(format!("{h}::new({})", built.code), PREC_POSTFIX));

@@ -15,7 +15,9 @@ impl<'a> Gen<'a> {
             f.handle_this
                 || (!f.in_ctor
                     && f.this_name == "self"
-                    && f.class.as_ref().is_some_and(|c| self.p.is_shared(c)))
+                    && f.class
+                        .as_ref()
+                        .is_some_and(|c| self.p.is_shared(c) && !self.p.is_shared_hierarchy(c)))
         })
     }
 

@@ -373,17 +373,30 @@ impl<'m> Infer<'m> {
         }
         let mut shared: HashSet<String> = changed.intersection(&copied).cloned().collect();
         shared.extend(self.identity_types.iter().cloned());
-        // Classes in a hierarchy are held through traits: kept as they are.
-        shared.retain(|n| {
-            !self.polymorphic.contains(n)
-                && self.struct_by_name(n).is_some_and(|s| {
-                    s.parent.is_none()
-                        && !self
-                            .structs
-                            .iter()
-                            .any(|o| o.parent.as_deref() == Some(n.as_str()))
-                })
-        });
+        // A class hierarchy (and the interfaces it implements) is shared as a whole: a
+        // value of one class may be held as another.
+        loop {
+            let before = shared.len();
+            for s in &self.structs {
+                let related: Vec<&str> = s
+                    .parent
+                    .iter()
+                    .map(String::as_str)
+                    .chain(s.implements.iter().map(String::as_str))
+                    .collect();
+                if related.iter().any(|r| shared.contains(*r)) || shared.contains(&s.name) {
+                    shared.insert(s.name.clone());
+                    for r in related {
+                        if self.struct_by_name(r).is_some() {
+                            shared.insert(r.to_string());
+                        }
+                    }
+                }
+            }
+            if shared.len() == before {
+                break;
+            }
+        }
         shared
     }
 

@@ -972,6 +972,11 @@ impl<'a> Gen<'a> {
             self.dyn_setters.insert((n.clone(), prop.to_string()));
             let o = self.expr(obj)?;
             let base = Self::paren(&o, PREC_POSTFIX);
+            let base = if self.p.is_shared(&n) {
+                format!("{base}.borrow_mut()")
+            } else {
+                base
+            };
             let place = format!("*{base}.{}_mut()", snake(prop));
             let x = E::new(place, PREC_UNARY, Repr::Owned);
             return self.assign_to(op, x, value, &tt, &vt, e);
@@ -985,6 +990,11 @@ impl<'a> Gen<'a> {
         {
             let o = self.expr(obj)?;
             let base = Self::paren(&o, PREC_POSTFIX);
+            let base = if self.p.is_shared_hierarchy(&n) && !matches!(obj.kind, ExprKind::This) {
+                format!("{base}.borrow_mut()")
+            } else {
+                base
+            };
             let val = self.expr_to(value, &tt)?;
             self.line(&format!("let value_ = {val};"));
             self.line(&format!("{base}.set_{}(value_);", snake(prop)));
