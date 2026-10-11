@@ -195,9 +195,9 @@ impl<'m> Infer<'m> {
                 }
                 UnaryOp::BitNot => {
                     let t = self.expr(arg, None)?;
-                    let n = self.types.int();
+                    let n = self.types.num(Flavor::Unknown);
                     self.expect(&t, &n, arg.span)?;
-                    Ok(n)
+                    Ok(self.types.int())
                 }
             },
             ExprKind::Update { arg, .. } => {
@@ -567,9 +567,20 @@ impl<'m> Infer<'m> {
                 let n = self.types.num(Flavor::Unknown);
                 self.expect(&lt, &n, left.span)?;
                 self.expect(&rt, &n, right.span)?;
+                self.beyond_safe(left, right, &n);
                 Ok(n)
             }
-            BinOp::Sub | BinOp::Mul | BinOp::Mod | BinOp::Pow => {
+            // `a ** b` is a double, as in JavaScript: `2 ** 64` does not overflow.
+            BinOp::Pow => {
+                let a = self.types.num(Flavor::Unknown);
+                let lt = self.expr(left, Some(&a))?;
+                self.expect(&lt, &a, left.span)?;
+                let b = self.types.num(Flavor::Unknown);
+                let rt = self.expr(right, Some(&b))?;
+                self.expect(&rt, &b, right.span)?;
+                Ok(self.types.float())
+            }
+            BinOp::Sub | BinOp::Mul | BinOp::Mod => {
                 let n = self.types.num(Flavor::Unknown);
                 let lt = if matches!(op, BinOp::Sub) {
                     self.expr(left, None)?
@@ -588,6 +599,9 @@ impl<'m> Infer<'m> {
                 self.expect(&lt, &n, left.span)?;
                 let rt = self.expr(right, Some(&n))?;
                 self.expect(&rt, &n, right.span)?;
+                if op != BinOp::Mod {
+                    self.beyond_safe(left, right, &n);
+                }
                 Ok(n)
             }
             BinOp::Div => {
@@ -632,12 +646,13 @@ impl<'m> Infer<'m> {
             | BinOp::BitAnd
             | BinOp::BitOr
             | BinOp::BitXor => {
-                let n = self.types.int();
-                let lt = self.expr(left, Some(&n))?;
-                self.expect(&lt, &n, left.span)?;
-                let rt = self.expr(right, Some(&n))?;
-                self.expect(&rt, &n, right.span)?;
-                Ok(n)
+                // Any numbers, taken as 32-bit integers; the result is one.
+                for side in [left, right] {
+                    let n = self.types.num(Flavor::Unknown);
+                    let t = self.expr(side, Some(&n))?;
+                    self.expect(&t, &n, side.span)?;
+                }
+                Ok(self.types.int())
             }
             BinOp::In => {
                 let rt = self.expr(right, None)?;
@@ -679,6 +694,31 @@ impl<'m> Infer<'m> {
         }
     }
 
+    /// Arithmetic on `Number.MAX_SAFE_INTEGER` (or a literal as large): past 2^53 an
+    /// integer is not exact in JavaScript, so it is a double.
+    fn beyond_safe(&mut self, left: &Expr, right: &Expr, n: &Ty) {
+        let big = |e: &Expr| match &e.kind {
+            ExprKind::Num { value, .. } => value.abs() >= 9007199254740991.0,
+            ExprKind::Member { obj, prop, .. } => {
+                matches!(&obj.kind, ExprKind::Ident(o) if o == "Number")
+                    && matches!(prop.as_str(), "MAX_SAFE_INTEGER" | "MIN_SAFE_INTEGER")
+            }
+            _ => false,
+        };
+        // Constants whose result is past 2^53: `123456789 * 1000000000000`.
+        let folded = match (const_value(left), const_value(right)) {
+            (Some(a), Some(b)) => [a * b, a + b, a - b]
+                .iter()
+                .any(|v| v.abs() >= 9007199254740992.0),
+            _ => false,
+        };
+        if (big(left) || big(right) || folded)
+            && let Ty::Num(v) = self.types.resolve(n)
+        {
+            self.types.set_flavor(v, Flavor::Float);
+        }
+    }
+
     fn assign(
         &mut self,
         op: AssignOp,
@@ -686,6 +726,7 @@ impl<'m> Infer<'m> {
         value: &'m Expr,
         span: Span,
     ) -> IResult<Ty> {
+        self.assigns.push((target, op, value));
         match target {
             AssignTarget::Pat(p) => {
                 if op != AssignOp::Assign {
@@ -711,7 +752,7 @@ impl<'m> Infer<'m> {
                 match op {
                     AssignOp::Assign => {
                         let vt = self.expr(value, Some(&tt))?;
-                        self.expect(&vt, &tt, value.span)?;
+                        self.expect_flow(&vt, &tt, value.span)?;
                         if !matches!(t.kind, ExprKind::Ident(_)) {
                             self.mark_stored(value);
                         } else if !super::stmts::is_place(value)
@@ -750,7 +791,14 @@ impl<'m> Infer<'m> {
                             (b, _) if b.is_bitwise() => {
                                 let i = self.types.int();
                                 self.expect(&tt, &i, t.span)?;
-                                self.expect(&vt, &i, value.span)?;
+                                let n = self.types.num(Flavor::Unknown);
+                                self.expect(&vt, &n, value.span)?;
+                            }
+                            (BinOp::Pow, _) => {
+                                let f = self.types.float();
+                                self.expect(&tt, &f, t.span)?;
+                                let n = self.types.num(Flavor::Unknown);
+                                self.expect(&vt, &n, value.span)?;
                             }
                             _ => {
                                 let n = self.types.num(Flavor::Unknown);
@@ -1759,7 +1807,7 @@ impl<'m> Infer<'m> {
                     self.expect(&at, &pt, a.expr.span)?;
                 } else {
                     let at = self.expr(&a.expr, Some(&item))?;
-                    self.expect(&at, &item, a.expr.span)?;
+                    self.expect_flow(&at, &item, a.expr.span)?;
                     self.mark_stored(&a.expr);
                 }
                 continue;
@@ -1776,7 +1824,7 @@ impl<'m> Infer<'m> {
                 _ => None,
             };
             let at = self.expr(&a.expr, Some(inner.as_ref().unwrap_or(&pt)))?;
-            self.expect(&at, &pt, a.expr.span)?;
+            self.expect_flow(&at, &pt, a.expr.span)?;
             if let ExprKind::Ident(name) = &a.expr.kind
                 && let Some(b) = self.lookup(name)
             {
@@ -1989,7 +2037,7 @@ impl<'m> Infer<'m> {
             }
             let pt = f.params[i].clone();
             let at = self.expr(&a.expr, Some(&pt))?;
-            self.expect(&at, &pt, a.expr.span)?;
+            self.expect_flow(&at, &pt, a.expr.span)?;
         }
         Ok(())
     }
@@ -2475,5 +2523,26 @@ fn optional_result(ret: Ty) -> Ty {
         Ty::Void => Ty::Void,
         Ty::Option(t) => Ty::Option(t),
         other => Ty::Option(Box::new(other)),
+    }
+}
+
+/// The value of an arithmetic expression on literals.
+fn const_value(e: &Expr) -> Option<f64> {
+    match &e.kind {
+        ExprKind::Num { value, .. } => Some(*value),
+        ExprKind::Unary {
+            op: UnaryOp::Neg,
+            arg,
+        } => const_value(arg).map(|v| -v),
+        ExprKind::Binary { op, left, right } => {
+            let (a, b) = (const_value(left)?, const_value(right)?);
+            match op {
+                BinOp::Add => Some(a + b),
+                BinOp::Sub => Some(a - b),
+                BinOp::Mul => Some(a * b),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

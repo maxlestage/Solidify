@@ -11,6 +11,9 @@ use crate::types::{Flavor, FuncTy, Ty, Types};
 
 impl<'m> Infer<'m> {
     pub(super) fn finish(mut self) -> IResult<Program> {
+        self.types.settle_flows();
+        self.float_growing_numbers();
+        self.types.settle_flows();
         let var_inits = std::mem::take(&mut self.var_inits);
         let fn_returns = std::mem::take(&mut self.fn_returns);
         let mut undef_vars = std::mem::take(&mut self.undef_vars);
@@ -49,6 +52,7 @@ impl<'m> Infer<'m> {
             }
         }
         self.float_json_numbers();
+        self.types.settle_flows();
         let bound_impls = self.check_bound_uses()?;
         // Methods that return `this` on every path.
         for (id, (this, other)) in std::mem::take(&mut self.this_returns) {
