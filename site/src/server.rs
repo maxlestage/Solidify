@@ -67,15 +67,18 @@ pub fn respond(path: &str, host: &str) -> (&'static str, &'static str, Vec<u8>) 
             return (
                 "200 OK",
                 content_type(relative),
-                crate::pwa::manifest().into_bytes(),
+                crate::pwa::manifest().to_json().into_bytes(),
             );
         }
         "/sw.js" => {
-            return (
-                "200 OK",
-                content_type(relative),
-                service_worker(&origin(host)).into_bytes(),
-            );
+            return match service_worker(&origin(host)) {
+                Some(worker) => ("200 OK", content_type(relative), worker.into_bytes()),
+                None => (
+                    "404 Not Found",
+                    "text/plain",
+                    b"the worker is not built".to_vec(),
+                ),
+            };
         }
         _ => {}
     }
@@ -94,8 +97,9 @@ pub fn respond(path: &str, host: &str) -> (&'static str, &'static str, Vec<u8>) 
     }
 }
 
-/// The service worker for the pages as rendered at `origin`.
-fn service_worker(origin: &str) -> String {
+/// The service worker for the pages as rendered at `origin` (`None` while
+/// `site/pkg/worker` is not built: see site/README.md).
+fn service_worker(origin: &str) -> Option<String> {
     let pages: Vec<(String, String)> = Lang::ALL
         .iter()
         .map(|lang| {
@@ -107,7 +111,7 @@ fn service_worker(origin: &str) -> String {
         })
         .collect();
     let (files, version) = crate::pwa::offline_files(&site_dir(), &pages);
-    crate::pwa::service_worker(&files, &version)
+    crate::pwa::service_worker(&site_dir(), &files, &version)
 }
 
 /// Serves the site until the process is stopped.
@@ -174,8 +178,14 @@ pub fn export(out: &Path) -> io::Result<usize> {
     }
     write("404.html", pages::home(Lang::En, &origin).as_bytes())?;
     // The installable app: its manifest, and the service worker that keeps it offline.
-    write("manifest.webmanifest", crate::pwa::manifest().as_bytes())?;
-    write("sw.js", service_worker(&origin).as_bytes())?;
+    write(
+        "manifest.webmanifest",
+        crate::pwa::manifest().to_json().as_bytes(),
+    )?;
+    match service_worker(&origin) {
+        Some(worker) => write("sw.js", worker.as_bytes())?,
+        None => eprintln!("warning: site/pkg/worker is missing, the site will not work offline"),
+    }
     let dir = site_dir();
     for folder in ["static", "pkg"] {
         let root = dir.join(folder);
@@ -187,6 +197,10 @@ pub fn export(out: &Path) -> io::Result<usize> {
         }
         for file in files_under(&root)? {
             let relative = file.strip_prefix(&dir).unwrap_or(&file);
+            // The worker is inlined into sw.js.
+            if relative.starts_with("pkg/worker") {
+                continue;
+            }
             let bytes = std::fs::read(&file)?;
             write(&relative.to_string_lossy().replace('\\', "/"), &bytes)?;
         }
@@ -243,8 +257,12 @@ mod tests {
         assert!(dir.join("static/app.css").exists());
         assert!(dir.join(".nojekyll").exists());
         assert!(dir.join("manifest.webmanifest").exists());
-        let sw = std::fs::read_to_string(dir.join("sw.js")).unwrap();
-        assert!(sw.contains("\"static/app.css\"") && sw.contains("\"fr/\""));
+        // The worker exists once site/pkg/worker is built (CI builds it before exporting).
+        if let Ok(sw) = std::fs::read_to_string(dir.join("sw.js")) {
+            assert!(sw.contains("\"static/app.css\"") && sw.contains("\"fr/\""));
+            assert!(sw.contains("wasm_bindgen.serve(\"solidify-"));
+            assert!(!sw.contains("\"pkg/worker"));
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

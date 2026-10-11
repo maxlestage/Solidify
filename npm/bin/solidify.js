@@ -1,6 +1,9 @@
 #!/usr/bin/env node
 // `npx solidify-rs main.ts -o app.rs`: Solidify compiled to WebAssembly (WASI), run by
 // Node.js with the files of this machine. Same options as the native command.
+//
+// The transpiler is Rust (crates/solidify); this file only starts its WebAssembly, the
+// way npm needs a package's command to be a script.
 "use strict";
 
 const fs = require("node:fs");
