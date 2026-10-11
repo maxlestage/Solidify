@@ -152,7 +152,7 @@ Cuatro reglas que conviene conocer:
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | El transpilador: lexer, parser, inferencia de tipos, generación de código, línea de comandos |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programas traducidos, compilados con `rustc` y comparados con lo que imprime Node.js (una carpeta contiene un programa de varios archivos) |
-| [`npm`](npm) | El paquete `solidify-rs` para `npx`: un lanzador Node.js del transpilador compilado a WebAssembly (WASI), comprobado contra los programas de prueba con `node npm/test.js` |
+| [`npm`](npm) | El paquete `solidify-rs` para `npx`: un lanzador Node.js del transpilador compilado a WebAssembly (WASI), comprobado contra los programas de prueba con `cargo test -p solidify --test npm` |
 | [`site`](site) | El sitio web, escrito con [active](https://github.com/maxlestage/Active): un playground que ejecuta Solidify en WebAssembly, tres idiomas elegidos automáticamente o a mano, una app instalable que funciona sin conexión, muchas animaciones. [`site/README.md`](site/README.md) lo documenta todo |
 
 ## Desarrollo
@@ -172,6 +172,8 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129
 cargo build -p solidify-site --lib --target wasm32-unknown-unknown --profile wasm-release
 wasm-bindgen --target web --no-typescript --out-dir site/pkg target/wasm32-unknown-unknown/wasm-release/solidify_site.wasm
+cargo build -p solidify-site-worker --target wasm32-unknown-unknown --profile wasm-release
+wasm-bindgen --target no-modules --no-typescript --out-dir site/pkg/worker target/wasm32-unknown-unknown/wasm-release/solidify_site_worker.wasm
 cargo run -p solidify-site                 # http://localhost:3000
 cargo run -p solidify-site -- export dist  # archivos estáticos para cualquier alojamiento
 ```
@@ -187,7 +189,7 @@ El workflow [`npm.yml`](.github/workflows/npm.yml) construye el paquete tras cad
 ```sh
 cargo build -p solidify --bin solidify --target wasm32-wasip1 --profile wasm-release
 cp target/wasm32-wasip1/wasm-release/solidify.wasm LICENSE npm/
-node npm/test.js                     # cada programa de prueba, como lo traduce la versión nativa
+cargo test -p solidify --test npm # cada programa de prueba, como lo traduce la versión nativa
 node npm/bin/solidify.js main.ts     # lo que ejecuta `npx solidify-rs main.ts`
 ```
 

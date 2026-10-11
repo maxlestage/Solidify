@@ -152,7 +152,7 @@ Four rules worth knowing:
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | The transpiler: lexer, parser, type inference, code generation, CLI |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
-| [`npm`](npm) | The `solidify-rs` package for `npx`: a Node.js launcher for the transpiler compiled to WebAssembly (WASI), checked against the test programs by `node npm/test.js` |
+| [`npm`](npm) | The `solidify-rs` package for `npx`: a Node.js launcher for the transpiler compiled to WebAssembly (WASI), checked against the test programs by `cargo test -p solidify --test npm` |
 | [`site`](site) | The website, written with [active](https://github.com/maxlestage/Active): a playground running Solidify as WebAssembly, three languages chosen automatically or by hand, an installable app that works offline, many animations. [`site/README.md`](site/README.md) documents all of it |
 
 ## Development
@@ -172,6 +172,8 @@ rustup target add wasm32-unknown-unknown
 cargo install wasm-bindgen-cli --version 0.2.129
 cargo build -p solidify-site --lib --target wasm32-unknown-unknown --profile wasm-release
 wasm-bindgen --target web --no-typescript --out-dir site/pkg target/wasm32-unknown-unknown/wasm-release/solidify_site.wasm
+cargo build -p solidify-site-worker --target wasm32-unknown-unknown --profile wasm-release
+wasm-bindgen --target no-modules --no-typescript --out-dir site/pkg/worker target/wasm32-unknown-unknown/wasm-release/solidify_site_worker.wasm
 cargo run -p solidify-site                 # http://localhost:3000
 cargo run -p solidify-site -- export dist  # static files for any host
 ```
@@ -187,7 +189,7 @@ The [`npm.yml`](.github/workflows/npm.yml) workflow builds the package after eve
 ```sh
 cargo build -p solidify --bin solidify --target wasm32-wasip1 --profile wasm-release
 cp target/wasm32-wasip1/wasm-release/solidify.wasm LICENSE npm/
-node npm/test.js                     # every test program, as the native build translates it
+cargo test -p solidify --test npm # every test program, as the native build translates it
 node npm/bin/solidify.js main.ts     # what `npx solidify-rs main.ts` runs
 ```
 
