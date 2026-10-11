@@ -897,6 +897,9 @@ impl<'a> Gen<'a> {
         if h == Helper::Json {
             self.helpers.insert(Helper::Inspect);
         }
+        if h == Helper::Eval {
+            self.helper(Helper::Dynamic);
+        }
         if h == Helper::Dynamic {
             self.helpers.extend([
                 Helper::Inspect,
@@ -907,7 +910,7 @@ impl<'a> Gen<'a> {
         }
         if matches!(
             h,
-            Helper::Json | Helper::Inspect | Helper::NumFormat | Helper::Dynamic
+            Helper::Json | Helper::Inspect | Helper::NumFormat | Helper::Dynamic | Helper::Eval
         ) {
             self.helpers.insert(Helper::NumText);
         }
@@ -950,6 +953,7 @@ impl<'a> Gen<'a> {
             Helper::Json => "js_json_stringify",
             Helper::Date => "JsDate",
             Helper::Dynamic => "JsValue",
+            Helper::Eval => "js_eval",
         }
     }
 

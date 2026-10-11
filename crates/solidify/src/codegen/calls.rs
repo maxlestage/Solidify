@@ -196,7 +196,7 @@ impl<'a> Gen<'a> {
                 self.finish_call(code, &info, e)
             }
             Callee::Builtin(name) => {
-                if name == "new Array" {
+                if name == "new Array" || name == "new Function" {
                     return self.new_expr(e, callee, args);
                 }
                 let ExprKind::Member { obj, .. } = &callee.kind else {
@@ -212,7 +212,7 @@ impl<'a> Gen<'a> {
                 }
                 match receiver_kind {
                     "console" | "Math" | "Number" | "String" | "Object" | "Array" | "Date"
-                    | "Symbol" | "performance" | "process" | "Promise" | "JSON" => {
+                    | "Symbol" | "performance" | "process" | "Promise" | "JSON" | "Reflect" => {
                         self.namespace_call(e, name, args)
                     }
                     _ => self.method_builtin(e, obj, name, args),
@@ -489,6 +489,8 @@ impl<'a> Gen<'a> {
         args: &'a [Arg],
     ) -> GResult<E> {
         match self.p.calls.get(&e.id).cloned() {
+            Some(Callee::Builtin("new Function")) => self.new_function(args),
+            Some(Callee::Builtin("new Proxy")) => self.new_proxy(args),
             Some(Callee::Ctor(class)) => {
                 let name = pascal(&class);
                 // A generic class: what its methods need of the type arguments.
@@ -664,6 +666,7 @@ impl<'a> Gen<'a> {
         let arg_str =
             |g: &mut Self, i: usize| -> GResult<String> { g.expr_as(&args[i].expr, Want::StrRef) };
         Ok(match name {
+            "global.eval" => return self.eval_code(e, args),
             "global.parseInt" => {
                 let at = self.ty_of(&args[0].expr);
                 if matches!(self.resolve(&at), Ty::Num(_)) {
@@ -960,6 +963,11 @@ impl<'a> Gen<'a> {
                     PREC_POSTFIX,
                 )
             }
+            "Reflect.get"
+            | "Reflect.set"
+            | "Reflect.has"
+            | "Reflect.deleteProperty"
+            | "Reflect.ownKeys" => return self.reflect_code(name, args),
             "Object.keys.dyn" | "Object.values.dyn" | "Object.entries.dyn" => {
                 let v = self.dyn_ref(&args[0].expr)?;
                 let code = match name {
