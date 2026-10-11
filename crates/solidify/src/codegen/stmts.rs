@@ -2,10 +2,10 @@
 
 use super::exprs::narrow_path_expr;
 use super::{
-    E, GResult, Gen, PREC_ATOM, PREC_POSTFIX, PREC_UNARY, Repr, Target, TryCtx, Want, snake,
+    E, GResult, Gen, PREC_ATOM, PREC_POSTFIX, PREC_UNARY, Repr, Target, TryCtx, Want, pascal, snake,
 };
 use crate::ast::*;
-use crate::infer::{Callee, Role};
+use crate::infer::{Callee, Complement, Role};
 use crate::types::Ty;
 
 impl<'a> Gen<'a> {
@@ -703,6 +703,20 @@ impl<'a> Gen<'a> {
             self.line(&format!("{m}.insert({key}, {val});"));
             return Ok(());
         }
+        // A field of a union value: through its mutable accessor.
+        if let ExprKind::Member { obj, prop, .. } = &t.kind
+            && let Ty::Named(n) = self.ty_of(obj)
+            && self.p.union_info(&n).is_some()
+            && op == AssignOp::Assign
+        {
+            self.union_accessors
+                .insert((n.clone(), prop.to_string(), true));
+            let o = self.expr(obj)?;
+            let base = Self::paren(&o, PREC_POSTFIX);
+            let val = self.expr_to(value, &tt)?;
+            self.line(&format!("*{base}.{}_mut() = {val};", snake(prop)));
+            return Ok(());
+        }
         // A setter.
         if let ExprKind::Member { obj, prop, .. } = &t.kind
             && let Ty::Named(n) = self.ty_of(obj)
@@ -885,13 +899,16 @@ impl<'a> Gen<'a> {
         then: &'a Stmt,
         otherwise: Option<&'a Stmt>,
     ) -> GResult<()> {
+        if self.if_union(test, then, otherwise)? {
+            return Ok(());
+        }
         // `if (x === null) return;` narrows the rest of the block: `let Some(x) = x else {…};`
         if let Some((n, path_expr)) = self.negative_narrow(test)
             && n.let_else
         {
             let pt = self.ty_of(path_expr);
             let x = self.expr(path_expr)?;
-            let (pattern, source) = self.narrow_binding(&n.name, n.mutated, &n.inner, x, &pt);
+            let (pattern, source) = self.narrow_binding(&n, x, &pt);
             self.line(&format!("let {pattern} = {source} else {{"));
             self.indent += 1;
             let saved: Vec<(String, Repr)> =
@@ -913,7 +930,7 @@ impl<'a> Gen<'a> {
             let pt = self.ty_of(path_expr);
             let x = self.expr(path_expr)?;
             let before = self.narrowed.len();
-            let (pattern, source) = self.narrow_binding(&n.name, n.mutated, &n.inner, x, &pt);
+            let (pattern, source) = self.narrow_binding(&n, x, &pt);
             self.line(&format!("if let {pattern} = {source} {{"));
             self.indent += 1;
             self.stmt_or_block(o)?;
@@ -958,6 +975,276 @@ impl<'a> Gen<'a> {
             }
         }
         Ok(())
+    }
+
+    /// The test of a union member in `test` (through a `!`), with what the value is when
+    /// the test is true and when it is false.
+    pub(super) fn union_test_of(
+        &self,
+        test: &'a Expr,
+    ) -> Option<(crate::infer::NarrowTest, &'a Expr, UnionSides)> {
+        let (inner, negated) = match &test.kind {
+            ExprKind::Unary {
+                op: UnaryOp::Not,
+                arg,
+            } => (&**arg, true),
+            _ => (test, false),
+        };
+        let n = self.p.narrow_tests.get(&inner.id)?;
+        let (en, variant) = n.union.clone()?;
+        let positive = n.positive != negated;
+        let tested = Side::Variant(variant);
+        let other = n.complement.clone().map(|c| match c {
+            Complement::Variant(v, _) => Side::Variant(v),
+            Complement::Union(t) => Side::Union(t),
+        });
+        let (when_true, when_false) = if positive {
+            (Some(tested), other)
+        } else {
+            (other, Some(tested))
+        };
+        Some((
+            n.clone(),
+            narrow_path_expr(inner),
+            UnionSides {
+                union: en,
+                when_true,
+                when_false,
+            },
+        ))
+    }
+
+    /// The source of a `match` on a union value, and how the bound members are held.
+    fn union_source(&mut self, n: &crate::infer::NarrowTest, x: E, pt: &Ty) -> (String, Repr) {
+        let before = self.narrowed.len();
+        let (_, source) = self.narrow_binding(n, x, pt);
+        let repr = self.narrowed.last().map_or(Repr::Ref, |(_, r)| *r);
+        self.narrowed.truncate(before);
+        (source, repr)
+    }
+
+    /// `match other { U::X(v) => U2::X(v), … }`: a value of union `from`, known not to be
+    /// the tested member, as the union of the remaining members.
+    pub(super) fn union_conversion(
+        &mut self,
+        other: &str,
+        from: &str,
+        to: &Ty,
+        repr: Repr,
+    ) -> GResult<String> {
+        let Some(target) = self.p.union_of(to).cloned() else {
+            return self.err("not a union", crate::error::Span::default());
+        };
+        let from_name = pascal(from);
+        let to_name = pascal(&target.name);
+        let mut arms = Vec::new();
+        for m in &target.members {
+            let Some((_, from_variant)) = self.union_variant(&m.ty, &Ty::Named(from.to_string()))
+            else {
+                continue;
+            };
+            let value = if repr == Repr::Owned {
+                "v".to_string()
+            } else if self.is_copy(&m.ty) {
+                "*v".to_string()
+            } else {
+                "v.clone()".to_string()
+            };
+            arms.push(format!(
+                "{from_name}::{from_variant}(v) => {to_name}::{}({value})",
+                m.name
+            ));
+        }
+        arms.push("_ => unreachable!()".into());
+        Ok(format!("match {other} {{ {} }}", arms.join(", ")))
+    }
+
+    /// The pattern of a side, and the lines binding `name` in its arm (a conversion for a
+    /// union side).
+    fn side_arm(
+        &mut self,
+        side: &Side,
+        name: &str,
+        sides: &UnionSides,
+        repr: Repr,
+    ) -> GResult<(String, Option<String>)> {
+        Ok(match side {
+            Side::Variant(v) => (format!("{}::{v}({name})", pascal(&sides.union)), None),
+            Side::Union(t) => {
+                let conv = self.union_conversion("other", &sides.union, t, repr)?;
+                ("other".to_string(), Some(format!("let {name} = {conv};")))
+            }
+        })
+    }
+
+    /// `if` on a test of a union member: `if let` or `match`, binding the member on each
+    /// side. Returns whether the statement was handled.
+    fn if_union(
+        &mut self,
+        test: &'a Expr,
+        then: &'a Stmt,
+        otherwise: Option<&'a Stmt>,
+    ) -> GResult<bool> {
+        let Some((n, path_expr, sides)) = self.union_test_of(test) else {
+            return Ok(false);
+        };
+        let pt = self.ty_of(path_expr);
+        let x = self.expr(path_expr)?;
+        let before = self.narrowed.len();
+        let name = snake(&n.name);
+        let (source, repr) = self.union_source(&n, x, &pt);
+        // A side made of the remaining members is held by value after its conversion.
+        let repr_of = |side: &Side| match side {
+            Side::Variant(..) => repr,
+            Side::Union(_) => Repr::Owned,
+        };
+        match (&sides.when_true, &sides.when_false, otherwise) {
+            (Some(t), Some(f), Some(o)) => {
+                let (pt_, prelude_t) = self.side_arm(t, &name, &sides, repr)?;
+                let (pf, prelude_f) = self.side_arm(f, &name, &sides, repr)?;
+                self.line(&format!("match {source} {{"));
+                self.indent += 1;
+                self.line(&format!("{pt_} => {{"));
+                self.indent += 1;
+                if let Some(p) = prelude_t {
+                    self.line(&p);
+                }
+                self.narrowed.push((name.clone(), repr_of(t)));
+                self.stmt_or_block(then)?;
+                self.narrowed.truncate(before);
+                self.indent -= 1;
+                self.line("}");
+                self.line(&format!("{pf} => {{"));
+                self.indent += 1;
+                if let Some(p) = prelude_f {
+                    self.line(&p);
+                }
+                self.narrowed.push((name.clone(), repr_of(f)));
+                self.stmt_or_block(o)?;
+                self.narrowed.truncate(before);
+                self.indent -= 1;
+                self.line("}");
+                self.indent -= 1;
+                self.line("}");
+            }
+            (Some(t), Some(f), None) if n.let_else => {
+                // The `then` branch leaves: the rest of the block sees the other side.
+                let (pt_, prelude_t) = self.side_arm(t, &name, &sides, repr)?;
+                self.line(&format!("let {name} = match {source} {{"));
+                self.indent += 1;
+                self.line(&format!("{pt_} => {{"));
+                self.indent += 1;
+                if let Some(p) = prelude_t {
+                    self.line(&p);
+                }
+                self.narrowed.push((name.clone(), repr_of(t)));
+                self.stmt_or_block(then)?;
+                self.narrowed.truncate(before);
+                self.indent -= 1;
+                self.line("}");
+                match f {
+                    Side::Variant(v) => {
+                        self.line(&format!("{}::{v}({name}) => {name},", pascal(&sides.union)))
+                    }
+                    Side::Union(ty) => {
+                        let conv = self.union_conversion("other", &sides.union, ty, repr)?;
+                        self.line(&format!("other => {conv},"));
+                    }
+                }
+                self.indent -= 1;
+                self.line("};");
+                self.narrowed.push((name, repr_of(f)));
+            }
+            (Some(Side::Variant(tv)), _, _) => {
+                let pattern = format!("{}::{tv}({name})", pascal(&sides.union));
+                self.line(&format!("if let {pattern} = {source} {{"));
+                self.indent += 1;
+                self.narrowed.push((name.clone(), repr));
+                self.stmt_or_block(then)?;
+                self.narrowed.truncate(before);
+                self.indent -= 1;
+                match otherwise {
+                    Some(o) => {
+                        self.line("} else {");
+                        self.indent += 1;
+                        self.stmt_or_block(o)?;
+                        self.indent -= 1;
+                        self.line("}");
+                    }
+                    None => self.line("}"),
+                }
+            }
+            (Some(Side::Union(_)), None, _) => return Ok(false),
+            (Some(Side::Union(ty)), f, None) => {
+                // The tested member is not in `then`: everything else is.
+                let (pf, _) = match f {
+                    Some(f) => self.side_arm(f, &name, &sides, repr)?,
+                    None => return Ok(false),
+                };
+                let pattern_wild = pf.replace(&format!("({name})"), "(_)");
+                self.line(&format!("if !matches!({source}, {pattern_wild}) {{"));
+                self.indent += 1;
+                let conv = self.union_conversion(&source, &sides.union, ty, repr)?;
+                self.line(&format!("let {name} = {conv};"));
+                self.narrowed.push((name.clone(), Repr::Owned));
+                self.stmt_or_block(then)?;
+                self.narrowed.truncate(before);
+                self.indent -= 1;
+                self.line("}");
+            }
+            (None, Some(f), Some(o)) => {
+                let (pf, prelude_f) = self.side_arm(f, &name, &sides, repr)?;
+                self.line(&format!("match {source} {{"));
+                self.indent += 1;
+                self.line(&format!("{pf} => {{"));
+                self.indent += 1;
+                if let Some(p) = prelude_f {
+                    self.line(&p);
+                }
+                self.narrowed.push((name.clone(), repr_of(f)));
+                self.stmt_or_block(o)?;
+                self.narrowed.truncate(before);
+                self.indent -= 1;
+                self.line("}");
+                self.line("_ => {");
+                self.indent += 1;
+                self.stmt_or_block(then)?;
+                self.indent -= 1;
+                self.line("}");
+                self.indent -= 1;
+                self.line("}");
+            }
+            (None, Some(Side::Variant(ev)), None) if n.let_else => {
+                let pattern = format!("{}::{ev}({name})", pascal(&sides.union));
+                self.line(&format!("let {pattern} = {source} else {{"));
+                self.indent += 1;
+                self.stmt_or_block(then)?;
+                self.indent -= 1;
+                self.line("};");
+                self.narrowed.push((name, repr));
+            }
+            (None, Some(Side::Union(ty)), None) if n.let_else => {
+                let conv = self.union_conversion("other", &sides.union, ty, repr)?;
+                self.line(&format!("let {name} = match {source} {{"));
+                self.indent += 1;
+                self.line(&format!("other => {conv},"));
+                self.indent -= 1;
+                self.line("};");
+                let _ = then;
+                self.narrowed.push((name, Repr::Owned));
+            }
+            (None, Some(f), None) => {
+                let (pf, _) = self.side_arm(f, &name, &sides, repr)?;
+                let pattern_wild = pf.replace(&format!("({name})"), "(_)");
+                self.line(&format!("if !matches!({source}, {pattern_wild}) {{"));
+                self.indent += 1;
+                self.stmt_or_block(then)?;
+                self.indent -= 1;
+                self.line("}");
+            }
+            (None, None, _) => return Ok(false),
+        }
+        Ok(true)
     }
 
     /// A test of the form `x === null` or `!x` on a nullable path.
@@ -1362,6 +1649,10 @@ impl<'a> Gen<'a> {
     }
 
     fn switch_stmt(&mut self, disc: &'a Expr, cases: &'a [Case]) -> GResult<()> {
+        if let Some(text) = self.switch_on_union(disc, cases)? {
+            self.out.push_str(&text);
+            return Ok(());
+        }
         let dt = self.ty_of(disc);
         // Patterns must be literals or enum variants.
         let mut patterns: Vec<Option<String>> = Vec::new();
@@ -1465,6 +1756,146 @@ impl<'a> Gen<'a> {
             self.line("}");
         }
         Ok(())
+    }
+
+    /// `switch (shape.kind)` on a union: a `match` on the union, each case binding its
+    /// member.
+    fn switch_on_union(&mut self, disc: &'a Expr, cases: &'a [Case]) -> GResult<Option<String>> {
+        let ExprKind::Member { obj, .. } = &disc.kind else {
+            return Ok(None);
+        };
+        let first_test = cases.iter().find_map(|c| c.test.as_ref());
+        let Some(first) = first_test else {
+            return Ok(None);
+        };
+        let Some(n0) = self.p.narrow_tests.get(&first.id).cloned() else {
+            return Ok(None);
+        };
+        let Some((en, _)) = &n0.union else {
+            return Ok(None);
+        };
+        let en = pascal(en);
+        let ot = self.ty_of(obj);
+        let o = self.expr(obj)?;
+        let mutated = cases
+            .iter()
+            .filter_map(|c| c.test.as_ref())
+            .any(|t| self.p.narrow_tests.get(&t.id).is_some_and(|n| n.mutated));
+        let source = if mutated {
+            match o.repr {
+                Repr::RefMut => o.code.clone(),
+                _ => format!("&mut {}", Self::paren(&o, PREC_UNARY)),
+            }
+        } else {
+            match o.repr {
+                Repr::Ref | Repr::RefMut => o.code.clone(),
+                Repr::Owned if self.can_move(&o) => o.code.clone(),
+                _ => format!("&{}", Self::paren(&o, PREC_UNARY)),
+            }
+        };
+        let by_value = !mutated && o.repr == Repr::Owned && self.can_move(&o);
+        let _ = ot;
+        let label = self.fresh_label("switch");
+        self.fn_ctx_mut().targets.push(Target::Switch {
+            rust_label: label.clone(),
+            used: false,
+        });
+        let mut has_default = false;
+        let text = self.capture(|g| {
+            g.indent += 1;
+            let mut pending: Vec<String> = Vec::new();
+            let mut bound: Vec<(String, Repr)> = Vec::new();
+            for (i, c) in cases.iter().enumerate() {
+                match &c.test {
+                    Some(t) => {
+                        let Some(n) = g.p.narrow_tests.get(&t.id).cloned() else {
+                            return g.err("every `case` of a union must be one of its tags", t.span);
+                        };
+                        let (_, variant) = n.union.clone().expect("union");
+                        let name = snake(&n.name);
+                        let repr = if by_value {
+                            Repr::Owned
+                        } else if mutated {
+                            Repr::RefMut
+                        } else {
+                            Repr::Ref
+                        };
+                        pending.push(format!("{en}::{variant}({name})"));
+                        bound.push((name, repr));
+                    }
+                    None => {
+                        has_default = true;
+                        pending.push("_".into());
+                    }
+                }
+                if c.body.is_empty() && i + 1 < cases.len() {
+                    continue;
+                }
+                let mut body: &[Stmt] = &c.body;
+                let falls_through = !body.last().is_some_and(always_exits) && i + 1 < cases.len();
+                if falls_through && !body.is_empty() {
+                    return g.err("a `case` must end with `break` or `return`: falling through is not supported", c.span);
+                }
+                if let [Stmt { kind: StmtKind::Block(b), .. }] = body {
+                    body = &b.stmts;
+                }
+                if let Some(Stmt { kind: StmtKind::Break(None), .. }) = body.last() {
+                    body = &body[..body.len() - 1];
+                }
+                // Several tags for one body: the binding must have the same name.
+                let names: std::collections::BTreeSet<&str> = bound.iter().map(|(n, _)| n.as_str()).collect();
+                if names.len() > 1 {
+                    return g.err("cases sharing a body must test the same value", c.span);
+                }
+                g.line(&format!("{} => {{", pending.join(" | ")));
+                pending.clear();
+                let before = g.narrowed.len();
+                if let Some((name, repr)) = bound.first() {
+                    g.narrowed.push((name.clone(), *repr));
+                }
+                bound.clear();
+                g.indent += 1;
+                g.block_body(body, false)?;
+                g.indent -= 1;
+                g.narrowed.truncate(before);
+                g.line("}");
+            }
+            g.indent -= 1;
+            Ok(())
+        })?;
+        let Some(Target::Switch { used, .. }) = self.fn_ctx_mut().targets.pop() else {
+            unreachable!()
+        };
+        let covered = self.p.union_info(&en).is_some_and(|u| {
+            u.members
+                .iter()
+                .all(|m| text.contains(&format!("{en}::{}(", m.name)))
+        }) || self.p.unions.iter().any(|u| {
+            pascal(&u.name) == en
+                && u.members
+                    .iter()
+                    .all(|m| text.contains(&format!("{en}::{}(", m.name)))
+        });
+        let mut out = String::new();
+        let indent = "    ".repeat(self.indent);
+        if used {
+            out.push_str(&format!("{indent}{label}: {{\n"));
+        }
+        let inner_indent = if used {
+            format!("{indent}    ")
+        } else {
+            indent.clone()
+        };
+        out.push_str(&format!("{inner_indent}match {source} {{\n"));
+        out.push_str(&if used { indent_text(&text, 1) } else { text });
+        if !has_default && !covered {
+            out.push_str(&format!("{inner_indent}    _ => {{}}\n"));
+        }
+        out.push_str(&format!("{inner_indent}}}\n"));
+        if used {
+            out.push_str(&format!("{indent}}}\n"));
+        }
+        Ok(Some(out))
     }
 
     fn pattern_text(&mut self, t: &'a Expr) -> Option<String> {
@@ -1670,6 +2101,23 @@ impl<'a> Gen<'a> {
         }
         Ok(())
     }
+}
+
+/// What a union value is on one side of a test.
+#[derive(Clone, Debug)]
+pub(super) enum Side {
+    /// One member: its variant.
+    Variant(String),
+    /// The union of the remaining members.
+    Union(Ty),
+}
+
+/// What a union test binds when true and when false.
+pub(super) struct UnionSides {
+    /// The union tested (TypeScript name).
+    pub union: String,
+    pub when_true: Option<Side>,
+    pub when_false: Option<Side>,
 }
 
 /// Whether a block ends by leaving (return, throw, break, continue, infinite loop).

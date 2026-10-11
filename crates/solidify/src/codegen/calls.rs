@@ -170,16 +170,27 @@ impl<'a> Gen<'a> {
                 Some(a) => {
                     let at = self.ty_of(&a.expr);
                     let x = self.expr(&a.expr)?;
+                    // A member passed where a union is borrowed: the variant, borrowed.
+                    if mode != Mode::Value
+                        && mode != Mode::FnImpl
+                        && self.union_variant(&at, pt).is_some()
+                    {
+                        let wrapped = self.owned_as(x, &at, pt);
+                        list.push(if mode == Mode::RefMut {
+                            format!("&mut {wrapped}")
+                        } else {
+                            format!("&{wrapped}")
+                        });
+                        continue;
+                    }
                     let code = match mode {
                         Mode::Value => {
                             let generic = matches!(self.resolve(pt), Ty::Named(ref n) if info.type_params.contains(n));
-                            if optional {
-                                self.owned_as(x, &at, pt)
-                            } else if generic && x.repr == Repr::Str {
+                            if generic && x.repr == Repr::Str {
                                 // A string literal for a type parameter: `&str` does.
                                 x.code
                             } else {
-                                self.owned(x, &at)
+                                self.owned_as(x, &at, pt)
                             }
                         }
                         Mode::FnImpl => {
@@ -1162,23 +1173,53 @@ impl<'a> Gen<'a> {
             match &args[i].expr.kind {
                 ExprKind::Arrow(f) | ExprKind::Func(f) => Ok(g.closure(f, reprs, false)?.code),
                 _ => {
-                    // A named function: wrapped so that references are dereferenced.
+                    // A named function: wrapped so that each element is passed the way the
+                    // function takes it.
                     let f = g.expr(&args[i].expr)?;
+                    let modes: Vec<Mode> = match g.p.refs.get(&args[i].expr.id) {
+                        Some(b) if g.p.var(*b).role == crate::infer::Role::Func => {
+                            let fn_id = g.p.fn_bindings[b];
+                            let info = g.p.funcs[&fn_id].clone();
+                            info.sig
+                                .params
+                                .iter()
+                                .enumerate()
+                                .map(|(j, pt)| {
+                                    let (stored, reassigned, mutated) = info
+                                        .params
+                                        .get(j)
+                                        .map(|b| {
+                                            let v = g.p.var(*b);
+                                            (v.stored, v.reassigned, v.mutated)
+                                        })
+                                        .unwrap_or((true, false, false));
+                                    g.param_mode(pt, stored, reassigned, mutated, &info.type_params)
+                                })
+                                .collect()
+                        }
+                        _ => Vec::new(),
+                    };
                     let n = reprs.len().max(1);
                     let params: Vec<String> = (0..n).map(|i| format!("a{i}")).collect();
-                    let call_args: Vec<String> = params
-                        .iter()
-                        .zip(reprs)
-                        .map(|(p, r)| {
-                            if *r == Repr::Ref && copy {
-                                format!("*{p}")
-                            } else if *r == Repr::Ref {
-                                format!("{p}.clone()")
-                            } else {
-                                p.clone()
+                    let mut call_args = Vec::new();
+                    for (j, (p, r)) in params.iter().zip(reprs).enumerate() {
+                        let mode = modes.get(j).copied().unwrap_or(Mode::Value);
+                        call_args.push(match (mode, *r) {
+                            (Mode::RefMut, _) => {
+                                return g.err(
+                                    "this function changes its argument: call it in a loop instead",
+                                    args[i].expr.span,
+                                );
                             }
-                        })
-                        .collect();
+                            (Mode::Value, Repr::Ref | Repr::Place) if copy => format!("*{p}"),
+                            (Mode::Value, Repr::Ref | Repr::Place) => format!("{p}.clone()"),
+                            (Mode::Value | Mode::FnImpl, _) => p.clone(),
+                            (Mode::StrRef, Repr::Owned) => format!("&{p}"),
+                            (_, Repr::Owned) => format!("&{p}"),
+                            (_, Repr::Usize) => format!("{p} as i64"),
+                            _ => p.clone(),
+                        });
+                    }
                     Ok(format!(
                         "|{}| {}({})",
                         params.join(", "),

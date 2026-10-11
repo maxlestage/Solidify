@@ -26,6 +26,9 @@ impl<'a> Gen<'a> {
         for en in &self.p.enums.clone() {
             self.enum_item(en)?;
         }
+        for u in &self.p.unions.clone() {
+            self.union_item(u)?;
+        }
         for s in &self.p.structs.clone() {
             self.struct_item(s)?;
         }
@@ -56,6 +59,8 @@ impl<'a> Gen<'a> {
             out.push_str("use std::collections::HashSet;\n\n");
         }
         out.push_str(body.trim_start_matches('\n'));
+        let union_impls = self.union_impls()?;
+        out.push_str(&union_impls);
         let impls = self.inspect_impls()?;
         for h in self.helpers.clone() {
             out.push('\n');
@@ -100,7 +105,17 @@ impl<'a> Gen<'a> {
                 out.push_str(&format!(
                     "\nimpl JsInspect for {rust_name} {{\n    fn js_value(&self) -> JsValue {{\n"
                 ));
-                if let Some(en) = self.p.enum_info(&name).cloned() {
+                if let Some(u) = self.p.union_info(&name).cloned() {
+                    out.push_str("        match self {\n");
+                    for m in &u.members {
+                        let inner = self.js_value_of("v", &m.ty);
+                        out.push_str(&format!(
+                            "            {rust_name}::{}(v) => {inner},\n",
+                            m.name
+                        ));
+                    }
+                    out.push_str("        }\n");
+                } else if let Some(en) = self.p.enum_info(&name).cloned() {
                     if en.kind == EnumKind::Numeric {
                         out.push_str("        match self {\n");
                         for v in &en.variants {
@@ -255,6 +270,113 @@ impl<'a> Gen<'a> {
         self.indent -= 1;
         self.line("}");
         Ok(())
+    }
+
+    /// The enum of a union of different types.
+    fn union_item(&mut self, u: &crate::infer::UnionInfo) -> GResult<()> {
+        self.blank();
+        let name = pascal(&u.name);
+        let vis = if u.exported { "pub " } else { "" };
+        for c in u.members.iter().map(|m| m.name.clone()).take(0) {
+            let _ = c;
+        }
+        self.line("#[derive(Debug, Clone, PartialEq)]");
+        self.line(&format!("{vis}enum {name} {{"));
+        self.indent += 1;
+        for m in &u.members {
+            let t = self.rust_ty(&m.ty, u.span)?;
+            self.line(&format!("{}({t}),", m.name));
+        }
+        self.indent -= 1;
+        self.line("}");
+        Ok(())
+    }
+
+    /// Accessors of the fields read on union values, and `js_typeof`.
+    fn union_impls(&mut self) -> GResult<String> {
+        let mut out = String::new();
+        for u in self.p.unions.clone() {
+            let name = pascal(&u.name);
+            let accessors: Vec<(String, bool)> = self
+                .union_accessors
+                .iter()
+                .filter(|(en, _, _)| *en == u.name)
+                .map(|(_, f, m)| (f.clone(), *m))
+                .collect();
+            let typeof_wanted = self.union_typeof.contains(&u.name);
+            if accessors.is_empty() && !typeof_wanted {
+                continue;
+            }
+            out.push_str(&format!("\nimpl {name} {{\n"));
+            let mut first = true;
+            let mut done = std::collections::BTreeSet::new();
+            for (field, mutable) in accessors {
+                for m in [false, mutable] {
+                    if !done.insert((field.clone(), m)) {
+                        continue;
+                    }
+                    if !first {
+                        out.push('\n');
+                    }
+                    first = false;
+                    let fty = u
+                        .members
+                        .first()
+                        .and_then(|member| match self.resolve(&member.ty) {
+                            Ty::Named(n) => self.p.struct_info(&n).and_then(|s| {
+                                s.field(&field).map(|f| {
+                                    if f.optional {
+                                        Ty::Option(Box::new(f.ty.clone()))
+                                    } else {
+                                        f.ty.clone()
+                                    }
+                                })
+                            }),
+                            _ => None,
+                        })
+                        .unwrap_or(Ty::Any);
+                    let t = self.rust_ty(&fty, u.span)?;
+                    let f = snake(&field);
+                    let (suffix, amp, selfp) = if m {
+                        ("_mut", "&mut ", "&mut self")
+                    } else {
+                        ("", "&", "&self")
+                    };
+                    out.push_str(&format!(
+                        "    fn {f}{suffix}({selfp}) -> {amp}{t} {{\n        match self {{\n"
+                    ));
+                    for member in &u.members {
+                        out.push_str(&format!(
+                            "            {name}::{}(v) => {amp}v.{f},\n",
+                            member.name
+                        ));
+                    }
+                    out.push_str("        }\n    }\n");
+                }
+            }
+            if typeof_wanted {
+                if !first {
+                    out.push('\n');
+                }
+                out.push_str("    fn js_typeof(&self) -> &'static str {\n        match self {\n");
+                for member in &u.members {
+                    let word = match self.resolve(&member.ty) {
+                        Ty::Num(_) => "number",
+                        Ty::Str => "string",
+                        Ty::Bool => "boolean",
+                        Ty::Func(_) => "function",
+                        _ => "object",
+                    };
+                    out.push_str(&format!(
+                        "            {name}::{}(_) => \"{word}\",\n",
+                        member.name
+                    ));
+                }
+                out.push_str("        }\n    }\n");
+            }
+            out.push_str("}\n");
+        }
+        Ok(out)
     }
 
     fn struct_item(&mut self, s: &crate::infer::StructInfo) -> GResult<()> {

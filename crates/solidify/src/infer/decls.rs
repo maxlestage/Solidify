@@ -160,7 +160,20 @@ impl<'m> Infer<'m> {
             if let StmtKind::TypeAlias(a) = &s.kind
                 && !self.type_exists(&a.name)
             {
+                let before = self.unions.len();
                 let ty = self.ann(&a.ty, &a.name)?;
+                // A union made for this alias takes its name.
+                if let Ty::Named(n) = &ty
+                    && self.unions.len() > before
+                    && self.unions.last().is_some_and(|u| u.name == *n)
+                {
+                    let u = self.unions.last_mut().expect("union");
+                    u.name = a.name.clone();
+                    u.exported = a.exported;
+                    self.aliases
+                        .insert(a.name.clone(), Ty::Named(a.name.clone()));
+                    continue;
+                }
                 self.aliases.insert(a.name.clone(), ty);
             }
         }
@@ -303,6 +316,17 @@ impl<'m> Infer<'m> {
                         statics.push((f.name.clone(), ty, None));
                         continue;
                     }
+                    let literal = match (&f.ty, &f.init) {
+                        (Some(TypeAnn::Lit(Lit::Str(s), _)), _) => Some(s.clone()),
+                        (
+                            None,
+                            Some(Expr {
+                                kind: ExprKind::Str(s),
+                                ..
+                            }),
+                        ) if f.readonly => Some(s.clone()),
+                        _ => None,
+                    };
                     fields.push(FieldInfo {
                         name: f.name.clone(),
                         ty,
@@ -310,6 +334,7 @@ impl<'m> Infer<'m> {
                         access: f.access,
                         readonly: f.readonly,
                         has_init: f.init.is_some(),
+                        literal,
                         span: f.span,
                     });
                 }
@@ -337,6 +362,7 @@ impl<'m> Infer<'m> {
                                     access: p.access,
                                     readonly: p.readonly,
                                     has_init: true,
+                                    literal: None,
                                     span: *span,
                                 });
                             }

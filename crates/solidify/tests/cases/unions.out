@@ -1,0 +1,10 @@
+circle 3.14
+square 4.00
+rect 6.00
+text of 5 chars number 42 a solo 
+Tom has 9 lives
+R2 charged to 60
+42 OK yes no
+[ 1, 3, 'four' ] number string number
+{ kind: 'square', side: 5 } true 25
+five true false

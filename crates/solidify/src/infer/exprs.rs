@@ -192,10 +192,16 @@ impl<'m> Infer<'m> {
                     Ok(inner)
                 }
                 LogicalOp::Or => {
-                    let lt = self.truthy(left)?;
+                    // `test(x) || rest`: the right side sees what `x` is when the test fails.
+                    let (_, neg) = self.condition(left)?;
+                    let lt = self.expr_ty.get(&left.id).cloned().unwrap_or(Ty::Bool);
                     match self.types.resolve(&lt) {
                         Ty::Bool => {
-                            let rt = self.truthy(right)?;
+                            let before = self.narrows.len();
+                            self.narrows.extend(neg);
+                            let rt = self.truthy(right);
+                            self.narrows.truncate(before);
+                            let rt = rt?;
                             self.expect(&rt, &Ty::Bool, right.span)?;
                             Ok(Ty::Bool)
                         }
@@ -239,14 +245,25 @@ impl<'m> Infer<'m> {
                 self.branch.pop();
                 self.narrows.truncate(before);
                 let ct = ct?;
+                // Both branches may fill a union: each is checked against it.
+                let union_expected = expected_res
+                    .as_ref()
+                    .filter(|t| self.union_of_ty(t).is_some())
+                    .cloned();
+                let alt_expected = union_expected.clone().unwrap_or_else(|| ct.clone());
                 self.narrows.extend(neg);
                 self.branch.push((test.id, 1));
-                let at = self.expr(alt, Some(&ct));
+                let at = self.expr(alt, Some(&alt_expected));
                 self.branch.pop();
                 self.narrows.truncate(before);
                 let at = at?;
                 self.mark_stored(cons);
                 self.mark_stored(alt);
+                if let Some(u) = union_expected {
+                    self.expect(&ct, &u, cons.span)?;
+                    self.expect(&at, &u, alt.span)?;
+                    return Ok(u);
+                }
                 if self.types.unify(&ct, &at).is_err() {
                     return self.err(
                         format!(
@@ -310,10 +327,10 @@ impl<'m> Infer<'m> {
                     other => other,
                 })
             }
-            ExprKind::TypeOf(_) => self.err(
-                "`typeof` is not supported: types are known at compile time",
-                e.span,
-            ),
+            ExprKind::TypeOf(inner) => {
+                self.expr(inner, None)?;
+                Ok(Ty::Str)
+            }
             ExprKind::Void(inner) => {
                 self.expr(inner, None)?;
                 Ok(Ty::Void)
@@ -468,7 +485,10 @@ impl<'m> Infer<'m> {
             BinOp::Eq | BinOp::NotEq | BinOp::StrictEq | BinOp::StrictNotEq => {
                 let lt = self.expr(left, None)?;
                 let rt = self.expr(right, Some(&lt))?;
-                if self.types.unify(&lt, &rt).is_err() {
+                if self.types.unify(&lt, &rt).is_err()
+                    && !self.union_accepts(&lt, &rt)
+                    && !self.union_accepts(&rt, &lt)
+                {
                     let (a, b) = (self.describe(&lt), self.describe(&rt));
                     return self.err(format!("cannot compare {a} with {b}"), span);
                 }
@@ -696,6 +716,15 @@ impl<'m> Infer<'m> {
         };
         let struct_name = match (expected, spread_struct) {
             (Some(Ty::Named(n)), _) if self.struct_by_name(n).is_some() => n.clone(),
+            (Some(Ty::Named(n)), _) if self.union_by_name(n).is_some() => {
+                let u = self.union_by_name(n).expect("union").clone();
+                match self.union_literal_member(&u, props) {
+                    Some(member) => member,
+                    None => {
+                        return self.err(format!("this object matches no member of {n}"), e.span);
+                    }
+                }
+            }
             (_, Some(n)) => n,
             _ => return self.anonymous_object(e, props),
         };
@@ -805,6 +834,7 @@ impl<'m> Infer<'m> {
                 access: None,
                 readonly: false,
                 has_init: false,
+                literal: None,
                 span: p.span,
             });
         }
@@ -984,6 +1014,18 @@ impl<'m> Infer<'m> {
                 let Some(s) = self.struct_by_name(n) else {
                     if self.enum_by_name(n).is_some() {
                         return self.err(format!("enum values have no property `{prop}`"), span);
+                    }
+                    if let Some(u) = self.union_by_name(n) {
+                        return match self.union_field(u, prop) {
+                            Some(t) => Ok(t),
+                            None => self.err(
+                                format!(
+                                    "`{prop}` is not a property of every member of {n}: test which member `{}` is first",
+                                    self.text(obj)
+                                ),
+                                span,
+                            ),
+                        };
                     }
                     return self.err(format!("{n} has no property `{prop}`"), span);
                 };
@@ -1516,6 +1558,15 @@ impl<'m> Infer<'m> {
         match &ot {
             Ty::Named(n) if n != "Error" && !self.is_type_param(n) => {
                 let Some(s) = self.struct_by_name(n) else {
+                    if self.union_by_name(n).is_some() {
+                        return self.err(
+                            format!(
+                                "`{}` is a {n}: test which member it is before calling `{prop}`",
+                                self.text(obj)
+                            ),
+                            obj.span,
+                        );
+                    }
                     return self.err(format!("{n} has no method `{prop}`"), e.span);
                 };
                 if let Some(f) = s.field(prop) {

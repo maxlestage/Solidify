@@ -53,6 +53,12 @@ impl<'m> Infer<'m> {
         for n in narrow_tests.values_mut() {
             n.inner = zonk(&n.inner);
         }
+        let mut unions = self.unions;
+        for u in &mut unions {
+            for m in &mut u.members {
+                m.ty = zonk(&m.ty);
+            }
+        }
         Ok(Program {
             types,
             node_count: self.node_count,
@@ -63,6 +69,7 @@ impl<'m> Infer<'m> {
             fn_bindings: self.fn_bindings,
             structs,
             enums: self.enums,
+            unions,
             calls: self.calls,
             literal_struct: self.literal_struct,
             enum_literal: self.enum_literal,
@@ -164,6 +171,19 @@ impl<'m> Infer<'m> {
             // `obj.m()` where `m` mutates self: `obj` is mutated.
             for (callee, root) in self.method_receivers.clone() {
                 if self.funcs.get(&callee).is_some_and(|f| f.mutates_self)
+                    && let Some(v) = self.vars.get_mut(&root)
+                    && !v.mutated
+                {
+                    v.mutated = true;
+                    if let Some(p) = v.param_of {
+                        self.param_mutated.insert(p);
+                    }
+                    changed = true;
+                }
+            }
+            // A loop variable changed in place changes its collection.
+            for (var, root) in self.loop_sources.clone() {
+                if self.vars.get(&var).is_some_and(|v| v.mutated)
                     && let Some(v) = self.vars.get_mut(&root)
                     && !v.mutated
                 {
@@ -371,7 +391,7 @@ pub(super) fn substitute(t: &Ty, subst: &HashMap<String, Ty>, types: &Types) -> 
 }
 
 /// Whether two resolved types have the same shape (variables match anything).
-pub(super) fn same_shape_ty(a: &Ty, b: &Ty) -> bool {
+pub fn same_shape_ty(a: &Ty, b: &Ty) -> bool {
     match (a, b) {
         (Ty::Var(_), _) | (_, Ty::Var(_)) => true,
         (Ty::Num(_), Ty::Num(_)) => true,
