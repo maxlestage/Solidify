@@ -200,6 +200,13 @@ impl<'m> Infer<'m> {
                 self.push_scope();
                 self.ctx_mut().loop_depth += 1;
                 self.bind_pattern(pat, &item, Role::Loop)?;
+                // `for (const l of this.listeners)`: changing `l` changes `this`.
+                if uses_this(iter) && !self.ctx().in_ctor {
+                    let method = self.ctx().this_fn;
+                    for (_, id) in pat.names() {
+                        self.loop_this_sources.push((id, method));
+                    }
+                }
                 if let Some(root) = self.root_binding(iter) {
                     for (_, id) in pat.names() {
                         self.loop_sources.push((id, root));

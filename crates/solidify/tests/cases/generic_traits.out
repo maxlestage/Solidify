@@ -1,0 +1,7 @@
+4 { name: 'n', value: 3, tag: 'x' }
+4 (1) a+b (2)
+[ 1, 2 ]
+2
+[ 3, 4 ]
+4.0 square
+3.1 circle
