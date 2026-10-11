@@ -97,6 +97,68 @@ impl<'a> Gen<'a> {
                 };
                 self.finish_call(code, &info, e)
             }
+            Callee::OptionalCall => {
+                // `f?.()`: the call when there is a function.
+                let ct = self.ty_of(callee);
+                let Ty::Option(inner) = self.resolve(&ct) else {
+                    return self.err("`?.()` on a value that is never null", callee.span);
+                };
+                let Ty::Func(f) = self.resolve(&inner) else {
+                    return self.err("not a function", callee.span);
+                };
+                let c = self.expr(callee)?;
+                let source = self.option_source(&c);
+                let mut list = Vec::new();
+                for (a, pt) in args.iter().zip(&f.params) {
+                    list.push(self.expr_to(&a.expr, pt)?);
+                }
+                let list = list.join(", ");
+                if matches!(self.resolve(&f.ret), Ty::Void) {
+                    Ok(E::owned(
+                        format!("if let Some(f) = {source} {{ f({list}) }}"),
+                        PREC_ATOM,
+                    ))
+                } else {
+                    Ok(E::owned(
+                        format!("{source}.map(|f| f({list}))"),
+                        PREC_POSTFIX,
+                    ))
+                }
+            }
+            Callee::OptionalMethod { name, fn_id, .. } => {
+                // `obj?.m(…)`: the call when there is an object.
+                let info = self.p.funcs[&fn_id].clone();
+                if info.throws {
+                    return self.err(
+                        format!("`{name}` may fail: test the object first, then call it"),
+                        e.span,
+                    );
+                }
+                let list = self.user_args(&info, args, e.span)?;
+                let method = snake(&name);
+                let ExprKind::Member { obj, .. } = &callee.kind else {
+                    unreachable!()
+                };
+                let source = if info.mutates_self {
+                    let o = self.expr_mut_root(obj)?;
+                    format!("{}.as_mut()", Self::paren(&o, PREC_POSTFIX))
+                } else {
+                    let o = self.expr(obj)?;
+                    self.option_source(&o)
+                };
+                let call = format!(
+                    "o.{method}({list}){}",
+                    if info.is_async { ".await" } else { "" }
+                );
+                if matches!(self.resolve(&info.sig.ret), Ty::Void) {
+                    Ok(E::owned(
+                        format!("if let Some(o) = {source} {{ {call} }}"),
+                        PREC_ATOM,
+                    ))
+                } else {
+                    Ok(E::owned(format!("{source}.map(|o| {call})"), PREC_POSTFIX))
+                }
+            }
             Callee::Ctor(_) => unreachable!("constructors go through new"),
             Callee::SuperCtor(_) => self.err(
                 "`super(…)` must be the first statement of the constructor",
@@ -439,6 +501,37 @@ impl<'a> Gen<'a> {
                     }
                     None => Ok(E::atom(format!("{name}::new()"), Repr::Owned)),
                 }
+            }
+            Some(Callee::Builtin("new Date")) => {
+                let d = self.helper(Helper::Date);
+                let code = match args.len() {
+                    0 => format!("{d}::now()"),
+                    1 => {
+                        let at = self.ty_of(&args[0].expr);
+                        match self.resolve(&at) {
+                            Ty::Str => {
+                                let s = self.expr_as(&args[0].expr, Want::StrRef)?;
+                                format!("{d}::parse({s})")
+                            }
+                            Ty::Named(_) => self.expr_as(&args[0].expr, Want::Owned)?,
+                            _ => {
+                                let n = self.expr_as(&args[0].expr, Want::Owned)?;
+                                format!("{d}::from_ms({n})")
+                            }
+                        }
+                    }
+                    _ => {
+                        let mut parts = Vec::new();
+                        for a in args {
+                            parts.push(self.expr_as(&a.expr, Want::Owned)?);
+                        }
+                        while parts.len() < 7 {
+                            parts.push(if parts.len() == 2 { "1" } else { "0" }.to_string());
+                        }
+                        format!("{d}::from_parts({})", parts.join(", "))
+                    }
+                };
+                Ok(E::owned(code, PREC_POSTFIX))
             }
             Some(Callee::Builtin("new Array")) => match args.first() {
                 Some(a) => {
@@ -1123,6 +1216,10 @@ impl<'a> Gen<'a> {
             "boolean" | "error" => {
                 let x = self.expr_as(obj, Want::Display)?;
                 Ok(E::owned(format!("{x}.to_string()"), PREC_POSTFIX))
+            }
+            "date" => {
+                let r = self.recv(obj)?;
+                Ok(E::owned(format!("{r}.{}()", snake(method)), PREC_POSTFIX))
             }
             "regex" => {
                 let r = self.recv(obj)?;

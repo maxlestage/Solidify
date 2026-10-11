@@ -296,6 +296,14 @@ pub enum Callee {
     },
     /// Any other callee of function type.
     Dynamic,
+    /// `f?.()`: a call when `f` is not null.
+    OptionalCall,
+    /// `obj?.m(…)`: a method call when `obj` is not null.
+    OptionalMethod {
+        class: String,
+        name: String,
+        fn_id: NodeId,
+    },
 }
 
 /// Where a nullable value is tested, what it binds.
@@ -472,7 +480,8 @@ impl Program {
 
     /// Whether values of the type copy freely in Rust.
     pub fn is_copy(&self, ty: &Ty) -> bool {
-        self.types.is_copy(ty, &|name| self.is_enum(name))
+        self.types
+            .is_copy(ty, &|name| self.is_enum(name) || name == "Date")
     }
 }
 

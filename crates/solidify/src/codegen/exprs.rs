@@ -506,6 +506,18 @@ impl<'a> Gen<'a> {
 
     /// `undefined` for the methods that give it, `null` otherwise.
     fn missing_word(&self, x: &Expr) -> &'static str {
+        // `a?.b`, `f?.()`: `undefined` when the chain stops.
+        if matches!(
+            x.kind,
+            ExprKind::Member { optional: true, .. }
+                | ExprKind::Index { optional: true, .. }
+                | ExprKind::Call { optional: true, .. }
+        ) || matches!(
+            self.p.calls.get(&x.id),
+            Some(Callee::OptionalCall | Callee::OptionalMethod { .. })
+        ) {
+            return "undefined";
+        }
         match self.p.calls.get(&x.id) {
             Some(Callee::Builtin(n))
                 if matches!(
@@ -914,6 +926,19 @@ impl<'a> Gen<'a> {
     fn binary(&mut self, op: BinOp, left: &'a Expr, right: &'a Expr, e: &'a Expr) -> GResult<E> {
         let ty = self.ty_of(e);
         let (lt, rt) = (self.ty_of(left), self.ty_of(right));
+        // `later - earlier` on dates: milliseconds.
+        if op == BinOp::Sub && matches!(self.resolve(&lt), Ty::Named(ref n) if n == "Date") {
+            let l = self.expr(left)?;
+            let r = self.expr(right)?;
+            return Ok(E::owned(
+                format!(
+                    "{}.get_time() - {}.get_time()",
+                    Self::paren(&l, PREC_POSTFIX),
+                    Self::paren(&r, PREC_POSTFIX)
+                ),
+                PREC_ADD,
+            ));
+        }
         // String concatenation.
         if op == BinOp::Add && self.is_str(&ty) {
             let mut parts = Vec::new();
@@ -1739,17 +1764,23 @@ impl<'a> Gen<'a> {
     }
 
     /// `a?.b`: `a.as_ref().map(|a| a.b.clone())`.
-    fn optional_member(&mut self, obj: &'a Expr, prop: &str, ot: &Ty, ty: &Ty) -> GResult<E> {
-        let o = self.expr(obj)?;
-        let is_param_ref = self.opt_ref_param(&o);
-        let source = match o.repr {
+    /// An `Option` value as `map` and `if let` can read it: moved when it can be, borrowed
+    /// with `as_ref()` otherwise.
+    pub(super) fn option_source(&self, o: &E) -> String {
+        let is_param_ref = self.opt_ref_param(o);
+        match o.repr {
             Repr::OptRef => o.code.clone(),
-            Repr::Owned if is_param_ref || self.can_move(&o) => o.code.clone(),
+            Repr::Owned if is_param_ref || self.can_move(o) => o.code.clone(),
             Repr::Owned | Repr::Place | Repr::Ref | Repr::RefMut => {
-                format!("{}.as_ref()", Self::paren(&o, PREC_POSTFIX))
+                format!("{}.as_ref()", Self::paren(o, PREC_POSTFIX))
             }
             _ => o.code.clone(),
-        };
+        }
+    }
+
+    fn optional_member(&mut self, obj: &'a Expr, prop: &str, ot: &Ty, ty: &Ty) -> GResult<E> {
+        let o = self.expr(obj)?;
+        let source = self.option_source(&o);
         let Ty::Option(inner) = self.resolve(ot) else {
             return self.err("`?.` on a value that is never null", obj.span);
         };

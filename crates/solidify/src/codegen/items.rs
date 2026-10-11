@@ -196,6 +196,11 @@ impl<'a> Gen<'a> {
                 "\nimpl<T: JsInspect + std::hash::Hash + Eq + Clone> JsInspect for JsSet<T> {\n    fn js_value(&self) -> JsValue {\n        JsValue::Set(self.iter().map(JsInspect::js_value).collect())\n    }\n}\n",
             );
         }
+        if self.helpers.contains(&Helper::Date) {
+            out.push_str(
+                "\nimpl JsInspect for JsDate {\n    fn js_value(&self) -> JsValue {\n        JsValue::Date(self.to_iso_string(), self.to_string())\n    }\n}\n",
+            );
+        }
         if self.helpers.contains(&Helper::Regex) {
             out.push_str(
                 "\nimpl JsInspect for JsRegex {\n    fn js_value(&self) -> JsValue {\n        JsValue::Raw(self.to_string())\n    }\n}\n\nimpl JsInspect for JsMatch {\n    fn js_value(&self) -> JsValue {\n        JsValue::Array(self.groups.iter().map(|g| g.as_ref().map_or(JsValue::Undefined, |s| JsValue::Str(s.clone()))).collect())\n    }\n}\n",
@@ -672,8 +677,14 @@ impl<'a> Gen<'a> {
         self.blank();
         let name = pascal(&s.name);
         let vis = self.vis(s.exported || s.kind == StructKind::Synth);
-        // A `dyn` value cannot be compared.
-        if s.fields.iter().any(|f| self.contains_dyn(&f.ty)) {
+        // A `dyn` value cannot be compared; a function cannot be shown or compared.
+        let has_fn = s
+            .fields
+            .iter()
+            .any(|f| matches!(self.resolve(&f.ty), Ty::Func(_)));
+        if has_fn {
+            self.line("#[derive(Clone)]");
+        } else if s.fields.iter().any(|f| self.contains_dyn(&f.ty)) {
             self.line("#[derive(Debug, Clone)]");
         } else {
             self.line("#[derive(Debug, Clone, PartialEq)]");
@@ -695,6 +706,35 @@ impl<'a> Gen<'a> {
         }
         self.indent -= 1;
         self.line("}");
+        if has_fn {
+            // `Debug` by hand: the functions are shown as such.
+            self.blank();
+            self.line(&format!("impl std::fmt::Debug for {name} {{"));
+            self.indent += 1;
+            self.line("fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {");
+            self.indent += 1;
+            self.line(&format!("f.debug_struct({})", string_literal(&name)));
+            self.indent += 1;
+            for f in &s.fields {
+                let fname = snake(&f.name);
+                if matches!(self.resolve(&f.ty), Ty::Func(_)) {
+                    self.line(&format!(
+                        ".field({}, &\"[Function]\")",
+                        string_literal(&fname)
+                    ));
+                } else {
+                    self.line(&format!(
+                        ".field({}, &self.{fname})",
+                        string_literal(&fname)
+                    ));
+                }
+            }
+            self.line(".finish()");
+            self.indent -= 2;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+        }
         if s.kind != StructKind::Class {
             return Ok(());
         }

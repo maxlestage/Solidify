@@ -1,0 +1,10 @@
+const epoch = new Date(0);
+const launch = new Date("2024-06-01T12:30:00.250Z");
+const day = new Date(2024, 5, 1);
+console.log(epoch.getFullYear(), epoch.toISOString(), launch.getMonth(), launch.getDate(), launch.getDay(), launch.getHours(), launch.getMinutes(), launch.getSeconds(), launch.getMilliseconds());
+console.log(day.toISOString(), day.getTime(), new Date(1_700_000_000_000).toISOString(), new Date("2000-02-29").getDay());
+console.log(launch > day, launch - day, (launch.getTime() - day.getTime()) / 60000);
+console.log(launch, `${epoch}`, String(day), JSON.stringify({ when: launch }));
+console.log(epoch.toUTCString(), day.toDateString(), new Date(2024, 13, 1).toISOString());
+const later = new Date(launch.getTime() + 86_400_000);
+console.log(later.toISOString(), later.valueOf() > launch.valueOf(), Date.now() > 0);

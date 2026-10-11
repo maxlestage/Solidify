@@ -826,6 +826,7 @@ impl<'a> Gen<'a> {
             Helper::Promise => "JsPromise",
             Helper::Regex => "JsRegex",
             Helper::Json => "js_json_stringify",
+            Helper::Date => "JsDate",
         }
     }
 
@@ -928,6 +929,7 @@ impl<'a> Gen<'a> {
                     && n != "RegExp"
                     && !self.is_type_param(&n)
                     && (n == "RegExpMatch"
+                        || n == "Date"
                         || self.p.struct_info(&n).is_some()
                         || self.p.union_info(&n).is_some())
             }
@@ -1030,8 +1032,11 @@ impl<'a> Gen<'a> {
             Ty::Func(_) => self.err("a function cannot be read from JSON", span),
             Ty::Gen(_) => self.err("a generator cannot be read from JSON", span),
             Ty::Named(n) => {
-                if n == "Error" || n == "RegExp" || n == "RegExpMatch" {
-                    return self.err(format!("a `{n}` cannot be read from JSON"), span);
+                if n == "Error" || n == "RegExp" || n == "RegExpMatch" || n == "Date" {
+                    return self.err(
+                        format!("a `{n}` cannot be read from JSON: read a string and parse it"),
+                        span,
+                    );
                 }
                 if self.is_type_param(&n) {
                     return self.err(
@@ -1295,6 +1300,8 @@ impl<'a> Gen<'a> {
                 } else if n == "RegExpMatch" {
                     self.helper(Helper::Regex);
                     "JsMatch".into()
+                } else if n == "Date" {
+                    self.helper(Helper::Date).into()
                 } else if self.is_type_param(&n) {
                     n
                 } else if self.p.is_dyn(&n) {
@@ -1314,7 +1321,8 @@ impl<'a> Gen<'a> {
                 } else {
                     format!(" -> {ret}")
                 };
-                format!("Box<dyn Fn({}){ret}>", params.join(", "))
+                self.uses_rc = true;
+                format!("Rc<dyn Fn({}){ret}>", params.join(", "))
             }
             Ty::Any => return self.err("`any` cannot be translated: give this value a type", span),
         })
@@ -1700,7 +1708,28 @@ impl<'a> Gen<'a> {
         if matches!(from_r, Ty::Null) {
             return "None".into();
         }
+        // A function kept in a field or a collection is shared: behind an `Rc`.
+        let fresh_fn = e.code.starts_with('|')
+            || e.code.starts_with("move |")
+            || e.var.is_some_and(|(b, _)| {
+                let v = self.p.var(b);
+                v.role == Role::Func || v.closure_fn.is_some()
+            });
+        let stored_fn = match &to_r {
+            Ty::Option(inner) => matches!(self.resolve(inner), Ty::Func(_)),
+            other => matches!(other, Ty::Func(_)),
+        };
         let mut code = self.owned(e, &from_r);
+        if stored_fn && fresh_fn {
+            self.uses_rc = true;
+            code = format!("Rc::new({code})");
+            if let Ty::Option(inner) = &to_r
+                && !matches!(from_r, Ty::Option(_))
+            {
+                let t = self.rust_ty(inner, Span::default()).unwrap_or_default();
+                return format!("Some({code} as {t})");
+            }
+        }
         // A member of a union goes into its variant.
         let target = match &to_r {
             Ty::Option(inner) if !matches!(from_r, Ty::Option(_)) => self.resolve(inner),

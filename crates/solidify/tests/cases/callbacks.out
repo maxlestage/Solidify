@@ -1,0 +1,10 @@
+inc 6
+double 10
+11 [ 2, 2 ]
+clicked
+ok { name: 'double', apply: [Function: apply] }
+Paris - hi none
+-1 Paris,?
+Rex speaks
+Max Max speaks
+silent undefined

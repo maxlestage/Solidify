@@ -83,6 +83,7 @@ fn js_json_write(v: &JsValue, indent: &str, depth: usize, out: &mut String) -> b
             out.push('}');
         }
         JsValue::Map(_) | JsValue::Set(_) | JsValue::Raw(_) => out.push_str("{}"),
+        JsValue::Date(iso, _) => js_json_quote(iso, out),
     }
     true
 }

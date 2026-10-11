@@ -50,7 +50,7 @@ fn main() {
     }
     println!("{} {}", sum(root.as_deref()), depth(root.as_deref()));
     let found = find(root.as_deref(), 4);
-    println!("{} {}", found.map(|v| v.value).as_ref().map_or("null".to_string(), |v| v.to_string()), find(root.as_deref(), 7).as_ref().map(|v| v.value).unwrap_or(-1));
+    println!("{} {}", found.map(|v| v.value).as_ref().map_or("undefined".to_string(), |v| v.to_string()), find(root.as_deref(), 7).as_ref().map(|v| v.value).unwrap_or(-1));
     let name: Option<String> = None;
     println!("{} {}", name.clone().unwrap_or("anonymous".to_string()), name.map(|v| v.chars().count() as i64).unwrap_or(0));
 }

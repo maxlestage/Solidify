@@ -59,6 +59,12 @@ pub const EXAMPLES: &[Example] = &[
     case!("generators", "Generators", "Générateurs"),
     case!("regex", "Regular expressions", "Expressions régulières"),
     case!("json", "JSON", "JSON"),
+    case!("dates", "Dates", "Dates"),
+    case!(
+        "callbacks",
+        "Callbacks & optional calls",
+        "Callbacks et appels optionnels"
+    ),
     case!("timers", "Timers & promises", "Minuteurs et promesses"),
     case!("printing", "console.log", "console.log"),
     case!("parsing", "Numbers & any", "Nombres et any"),
