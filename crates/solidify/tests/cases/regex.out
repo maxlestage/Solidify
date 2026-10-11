@@ -13,3 +13,9 @@ Hello World a b c
 3 miSiSippi hi
 price: 84 EUR AAA
 true 1 true /c.t/g
+a1 a 1 0 2
+b2 b 2 3 5
+c3 c 3 6 8
+0
+true 6 false 0
+found 2 at 3

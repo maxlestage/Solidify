@@ -640,6 +640,7 @@ impl<'m> Infer<'m> {
                 }
                 StmtKind::Var(v) if top => {
                     for d in &v.decls {
+                        self.check_redeclaration(v.kind, &d.pat)?;
                         if !matches!(d.pat, Pattern::Ident { .. }) {
                             // Destructured at the top level: bound when reached.
                             continue;

@@ -226,8 +226,8 @@ static EN: Dict = Dict {
                 "an event loop run by main, JsPromise",
             ),
             (
-                "/regex/, test, exec, match, replace, split",
-                "JsRegex, a backtracking engine shipped in the file",
+                "/regex/, test, exec, match, replace, split, lastIndex",
+                "JsRegex, a backtracking engine shipped in the file, while let Some(m) = re.exec(&s)",
             ),
             (
                 "JSON.stringify, JSON.parse",
@@ -402,8 +402,8 @@ static FR: Dict = Dict {
                 "une boucle d'événements lancée par main, JsPromise",
             ),
             (
-                "/regex/, test, exec, match, replace, split",
-                "JsRegex, un moteur à retour arrière livré dans le fichier",
+                "/regex/, test, exec, match, replace, split, lastIndex",
+                "JsRegex, un moteur à retour arrière livré dans le fichier, while let Some(m) = re.exec(&s)",
             ),
             (
                 "JSON.stringify, JSON.parse",

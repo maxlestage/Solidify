@@ -39,6 +39,7 @@ impl<'m> Infer<'m> {
             }
         }
         let boxed = self.boxed_structs();
+        let drop_decl = self.assign_narrowed_decls()?;
         self.generalize()?;
         self.check_locals()?;
         let last_use = self.last_uses();
@@ -92,6 +93,7 @@ impl<'m> Infer<'m> {
             enum_literal: self.enum_literal,
             narrow_tests,
             narrowed_uses: self.narrowed_uses,
+            drop_decl,
             last_use,
             calls_in_try: self.calls_in_try,
             try_returns: self.try_returns,
@@ -199,6 +201,34 @@ impl<'m> Infer<'m> {
             }
             _ => {}
         }
+    }
+
+    /// `(m = re.exec(s)) !== null` binds the value in the test: `m` needs no declaration
+    /// when every read of it is inside such a test.
+    fn assign_narrowed_decls(&self) -> IResult<HashSet<NodeId>> {
+        let mut out = HashSet::new();
+        for (binding, targets) in &self.assign_narrowed {
+            let outside = self
+                .uses
+                .get(binding)
+                .into_iter()
+                .flatten()
+                .find(|(use_id, ..)| {
+                    !targets.contains(use_id) && !self.narrowed_uses.contains_key(use_id)
+                });
+            if outside.is_some() {
+                let v = &self.vars[binding];
+                return self.err(
+                    format!(
+                        "`{}` is assigned inside a condition and read elsewhere: assign it on its own line",
+                        v.name
+                    ),
+                    v.span,
+                );
+            }
+            out.insert(*binding);
+        }
+        Ok(out)
     }
 
     /// A function throws if it throws itself or calls, outside a `try`, one that does.
