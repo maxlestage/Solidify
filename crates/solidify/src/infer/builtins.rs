@@ -78,6 +78,17 @@ impl<'m> Infer<'m> {
         let full = format!("{ns}.{prop}");
         let span = e.span;
         match (ns, prop) {
+            // `Symbol.for("key")`: one symbol per key, `Symbol.keyFor(s)`: its key.
+            ("Symbol", "for") => {
+                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::named("Symbol"))
+            }
+            ("Symbol", "keyFor") => {
+                self.arg_typed(args, 0, Some(Ty::named("Symbol")), &full, span)?;
+                self.no_more_than(args, 1, &full, span)?;
+                self.done(e, full, Ty::Option(Box::new(Ty::Str)))
+            }
             ("console", "log" | "error" | "warn" | "info" | "debug") => {
                 for a in args {
                     if a.spread {
@@ -230,10 +241,13 @@ impl<'m> Infer<'m> {
                     Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => *t,
                     Ty::Str => Ty::Str,
                     Ty::Map(k, v, _) => Ty::Tuple(vec![*k, *v]),
-                    other => {
-                        let d = self.describe(&other);
-                        return self.err(format!("`Array.from` cannot read {d}"), span);
-                    }
+                    other => match self.struct_iteration(&other) {
+                        Some(t) => t,
+                        None => {
+                            let d = self.describe(&other);
+                            return self.err(format!("`Array.from` cannot read {d}"), span);
+                        }
+                    },
                 };
                 if args.len() > 1 {
                     let u = self.types.fresh();
@@ -465,6 +479,14 @@ impl<'m> Infer<'m> {
                 format!("a match has no method `{prop}`: its groups are `m[i]`"),
                 span,
             ),
+            Ty::Named(n, ..) if n == "Symbol" => {
+                let full = format!("symbol.{prop}");
+                self.no_more_than(args, 0, &full, span)?;
+                match prop {
+                    "toString" => self.done(e, full, Ty::Str),
+                    _ => self.err(format!("a symbol has no method `{prop}`"), span),
+                }
+            }
             Ty::Named(n, ..) if n == "Date" => {
                 let full = format!("date.{prop}");
                 self.no_more_than(args, 0, &full, span)?;
