@@ -54,6 +54,8 @@ pub enum Helper {
     Date,
     /// `JsSymbol`: `Symbol(…)`, `Symbol.for(…)`.
     Symbol,
+    /// Values known only at run time: JavaScript's operators on `JsValue`.
+    Dynamic,
 }
 
 /// The regular expression engine, compiled into Solidify too: patterns are checked when
@@ -370,6 +372,7 @@ fn js_num_to_string(mut n: i64, radix: i64) -> String {
             Helper::Json => include_str!("runtime/json.rs"),
             Helper::Date => include_str!("runtime/date.rs"),
             Helper::Symbol => include_str!("runtime/symbol.rs"),
+            Helper::Dynamic => include_str!("runtime/dynamic.rs"),
             Helper::BlockOn => {
                 r#"/// Runs a future to completion, running the timers it waits on.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
