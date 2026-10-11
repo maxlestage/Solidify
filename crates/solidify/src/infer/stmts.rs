@@ -67,7 +67,7 @@ impl<'m> Infer<'m> {
                     Some(e) => {
                         let t = self.expr(e, Some(&ret))?;
                         self.mark_stored(e);
-                        self.expect_flow(&t, &ret, e.span)?;
+                        self.expect_flow(&t, &ret, e)?;
                         self.ctx_mut().has_return_value = true;
                     }
                     None => self.expect(&Ty::Void, &ret, s.span)?,
@@ -173,6 +173,7 @@ impl<'m> Infer<'m> {
                     match &it {
                         Ty::Map(k, _, _) => (**k).clone(),
                         Ty::Array(_) => self.types.int(),
+                        d if d.is_dynamic() => Ty::Str,
                         other => {
                             let d = self.describe(other);
                             return self.err(
@@ -185,6 +186,7 @@ impl<'m> Infer<'m> {
                     match &it {
                         Ty::Array(t) | Ty::Set(t) | Ty::Gen(t) => (**t).clone(),
                         Ty::Str => Ty::Str,
+                        d if d.is_dynamic() => Ty::dynamic(),
                         Ty::Map(k, v, _) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
                         Ty::Var(_) => {
                             let t = self.types.fresh();
@@ -362,7 +364,7 @@ impl<'m> Infer<'m> {
             let ty = match (&d.init, &declared) {
                 (Some(init), Some(t)) => {
                     let it = self.expr(init, Some(t))?;
-                    self.expect(&it, t, init.span)?;
+                    self.expect_flow(&it, t, init)?;
                     t.clone()
                 }
                 (Some(init), None) => self.expr(init, None)?,
@@ -547,7 +549,7 @@ impl<'m> Infer<'m> {
                 } else {
                     let t = self.expr(e, Some(&ret))?;
                     self.mark_stored(e);
-                    self.expect_flow(&t, &ret, e.span)?;
+                    self.expect_flow(&t, &ret, e)?;
                 }
             }
         }
@@ -946,6 +948,7 @@ impl<'m> Infer<'m> {
         let t = self.expr(e, None)?;
         match self.types.resolve(&t) {
             Ty::Bool | Ty::Num(_) | Ty::Str | Ty::Option(_) | Ty::Array(_) | Ty::Any => Ok(t),
+            d if d.is_dynamic() => Ok(t),
             Ty::Var(_) => {
                 self.unify(&t, &Ty::Bool, e.span)?;
                 Ok(t)

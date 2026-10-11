@@ -207,6 +207,9 @@ impl<'a> Gen<'a> {
                     return self.global_call(e, name, args);
                 }
                 let receiver_kind = name.split('.').next().unwrap_or("");
+                if let Some(method) = name.strip_prefix("dyn.") {
+                    return self.dyn_method(obj, method, args);
+                }
                 match receiver_kind {
                     "console" | "Math" | "Number" | "String" | "Object" | "Array" | "Date"
                     | "Symbol" | "performance" | "process" | "Promise" | "JSON" => {
@@ -957,6 +960,26 @@ impl<'a> Gen<'a> {
                     PREC_POSTFIX,
                 )
             }
+            "Object.keys.dyn" | "Object.values.dyn" | "Object.entries.dyn" => {
+                let v = self.dyn_ref(&args[0].expr)?;
+                let code = match name {
+                    "Object.keys.dyn" => format!("js_keys({v})"),
+                    "Object.values.dyn" => format!("js_values({v})"),
+                    _ => format!("js_entries({v})"),
+                };
+                E::owned(code, PREC_POSTFIX)
+            }
+            "Array.isArray" => {
+                let at = self.ty_of(&args[0].expr);
+                if self.is_dynamic(&at) {
+                    let v = self.dyn_ref(&args[0].expr)?;
+                    E::owned(format!("matches!({v}, JsValue::Array(_))"), PREC_POSTFIX)
+                } else {
+                    self.expr(&args[0].expr)?;
+                    let is = matches!(self.resolve(&at), Ty::Array(_) | Ty::Tuple(_));
+                    E::atom(if is { "true" } else { "false" }, Repr::Owned)
+                }
+            }
             "Object.keys" => {
                 let m = self.recv(&args[0].expr)?;
                 E::owned(
@@ -1057,6 +1080,12 @@ impl<'a> Gen<'a> {
             "JSON.stringify" => {
                 let value = self.json_value_of(&args[0].expr)?;
                 let h = self.helper(Helper::Json);
+                let replacer = match args.get(1) {
+                    Some(a) if !matches!(a.expr.kind, ExprKind::Null | ExprKind::Undefined) => {
+                        Some(&a.expr)
+                    }
+                    _ => None,
+                };
                 let indent = match args.get(2) {
                     None => "\"\"".to_string(),
                     Some(a) => {
@@ -1071,7 +1100,50 @@ impl<'a> Gen<'a> {
                         }
                     }
                 };
-                E::owned(format!("{h}(&{value}, {indent})"), PREC_POSTFIX)
+                match replacer {
+                    // The keys to keep.
+                    Some(r) if matches!(self.resolve(&self.ty_of(r)), Ty::Array(_)) => {
+                        self.helper(Helper::Dynamic);
+                        let keys = self.expr_as(r, Want::Owned)?;
+                        E::owned(
+                            format!(
+                                "js_json_stringify_keys(&{value}, &{}.iter().map(|k| k.as_ref()).collect::<Vec<&str>>(), {indent})",
+                                paren_num(&keys)
+                            ),
+                            PREC_POSTFIX,
+                        )
+                    }
+                    Some(r) => {
+                        self.helper(Helper::Dynamic);
+                        let f = self.callback_code(r)?;
+                        E::owned(
+                            format!(
+                                "{{ let f = {f}; js_json_stringify_with(&{value}, &|k: &str, v: JsValue| f(k.to_string(), v), {indent}) }}"
+                            ),
+                            PREC_ATOM,
+                        )
+                    }
+                    None => E::owned(format!("{h}(&{value}, {indent})"), PREC_POSTFIX),
+                }
+            }
+            "JSON.parse" if self.is_dynamic(&self.ty_of(e)) => {
+                self.helper(Helper::Dynamic);
+                let text = self.expr_as(&args[0].expr, Want::StrRef)?;
+                let mut code = match args.get(1) {
+                    Some(r) => {
+                        let f = self.callback_code(&r.expr)?;
+                        format!(
+                            "{{ let f = {f}; js_json_parse_with({text}, &|k: &str, v: JsValue| f(k.to_string(), v)) }}"
+                        )
+                    }
+                    None => format!("js_json_parse_value({text})"),
+                };
+                if self.fn_ctx().returns_result || !self.fn_ctx().try_ctx.is_empty() {
+                    code.push('?');
+                } else {
+                    code.push_str(".unwrap()");
+                }
+                E::owned(code, PREC_POSTFIX)
             }
             "JSON.parse" => {
                 let ty = self.ty_of(e);
@@ -1116,7 +1188,7 @@ impl<'a> Gen<'a> {
     }
 
     /// The `JsValue` of an expression, for `JSON.stringify`.
-    fn json_value_of(&mut self, e: &'a Expr) -> GResult<String> {
+    pub(super) fn json_value_of(&mut self, e: &'a Expr) -> GResult<String> {
         let ty = self.ty_of(e);
         Ok(match self.resolve(&ty) {
             Ty::Num(_) if self.is_float(&ty) => {
