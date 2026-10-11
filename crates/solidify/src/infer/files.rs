@@ -5,6 +5,8 @@
 use std::collections::{HashMap, HashSet};
 
 use super::{IResult, Infer, Role};
+#[allow(unused_imports)]
+use crate::ast::NodeId;
 use crate::ast::*;
 use crate::error::Span;
 use crate::types::Ty;
@@ -227,6 +229,25 @@ impl<'m> Infer<'m> {
                 span,
             ),
         }
+    }
+
+    /// The class or enum an expression names: `C`, or `ns.C` through a namespace import,
+    /// with its binding.
+    pub(super) fn type_ref(&self, obj: &Expr) -> Option<(String, NodeId)> {
+        let name = match &obj.kind {
+            ExprKind::Ident(n) => n.clone(),
+            ExprKind::Member { obj: ns, prop, .. } => {
+                let file = self.namespace_of(ns)?;
+                self.exports.get(file)?.get(prop)?.clone()
+            }
+            _ => return None,
+        };
+        let id = self.lookup(&name)?;
+        let v = self.vars.get(&id)?;
+        if !matches!(v.role, Role::Class | Role::Enum) {
+            return None;
+        }
+        Some((v.name.clone(), id))
     }
 
     /// The names every file exports (for messages).

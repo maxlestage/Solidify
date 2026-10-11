@@ -775,9 +775,20 @@ impl<'m> Infer<'m> {
         value: &'m Expr,
         class: &Expr,
     ) -> IResult<Option<(String, String)>> {
-        let ExprKind::Ident(sub) = &class.kind else {
-            return Ok(None);
+        // The class may be imported under another name, or through a namespace.
+        let sub = match self.type_ref(class) {
+            Some((canonical, id)) if self.vars[&id].role == Role::Class => {
+                if let ExprKind::Member { obj: ns, .. } = &class.kind {
+                    self.set_ty(ns.id, Ty::Void);
+                }
+                canonical
+            }
+            _ => match &class.kind {
+                ExprKind::Ident(s) => s.clone(),
+                _ => return Ok(None),
+            },
         };
+        let sub = &sub;
         if self
             .struct_by_name(sub)
             .is_none_or(|s| s.kind != StructKind::Class)

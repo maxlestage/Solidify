@@ -3,6 +3,23 @@ use std::sync::{LazyLock, Mutex};
 mod geometry {
     use super::*;
 
+    pub static ORIGIN: LazyLock<Point> = LazyLock::new(|| Point { x: 0.0, y: 0.0 });
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    pub enum Shade {
+        Light,
+        Dark,
+    }
+
+    impl std::fmt::Display for Shade {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(match self {
+                Shade::Light => "light",
+                Shade::Dark => "dark",
+            })
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub struct Point {
         pub x: f64,
@@ -18,6 +35,14 @@ mod geometry {
     impl Circle {
         pub fn new(center: Point, radius: f64) -> Self {
             Self { center, radius }
+        }
+
+        pub fn unit() -> Circle {
+            Circle::new((*ORIGIN).clone(), 1.0)
+        }
+
+        pub fn shade(&self) -> Shade {
+            if self.radius > 5.0 { Shade::Dark } else { Shade::Light }
         }
 
         pub fn area(&self) -> f64 {
@@ -84,18 +109,21 @@ mod strings {
 pub use strings::*;
 
 fn main() {
-    let origin = Point { x: 0.0, y: 0.0 };
     println!("geometry loaded");
     println!("strings loaded");
-    let unit = Circle::new(origin.clone(), 1.0);
+    let unit = Circle::new((*ORIGIN).clone(), 1.0);
     let p = Point { x: 3.0, y: 4.0 };
     println!("{}", describe(&unit));
-    println!("{} {} {}", distance(&origin, &p), unit.contains(&p), unit.contains(&Point { x: 0.5, y: 0.5 }));
+    println!("{} {} {}", distance(&(*ORIGIN), &p), unit.contains(&p), unit.contains(&Point { x: 0.5, y: 0.5 }));
     println!("{} {SEPARATOR} {}", shout("hello"), repeat("ab", 3));
     println!("{} {} {}", shout("again"), counted("a"), counted("b"));
     let big = Circle::new(Point { x: 1.0, y: 1.0 }, 10.0);
     println!("{} {}", format!("{:.3}", unit.area()), format!("{:.1}", big.area()));
     println!("{}", js_inspect(&unit.js_value()));
+    let c2 = Circle::new((*ORIGIN).clone(), 2.0);
+    println!("{} {}", format!("{:.2}", c2.area()), format!("{:.3}", (distance(&(*ORIGIN), &Point { x: 1.0, y: 1.0 }))));
+    println!("{} {} {} {}", Circle::unit().radius, c2.shade(), big.shade() == Shade::Dark, Shade::Light);
+    println!("{} {}", true, true);
 }
 
 /// A value as JavaScript sees it, for `console.log`, `String(…)` and `JSON.stringify`.
