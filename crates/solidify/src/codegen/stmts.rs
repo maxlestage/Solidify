@@ -454,13 +454,13 @@ impl<'a> Gen<'a> {
                         }
                     }
                 }
-                Pattern::Object { props, span, .. } => {
+                Pattern::Object { props, span, rest } => {
                     let Some(init) = &d.init else {
                         return self.err("destructuring needs a value", *span);
                     };
                     let base = self.temp_binding(init, "obj")?;
                     let it = self.ty_of(init);
-                    self.destructure_object(props, &base, &it)?;
+                    self.destructure_object_rest(props, rest, &base, &it)?;
                 }
             }
         }
@@ -468,12 +468,51 @@ impl<'a> Gen<'a> {
     }
 
     /// `{ a, b: c = d }` taken from the variable `base` of type `it`.
-    pub(super) fn destructure_object(
+    /// `{ a, b, ...rest }` taken from the variable `base` of type `it`.
+    pub(super) fn destructure_object_rest(
         &mut self,
         props: &'a [PatProp],
+        rest: &'a Option<Box<Pattern>>,
         base: &str,
         it: &Ty,
     ) -> GResult<()> {
+        if let Some(r) = rest {
+            let Pattern::Ident { id, .. } = &**r else {
+                return self.err("nested patterns are not supported", r.span());
+            };
+            let rt = self.resolve(&self.p.var(*id).ty);
+            let value = match (&rt, self.resolve(it)) {
+                (Ty::Map(..), _) => {
+                    let removed: Vec<String> = props
+                        .iter()
+                        .map(|p| format!("m.remove({});", super::string_literal(&p.key)))
+                        .collect();
+                    format!("{{ let mut m = {base}.clone(); {} m }}", removed.join(" "))
+                }
+                (Ty::Named(n, ..), _) => {
+                    let info = self.p.struct_info(n).cloned().expect("rest struct");
+                    let fields: Vec<String> = info
+                        .fields
+                        .iter()
+                        .map(|f| format!("{0}: {base}.{0}.clone()", snake(&f.name)))
+                        .collect();
+                    format!("{} {{ {} }}", super::pascal(n), fields.join(", "))
+                }
+                _ => return self.err("rest properties need an object", r.span()),
+            };
+            let var = self.p.var(*id);
+            let m = if var.reassigned || var.mutated {
+                "mut "
+            } else {
+                ""
+            };
+            let name = self.bind(*id, Repr::Owned);
+            // After the others are read: a value of its own.
+            let rest_line = format!("let {m}{name} = {value};");
+            self.destructure_object_rest(props, &None, base, it)?;
+            self.line(&rest_line);
+            return Ok(());
+        }
         for p in props {
             let Pattern::Ident { id, .. } = &p.value else {
                 return self.err("nested patterns are not supported", p.value.span());
