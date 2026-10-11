@@ -17,7 +17,7 @@ fn main() {
     }
     println!("{acc} {}", acc.chars().count());
     println!("{} {} {} {} {}", format!("{:.*}", 2 as usize, N), 10.to_string(), format!("{}!", 42.to_string()), format!("7{}", 7), format!("{}7", 7));
-    println!("{} {} {} {}", js_parse_int("42px"), js_parse_float("2.5kg"), js_number("12") + 1.0, js_number("x"));
+    println!("{} {} {} {}", js_parse_int("42px").as_ref().map_or("NaN".to_string(), |v| v.to_string()), js_parse_float("2.5kg"), js_number("12") + 1.0, js_number("x"));
     let mut words = vec!["b".to_string(), "a".to_string(), "c".to_string()];
     words.sort();
     println!("{} {} {}", words.join(""), "b" < "c", "Zed" > "apple");
@@ -81,8 +81,8 @@ fn js_pad_end(s: &str, width: i64, pad: &str) -> String {
     format!("{s}{fill}")
 }
 
-/// `parseInt(s)`: the leading integer, or NaN.
-fn js_parse_int(s: &str) -> f64 {
+/// `parseInt(s)`: the leading integer, or `None` for `NaN`.
+fn js_parse_int(s: &str) -> Option<i64> {
     let s = s.trim_start();
     let end = s
         .char_indices()
@@ -90,7 +90,7 @@ fn js_parse_int(s: &str) -> f64 {
         .map(|(i, c)| i + c.len_utf8())
         .last()
         .unwrap_or(0);
-    s[..end].parse::<f64>().unwrap_or(f64::NAN)
+    s[..end].parse::<i64>().ok()
 }
 
 /// `parseFloat(s)`: the leading number, or NaN.

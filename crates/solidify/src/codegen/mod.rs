@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::error::{Error, Span};
-use crate::infer::{Program, Role};
+use crate::infer::{Callee, Program, Role};
 use crate::types::{Flavor, Ty};
 pub use runtime::Helper;
 
@@ -154,6 +154,11 @@ pub(super) struct Gen<'a> {
     pub helpers: BTreeSet<Helper>,
     pub uses_hashmap: bool,
     pub uses_hashset: bool,
+    /// Maps and sets are iterated or shown: they keep the insertion order (`JsMap`, `JsSet`).
+    pub ordered: bool,
+    /// Structs and enums shown by `console.log` or converted to strings: they get a
+    /// `JsInspect` implementation.
+    pub inspected: BTreeSet<String>,
     /// Binding → Rust name.
     pub names: HashMap<NodeId, String>,
     /// Binding → how the variable holds its value.
@@ -180,6 +185,8 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         helpers: BTreeSet::new(),
         uses_hashmap: false,
         uses_hashset: false,
+        ordered: false,
+        inspected: BTreeSet::new(),
         names: HashMap::new(),
         reprs: HashMap::new(),
         fn_asts: HashMap::new(),
@@ -190,7 +197,225 @@ pub fn generate(module: &Module, prog: &Program, opts: &Options) -> GResult<Stri
         opts,
     };
     collect_asts(&module.body, &mut g.fn_asts, &mut g.class_asts);
+    g.ordered = g.needs_ordered();
     g.module()
+}
+
+/// Visits every statement and every expression of a list of statements, nested
+/// functions included.
+pub(super) fn visit_all<'e>(
+    stmts: &'e [Stmt],
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    for s in stmts {
+        visit_stmt(s, on_stmt, on_expr);
+    }
+}
+
+fn visit_stmt<'e>(
+    s: &'e Stmt,
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    on_stmt(s);
+    macro_rules! ex {
+        ($x:expr) => {
+            visit_expr_deep($x, on_stmt, on_expr)
+        };
+    }
+    match &s.kind {
+        StmtKind::Func(f) => visit_fn(f, on_stmt, on_expr),
+        StmtKind::Class(c) => {
+            for m in &c.members {
+                match m {
+                    ClassMember::Method(m) => visit_fn(&m.func, on_stmt, on_expr),
+                    ClassMember::Field(f) => {
+                        if let Some(i) = &f.init {
+                            visit_expr_deep(i, on_stmt, on_expr);
+                        }
+                    }
+                    ClassMember::StaticBlock(b) => visit_all(&b.stmts, on_stmt, on_expr),
+                }
+            }
+        }
+        StmtKind::Var(v) => {
+            for d in &v.decls {
+                if let Some(i) = &d.init {
+                    ex!(i);
+                }
+            }
+        }
+        StmtKind::Return(Some(e))
+        | StmtKind::Expr(e)
+        | StmtKind::Throw(e)
+        | StmtKind::ExportDefault(e) => ex!(e),
+        StmtKind::If {
+            test,
+            then,
+            otherwise,
+        } => {
+            ex!(test);
+            visit_stmt(then, on_stmt, on_expr);
+            if let Some(o) = otherwise {
+                visit_stmt(o, on_stmt, on_expr);
+            }
+        }
+        StmtKind::While { test, body } | StmtKind::DoWhile { body, test } => {
+            ex!(test);
+            visit_stmt(body, on_stmt, on_expr);
+        }
+        StmtKind::For {
+            init,
+            test,
+            update,
+            body,
+        } => {
+            if let Some(i) = init {
+                visit_stmt(i, on_stmt, on_expr);
+            }
+            if let Some(t) = test {
+                ex!(t);
+            }
+            if let Some(u) = update {
+                ex!(u);
+            }
+            visit_stmt(body, on_stmt, on_expr);
+        }
+        StmtKind::ForOf { iter, body, .. } => {
+            ex!(iter);
+            visit_stmt(body, on_stmt, on_expr);
+        }
+        StmtKind::Switch { disc, cases } => {
+            ex!(disc);
+            for c in cases {
+                if let Some(t) = &c.test {
+                    ex!(t);
+                }
+                visit_all(&c.body, on_stmt, on_expr);
+            }
+        }
+        StmtKind::Try {
+            block,
+            catch,
+            finally,
+        } => {
+            visit_all(&block.stmts, on_stmt, on_expr);
+            if let Some(c) = catch {
+                visit_all(&c.body.stmts, on_stmt, on_expr);
+            }
+            if let Some(f) = finally {
+                visit_all(&f.stmts, on_stmt, on_expr);
+            }
+        }
+        StmtKind::Block(b) => visit_all(&b.stmts, on_stmt, on_expr),
+        StmtKind::Labeled { body, .. } => visit_stmt(body, on_stmt, on_expr),
+        _ => {}
+    }
+}
+
+fn visit_fn<'e>(
+    f: &'e Function,
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    for p in &f.params {
+        if let Some(d) = &p.default {
+            visit_expr_deep(d, on_stmt, on_expr);
+        }
+    }
+    match &f.body {
+        FnBody::Block(b) => visit_all(&b.stmts, on_stmt, on_expr),
+        FnBody::Expr(e) => visit_expr_deep(e, on_stmt, on_expr),
+    }
+}
+
+/// Visits an expression and everything inside it, function bodies included.
+pub(super) fn visit_expr_deep<'e>(
+    e: &'e Expr,
+    on_stmt: &mut dyn FnMut(&'e Stmt),
+    on_expr: &mut dyn FnMut(&'e Expr),
+) {
+    on_expr(e);
+    macro_rules! visit {
+        ($x:expr) => {
+            visit_expr_deep($x, on_stmt, on_expr)
+        };
+    }
+    match &e.kind {
+        ExprKind::Func(f) | ExprKind::Arrow(f) => visit_fn(f, on_stmt, on_expr),
+        ExprKind::Template { exprs, .. } | ExprKind::Seq(exprs) => {
+            exprs.iter().for_each(|x| visit!(x))
+        }
+        ExprKind::Array(elems) => {
+            for el in elems {
+                match el {
+                    ArrayElem::Expr(x) | ArrayElem::Spread(x) => visit!(x),
+                    ArrayElem::Hole => {}
+                }
+            }
+        }
+        ExprKind::Object(props) => {
+            for p in props {
+                if let PropKey::Computed(k) = &p.key {
+                    visit!(k);
+                }
+                match &p.value {
+                    PropValue::Expr(x) | PropValue::Spread(x) => visit!(x),
+                    PropValue::Method(f) | PropValue::Get(f) | PropValue::Set(f) => {
+                        visit_fn(f, on_stmt, on_expr)
+                    }
+                    PropValue::Shorthand(_) => {}
+                }
+            }
+        }
+        ExprKind::Unary { arg, .. } | ExprKind::Update { arg, .. } => visit!(arg),
+        ExprKind::Binary { left, right, .. } | ExprKind::Logical { left, right, .. } => {
+            visit!(left);
+            visit!(right);
+        }
+        ExprKind::Assign { target, value, .. } => {
+            if let AssignTarget::Expr(t) = target {
+                visit!(t);
+            }
+            visit!(value);
+        }
+        ExprKind::Cond { test, cons, alt } => {
+            visit!(test);
+            visit!(cons);
+            visit!(alt);
+        }
+        ExprKind::Call { callee, args, .. } | ExprKind::New { callee, args, .. } => {
+            visit!(callee);
+            for a in args {
+                visit!(&a.expr);
+            }
+        }
+        ExprKind::Member { obj, .. } => visit!(obj),
+        ExprKind::Index { obj, index, .. } => {
+            visit!(obj);
+            visit!(index);
+        }
+        ExprKind::As(x, _)
+        | ExprKind::NonNull(x)
+        | ExprKind::TypeOf(x)
+        | ExprKind::Void(x)
+        | ExprKind::Delete(x)
+        | ExprKind::Await(x) => visit!(x),
+        ExprKind::Yield(Some(x)) => visit!(x),
+        ExprKind::Tagged { tag, exprs, .. } => {
+            visit!(tag);
+            exprs.iter().for_each(|x| visit!(x));
+        }
+        ExprKind::Class(c) => {
+            for m in &c.members {
+                if let ClassMember::Method(m) = m {
+                    visit_fn(&m.func, on_stmt, on_expr);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn collect_asts<'a>(
@@ -530,11 +755,215 @@ impl<'a> Gen<'a> {
             Helper::Compare => "js_compare",
             Helper::Ordering => "js_ordering",
             Helper::ParseInt => "js_parse_int",
+            Helper::ParseIntRadix => "js_parse_int_radix",
             Helper::ParseFloat => "js_parse_float",
             Helper::ToNumber => "js_number",
             Helper::Random => "js_random",
             Helper::NumToString => "js_num_to_string",
             Helper::BlockOn => "block_on",
+            Helper::Inspect => "js_inspect",
+            Helper::JsMap => "JsMap",
+            Helper::JsSet => "JsSet",
+        }
+    }
+
+    /// The Rust type of a `Map` (`JsMap` keeps the insertion order when it matters).
+    pub(super) fn map_name(&mut self) -> &'static str {
+        if self.ordered {
+            self.helper(Helper::JsMap)
+        } else {
+            self.uses_hashmap = true;
+            "HashMap"
+        }
+    }
+
+    pub(super) fn set_name(&mut self) -> &'static str {
+        if self.ordered {
+            self.helper(Helper::JsSet)
+        } else {
+            self.uses_hashset = true;
+            "HashSet"
+        }
+    }
+
+    /// Whether some map or set of the program is iterated or shown: then every map and set
+    /// keeps its insertion order, like in JavaScript.
+    fn needs_ordered(&self) -> bool {
+        let mut found = false;
+        let is_collection = |g: &Self, e: &Expr| matches!(g.ty_of(e), Ty::Map(..) | Ty::Set(_));
+        let mut on_stmt = |s: &Stmt| {
+            if let StmtKind::ForOf { iter, .. } = &s.kind
+                && is_collection(self, iter)
+            {
+                found = true;
+            }
+        };
+        let mut found2 = false;
+        let mut on_expr = |e: &Expr| match &e.kind {
+            ExprKind::Call { args, .. } => {
+                if let Some(Callee::Builtin(name)) = self.p.calls.get(&e.id)
+                    && (matches!(
+                        *name,
+                        "map.keys"
+                            | "map.values"
+                            | "map.entries"
+                            | "map.forEach"
+                            | "set.values"
+                            | "set.keys"
+                            | "set.forEach"
+                            | "Object.keys"
+                            | "Object.values"
+                            | "Object.entries"
+                            | "JSON.stringify"
+                    ) || (matches!(
+                        *name,
+                        "Array.from"
+                            | "Array.from.map"
+                            | "console.log"
+                            | "console.error"
+                            | "console.warn"
+                            | "console.info"
+                            | "console.debug"
+                            | "global.String"
+                    ) && args.iter().any(|a| is_collection(self, &a.expr))))
+                {
+                    found2 = true;
+                }
+            }
+            ExprKind::Array(elems) => {
+                if elems
+                    .iter()
+                    .any(|el| matches!(el, ArrayElem::Spread(x) if is_collection(self, x)))
+                {
+                    found2 = true;
+                }
+            }
+            ExprKind::Template { exprs, .. } => {
+                if exprs.iter().any(|x| is_collection(self, x)) {
+                    found2 = true;
+                }
+            }
+            ExprKind::Binary {
+                op: BinOp::Add,
+                left,
+                right,
+            } if is_collection(self, left) || is_collection(self, right) => {
+                found2 = true;
+            }
+            _ => {}
+        };
+        visit_all(&self.m.body, &mut on_stmt, &mut on_expr);
+        found || found2
+    }
+
+    /// Whether values of this type print through `JsInspect` rather than `Display`.
+    pub(super) fn is_inspect_ty(&self, ty: &Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Array(_) | Ty::Tuple(_) | Ty::Map(..) | Ty::Set(_) => true,
+            Ty::Option(inner) => self.is_inspect_ty(&inner),
+            Ty::Named(n) => {
+                n != "Error" && !self.is_type_param(&n) && self.p.struct_info(&n).is_some()
+            }
+            _ => false,
+        }
+    }
+
+    /// Records that the structs and enums reachable from this type are shown.
+    pub(super) fn mark_inspected(&mut self, ty: &Ty) {
+        self.helpers.insert(Helper::Inspect);
+        match self.resolve(ty) {
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.mark_inspected(&t),
+            Ty::Map(k, v, _) => {
+                self.mark_inspected(&k);
+                self.mark_inspected(&v);
+            }
+            Ty::Tuple(ts) => {
+                for t in &ts {
+                    self.mark_inspected(t);
+                }
+            }
+            Ty::Named(n)
+                if (self.p.struct_info(&n).is_some() || self.p.is_enum(&n))
+                    && self.inspected.insert(n.clone()) =>
+            {
+                let fields: Vec<Ty> = self
+                    .p
+                    .struct_info(&n)
+                    .map(|s| s.fields.iter().map(|f| f.ty.clone()).collect())
+                    .unwrap_or_default();
+                for f in &fields {
+                    self.mark_inspected(f);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `js_inspect(&x.js_value())` or `js_to_string(&x.js_value())` for a value of type `ty`.
+    pub(super) fn inspect_call(&mut self, code: &str, ty: &Ty, inspect: bool) -> String {
+        let f = if inspect {
+            "js_inspect"
+        } else {
+            "js_to_string"
+        };
+        let value = self.js_value_of(code, ty);
+        format!("{f}(&{value})")
+    }
+
+    /// Whether a record (an object used as a dictionary) is somewhere in this type.
+    pub(super) fn contains_record(&self, ty: &Ty) -> bool {
+        match self.resolve(ty) {
+            Ty::Map(k, v, record) => record || self.contains_record(&k) || self.contains_record(&v),
+            Ty::Option(t) | Ty::Array(t) | Ty::Set(t) => self.contains_record(&t),
+            Ty::Tuple(ts) => ts.iter().any(|t| self.contains_record(t)),
+            _ => false,
+        }
+    }
+
+    /// The `JsValue` of a Rust expression of type `ty`: `.js_value()`, except that records
+    /// are shown as objects, not as maps.
+    pub(super) fn js_value_of(&mut self, code: &str, ty: &Ty) -> String {
+        self.mark_inspected(ty);
+        let recv = if code.contains(' ') && !(code.starts_with('(') && code.ends_with(')')) {
+            format!("({code})")
+        } else {
+            code.to_string()
+        };
+        if !self.contains_record(ty) {
+            return format!("{recv}.js_value()");
+        }
+        match self.resolve(ty) {
+            Ty::Map(k, v, record) => {
+                let inner = self.js_value_of("v", &v);
+                if record {
+                    format!(
+                        "JsValue::Object(None, {recv}.iter().map(|(k, v)| (k.to_string(), {inner})).collect())"
+                    )
+                } else {
+                    let key = self.js_value_of("k", &k);
+                    format!("JsValue::Map({recv}.iter().map(|(k, v)| ({key}, {inner})).collect())")
+                }
+            }
+            Ty::Array(t) => {
+                let inner = self.js_value_of("x", &t);
+                format!("JsValue::Array({recv}.iter().map(|x| {inner}).collect())")
+            }
+            Ty::Set(t) => {
+                let inner = self.js_value_of("x", &t);
+                format!("JsValue::Set({recv}.iter().map(|x| {inner}).collect())")
+            }
+            Ty::Option(t) => {
+                let inner = self.js_value_of("x", &t);
+                format!("{recv}.as_ref().map_or(JsValue::Null, |x| {inner})")
+            }
+            Ty::Tuple(ts) => {
+                let mut parts = Vec::new();
+                for (i, t) in ts.iter().enumerate() {
+                    parts.push(self.js_value_of(&format!("{recv}.{i}"), t));
+                }
+                format!("JsValue::Array(vec![{}])", parts.join(", "))
+            }
+            _ => format!("{recv}.js_value()"),
         }
     }
 
@@ -622,17 +1051,17 @@ impl<'a> Gen<'a> {
                     format!("({})", parts.join(", "))
                 }
             }
-            Ty::Map(k, v) => {
-                self.uses_hashmap = true;
+            Ty::Map(k, v, _) => {
+                let name = self.map_name();
                 format!(
-                    "HashMap<{}, {}>",
+                    "{name}<{}, {}>",
                     self.rust_ty(&k, span)?,
                     self.rust_ty(&v, span)?
                 )
             }
             Ty::Set(t) => {
-                self.uses_hashset = true;
-                format!("HashSet<{}>", self.rust_ty(&t, span)?)
+                let name = self.set_name();
+                format!("{name}<{}>", self.rust_ty(&t, span)?)
             }
             Ty::Named(n) => {
                 if n == "Error" {

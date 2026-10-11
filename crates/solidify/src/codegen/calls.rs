@@ -295,29 +295,29 @@ impl<'a> Gen<'a> {
                 None => Ok(E::owned("String::new()", PREC_POSTFIX)),
             },
             Some(Callee::Builtin("new Map")) => {
-                self.uses_hashmap = true;
+                let name = self.map_name();
                 match args.first() {
                     Some(a) => {
                         let v = self.expr_as(&a.expr, Want::Owned)?;
                         Ok(E::owned(
-                            format!("{v}.into_iter().collect::<HashMap<_, _>>()"),
+                            format!("{v}.into_iter().collect::<{name}<_, _>>()"),
                             PREC_POSTFIX,
                         ))
                     }
-                    None => Ok(E::atom("HashMap::new()", Repr::Owned)),
+                    None => Ok(E::atom(format!("{name}::new()"), Repr::Owned)),
                 }
             }
             Some(Callee::Builtin("new Set")) => {
-                self.uses_hashset = true;
+                let name = self.set_name();
                 match args.first() {
                     Some(a) => {
                         let v = self.expr_as(&a.expr, Want::Owned)?;
                         Ok(E::owned(
-                            format!("{v}.into_iter().collect::<HashSet<_>>()"),
+                            format!("{v}.into_iter().collect::<{name}<_>>()"),
                             PREC_POSTFIX,
                         ))
                     }
-                    None => Ok(E::atom("HashSet::new()", Repr::Owned)),
+                    None => Ok(E::atom(format!("{name}::new()"), Repr::Owned)),
                 }
             }
             Some(Callee::Builtin("new Array")) => match args.first() {
@@ -350,8 +350,8 @@ impl<'a> Gen<'a> {
             Ty::Bool => "false".into(),
             Ty::Option(_) => "None".into(),
             Ty::Array(_) => "Vec::new()".into(),
-            Ty::Map(..) => "HashMap::new()".into(),
-            Ty::Set(_) => "HashSet::new()".into(),
+            Ty::Map(..) => format!("{}::new()", self.map_name()),
+            Ty::Set(_) => format!("{}::new()", self.set_name()),
             Ty::Void | Ty::Null => "()".into(),
             Ty::Named(n) if self.p.enum_info(&n).is_some() => {
                 let en = self.p.enum_info(&n).expect("enum");
@@ -369,15 +369,21 @@ impl<'a> Gen<'a> {
             |g: &mut Self, i: usize| -> GResult<String> { g.expr_as(&args[i].expr, Want::StrRef) };
         Ok(match name {
             "global.parseInt" => {
+                let at = self.ty_of(&args[0].expr);
+                if matches!(self.resolve(&at), Ty::Num(_)) {
+                    // `parseInt(3.7)`: a truncation.
+                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
+                    if self.is_float(&at) {
+                        let x = super::exprs::num_recv(&paren_num(&x), true);
+                        return Ok(E::owned(format!("{x}.trunc() as i64"), PREC_CAST));
+                    }
+                    return Ok(E::owned(x, PREC_ATOM));
+                }
                 let s = arg_str(self, 0)?;
                 if args.len() > 1 {
                     let radix = self.expr_as(&args[1].expr, Want::Owned)?;
-                    E::owned(
-                        format!(
-                            "i64::from_str_radix({s}.trim(), {radix} as u32).map_or(f64::NAN, |n| n as f64)"
-                        ),
-                        PREC_POSTFIX,
-                    )
+                    let h = self.helper(Helper::ParseIntRadix);
+                    E::owned(format!("{h}({s}, {radix})"), PREC_POSTFIX)
                 } else {
                     let h = self.helper(Helper::ParseInt);
                     E::owned(format!("{h}({s})"), PREC_POSTFIX)
@@ -410,6 +416,7 @@ impl<'a> Gen<'a> {
             "global.String" => {
                 let (spec, arg) = self.format_arg(&args[0].expr)?;
                 match arg {
+                    Some(a) if a.starts_with("js_to_string(") => E::owned(a, PREC_POSTFIX),
                     Some(a) if spec == "{}" => E::owned(format!("{a}.to_string()"), PREC_POSTFIX),
                     _ => E::owned(
                         format_call("format!", &spec, &arg.into_iter().collect::<Vec<_>>()),
@@ -421,25 +428,8 @@ impl<'a> Gen<'a> {
                 let c = self.cond(&args[0].expr)?;
                 E::owned(c, PREC_ATOM)
             }
-            "global.isNaN" => {
-                let at = self.ty_of(&args[0].expr);
-                if self.is_float(&at) {
-                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    E::owned(format!("{}.is_nan()", paren_num(&x)), PREC_POSTFIX)
-                } else {
-                    self.expr(&args[0].expr)?;
-                    E::atom("false", Repr::Owned)
-                }
-            }
-            "global.isFinite" => {
-                let at = self.ty_of(&args[0].expr);
-                if self.is_float(&at) {
-                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    E::owned(format!("{}.is_finite()", paren_num(&x)), PREC_POSTFIX)
-                } else {
-                    self.expr(&args[0].expr)?;
-                    E::atom("true", Repr::Owned)
-                }
+            "global.isNaN" | "global.isFinite" => {
+                self.nan_test(name == "global.isNaN", &args[0].expr)?
             }
             "global.structuredClone" => {
                 let x = self.expr_as(&args[0].expr, Want::Owned)?;
@@ -485,7 +475,7 @@ impl<'a> Gen<'a> {
                         }
                         continue;
                     }
-                    let (spec, arg) = self.format_arg(&a.expr)?;
+                    let (spec, arg) = self.log_arg(&a.expr)?;
                     fmt.push_str(&spec);
                     list.extend(arg);
                 }
@@ -636,22 +626,7 @@ impl<'a> Gen<'a> {
                 }
             }
             "Number.isNaN" | "Number.isFinite" => {
-                let at = self.ty_of(&args[0].expr);
-                let method = if name == "Number.isNaN" {
-                    "is_nan"
-                } else {
-                    "is_finite"
-                };
-                if self.is_float(&at) {
-                    let x = self.expr_as(&args[0].expr, Want::Owned)?;
-                    E::owned(format!("{}.{method}()", paren_num(&x)), PREC_POSTFIX)
-                } else {
-                    self.expr(&args[0].expr)?;
-                    E::atom(
-                        if method == "is_nan" { "false" } else { "true" },
-                        Repr::Owned,
-                    )
-                }
+                self.nan_test(name == "Number.isNaN", &args[0].expr)?
             }
             "String.fromCharCode" => {
                 let x = self.expr_as(&args[0].expr, Want::Owned)?;
@@ -767,6 +742,30 @@ impl<'a> Gen<'a> {
             }
             _ => return self.err(format!("`{name}` is not supported"), e.span),
         })
+    }
+
+    /// `isNaN(x)` / `isFinite(x)`: on a float, the test; on the `Option` of `parseInt`,
+    /// `is_none` / `is_some`; on an integer, decided.
+    fn nan_test(&mut self, nan: bool, arg: &'a Expr) -> GResult<E> {
+        let at = self.ty_of(arg);
+        if matches!(self.resolve(&at), Ty::Option(_)) {
+            let x = self.expr(arg)?;
+            let code = Self::paren(&x, PREC_POSTFIX);
+            return Ok(E::owned(
+                format!("{code}.{}()", if nan { "is_none" } else { "is_some" }),
+                PREC_POSTFIX,
+            ));
+        }
+        if self.is_float(&at) {
+            let x = self.expr_as(arg, Want::Owned)?;
+            let x = super::exprs::num_recv(&paren_num(&x), true);
+            return Ok(E::owned(
+                format!("{x}.{}()", if nan { "is_nan" } else { "is_finite" }),
+                PREC_POSTFIX,
+            ));
+        }
+        self.expr(arg)?;
+        Ok(E::atom(if nan { "false" } else { "true" }, Repr::Owned))
     }
 
     /// The receiver of a method chain: the expression, parenthesized if needed.
@@ -1025,7 +1024,7 @@ impl<'a> Gen<'a> {
         args: &'a [Arg],
     ) -> GResult<E> {
         let ot = self.ty_of(obj);
-        let Ty::Map(k, v) = self.resolve(&ot) else {
+        let Ty::Map(k, v, _) = self.resolve(&ot) else {
             unreachable!()
         };
         let key_want = if self.is_str(&k) {
@@ -1340,10 +1339,9 @@ impl<'a> Gen<'a> {
                 if self.is_str(&item) {
                     E::owned(format!("{recv}.join({sep})"), PREC_POSTFIX)
                 } else {
+                    let shown = self.string_of("x", &item);
                     E::owned(
-                        format!(
-                            "{recv}.iter().map(|x| x.to_string()).collect::<Vec<_>>().join({sep})"
-                        ),
+                        format!("{recv}.iter().map(|x| {shown}).collect::<Vec<_>>().join({sep})"),
                         PREC_POSTFIX,
                     )
                 }
@@ -1448,10 +1446,13 @@ impl<'a> Gen<'a> {
             "entries" => E::owned(format!("{iter}.enumerate()"), PREC_POSTFIX),
             "keys" => E::owned(format!("(0..{recv}.len())"), PREC_ATOM),
             "values" => E::owned(iter, PREC_POSTFIX),
-            "toString" => E::owned(
-                format!("{recv}.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(\",\")"),
-                PREC_POSTFIX,
-            ),
+            "toString" => {
+                let shown = self.string_of("x", &item);
+                E::owned(
+                    format!("{recv}.iter().map(|x| {shown}).collect::<Vec<_>>().join(\",\")"),
+                    PREC_POSTFIX,
+                )
+            }
             _ => return self.err(format!("`array.{method}` is not supported"), e.span),
         })
     }

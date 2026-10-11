@@ -144,7 +144,7 @@ impl<'m> Infer<'m> {
                 let it = self.types.resolve(&it);
                 let item = if *is_in {
                     match &it {
-                        Ty::Map(k, _) => (**k).clone(),
+                        Ty::Map(k, _, _) => (**k).clone(),
                         Ty::Array(_) => self.types.int(),
                         other => {
                             let d = self.describe(other);
@@ -158,7 +158,7 @@ impl<'m> Infer<'m> {
                     match &it {
                         Ty::Array(t) | Ty::Set(t) => (**t).clone(),
                         Ty::Str => Ty::Str,
-                        Ty::Map(k, v) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
+                        Ty::Map(k, v, _) => Ty::Tuple(vec![(**k).clone(), (**v).clone()]),
                         Ty::Var(_) => {
                             let t = self.types.fresh();
                             self.unify(&it, &Ty::Array(Box::new(t.clone())), iter.span)?;
@@ -594,6 +594,29 @@ impl<'m> Infer<'m> {
                 self.truthy(e)?;
                 Ok((Vec::new(), Vec::new()))
             }
+            // `isNaN(n)` on the `Option` of `parseInt`: `n` exists when the test is false.
+            ExprKind::Call { callee, args, .. }
+                if args.len() == 1 && nan_test_name(callee).is_some() =>
+            {
+                let positive = nan_test_name(callee) == Some(false);
+                let value = &args[0].expr;
+                if self.path_of(value).is_some()
+                    && matches!(
+                        self.expr(value, None).map(|t| self.types.resolve(&t)),
+                        Ok(Ty::Option(_))
+                    )
+                    && let Some(n) = self.narrow_value(value, e.id, positive)?
+                {
+                    self.set_ty(e.id, Ty::Bool);
+                    return Ok(if positive {
+                        (vec![n], Vec::new())
+                    } else {
+                        (Vec::new(), vec![n])
+                    });
+                }
+                self.truthy(e)?;
+                Ok((Vec::new(), Vec::new()))
+            }
             _ => {
                 self.truthy(e)?;
                 Ok((Vec::new(), Vec::new()))
@@ -777,6 +800,22 @@ impl<'m> Infer<'m> {
         {
             info.escapes = true;
         }
+    }
+}
+
+/// `isNaN` / `Number.isNaN` (true) or `isFinite` / `Number.isFinite` (false).
+pub(super) fn nan_test_name(callee: &Expr) -> Option<bool> {
+    match &callee.kind {
+        ExprKind::Ident(n) if n == "isNaN" => Some(true),
+        ExprKind::Ident(n) if n == "isFinite" => Some(false),
+        ExprKind::Member { obj, prop, .. } if matches!(&obj.kind, ExprKind::Ident(n) if n == "Number") => {
+            match prop.as_str() {
+                "isNaN" => Some(true),
+                "isFinite" => Some(false),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

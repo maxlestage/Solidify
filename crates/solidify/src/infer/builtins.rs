@@ -131,15 +131,18 @@ impl<'m> Infer<'m> {
                 self.done(e, full, f)
             }
             ("Math", _) => self.err(format!("`Math.{prop}` is not supported"), span),
-            ("Number", "isInteger" | "isNaN" | "isFinite" | "isSafeInteger") => {
+            ("Number", "isInteger" | "isSafeInteger") => {
                 let n = self.types.num(Flavor::Unknown);
                 self.arg_typed(args, 0, Some(n), &full, span)?;
                 self.done(e, full, Ty::Bool)
             }
+            ("Number", "isNaN" | "isFinite") => {
+                self.nan_test_arg(args, &full, span)?;
+                self.done(e, full, Ty::Bool)
+            }
             ("Number", "parseInt") => {
-                self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
-                let i = self.types.int();
-                self.done(e, "global.parseInt".into(), i)
+                let t = self.parse_int_call(args, &full, span)?;
+                self.done(e, "global.parseInt".into(), t)
             }
             ("Number", "parseFloat") => {
                 self.arg_typed(args, 0, Some(Ty::Str), &full, span)?;
@@ -153,7 +156,7 @@ impl<'m> Infer<'m> {
             }
             ("Object", "keys" | "values" | "entries") => {
                 let t = self.arg_typed(args, 0, None, &full, span)?;
-                let Ty::Map(k, v) = self.types.resolve(&t) else {
+                let Ty::Map(k, v, _) = self.types.resolve(&t) else {
                     return self.err(
                         format!("`{full}` works on a `Record` or `Map`; struct fields are known at compile time"),
                         span,
@@ -196,7 +199,7 @@ impl<'m> Infer<'m> {
                 let item = match self.types.resolve(&t) {
                     Ty::Array(t) | Ty::Set(t) => *t,
                     Ty::Str => Ty::Str,
-                    Ty::Map(k, v) => Ty::Tuple(vec![*k, *v]),
+                    Ty::Map(k, v, _) => Ty::Tuple(vec![*k, *v]),
                     other => {
                         let d = self.describe(&other);
                         return self.err(format!("`Array.from` cannot read {d}"), span);
@@ -251,8 +254,8 @@ impl<'m> Infer<'m> {
                 let item = (**item).clone();
                 self.array_method(e, obj, item, prop, args, span)
             }
-            Ty::Map(k, v) => {
-                let (k, v) = ((**k).clone(), (**v).clone());
+            Ty::Map(k, v, record) => {
+                let (k, v, record) = ((**k).clone(), (**v).clone(), *record);
                 let full = format!("map.{prop}");
                 match prop {
                     "get" => {
@@ -265,7 +268,7 @@ impl<'m> Infer<'m> {
                         self.mark_stored(&args[0].expr);
                         self.mark_stored(&args[1].expr);
                         self.mark_receiver_mutated(obj);
-                        self.done(e, full, Ty::Map(Box::new(k), Box::new(v)))
+                        self.done(e, full, Ty::Map(Box::new(k), Box::new(v), record))
                     }
                     "has" => {
                         self.arg_typed(args, 0, Some(k), &full, span)?;

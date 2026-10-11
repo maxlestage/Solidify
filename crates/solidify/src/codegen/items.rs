@@ -56,10 +56,119 @@ impl<'a> Gen<'a> {
             out.push_str("use std::collections::HashSet;\n\n");
         }
         out.push_str(body.trim_start_matches('\n'));
+        let impls = self.inspect_impls()?;
         for h in self.helpers.clone() {
             out.push('\n');
             out.push_str(h.source());
             out.push('\n');
+        }
+        out.push_str(&impls);
+        Ok(out)
+    }
+
+    /// `JsInspect` for the structs and enums that `console.log` shows.
+    fn inspect_impls(&mut self) -> GResult<String> {
+        let mut out = String::new();
+        if !self.helpers.contains(&Helper::Inspect) {
+            return Ok(out);
+        }
+        if self.helpers.contains(&Helper::JsMap) {
+            out.push_str(
+                "\nimpl<K: JsInspect + std::hash::Hash + Eq + Clone, V: JsInspect> JsInspect for JsMap<K, V> {\n    fn js_value(&self) -> JsValue {\n        JsValue::Map(self.iter().map(|(k, v)| (k.js_value(), v.js_value())).collect())\n    }\n}\n",
+            );
+        }
+        if self.helpers.contains(&Helper::JsSet) {
+            out.push_str(
+                "\nimpl<T: JsInspect + std::hash::Hash + Eq + Clone> JsInspect for JsSet<T> {\n    fn js_value(&self) -> JsValue {\n        JsValue::Set(self.iter().map(JsInspect::js_value).collect())\n    }\n}\n",
+            );
+        }
+        // Fields may bring in more types: loop until the set is stable.
+        let mut done = std::collections::BTreeSet::new();
+        loop {
+            let pending: Vec<String> = self
+                .inspected
+                .iter()
+                .filter(|n| !done.contains(*n))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                break;
+            }
+            for name in pending {
+                done.insert(name.clone());
+                let rust_name = pascal(&name);
+                out.push_str(&format!(
+                    "\nimpl JsInspect for {rust_name} {{\n    fn js_value(&self) -> JsValue {{\n"
+                ));
+                if let Some(en) = self.p.enum_info(&name).cloned() {
+                    if en.kind == EnumKind::Numeric {
+                        out.push_str("        match self {\n");
+                        for v in &en.variants {
+                            let value = match &v.value {
+                                Some(EnumValue::Num(n)) if n.fract() == 0.0 => {
+                                    format!("JsValue::Int({})", *n as i64)
+                                }
+                                Some(EnumValue::Num(n)) => format!("JsValue::Float({n:?})"),
+                                _ => "JsValue::Str(self.to_string())".to_string(),
+                            };
+                            out.push_str(&format!(
+                                "            {rust_name}::{} => {value},\n",
+                                v.name
+                            ));
+                        }
+                        out.push_str("        }\n");
+                    } else {
+                        out.push_str("        JsValue::Str(self.to_string())\n");
+                    }
+                } else if let Some(info) = self.p.struct_info(&name).cloned() {
+                    let class = if info.kind == StructKind::Class {
+                        format!("Some({})", string_literal(&name))
+                    } else {
+                        "None".to_string()
+                    };
+                    let mut entries = Vec::new();
+                    let mut optional = Vec::new();
+                    for f in &info.fields {
+                        let key = string_literal(&f.name);
+                        let field = snake(&f.name);
+                        let value = match self.resolve(&f.ty) {
+                            Ty::Func(_) => format!("JsValue::Func({key})"),
+                            _ if f.optional && info.kind == StructKind::Class => {
+                                // A declared class field exists, `undefined` until set.
+                                let inner = self.js_value_of("v", &f.ty);
+                                format!(
+                                    "self.{field}.as_ref().map_or(JsValue::Undefined, |v| {inner})"
+                                )
+                            }
+                            _ if f.optional => {
+                                let inner = self.js_value_of("v", &f.ty);
+                                optional.push((key, field, inner));
+                                continue;
+                            }
+                            _ => self.js_value_of(&format!("self.{field}"), &f.ty),
+                        };
+                        entries.push(format!("({key}.to_string(), {value})"));
+                    }
+                    if optional.is_empty() {
+                        out.push_str(&format!(
+                            "        JsValue::Object({class}, vec![{}])\n",
+                            entries.join(", ")
+                        ));
+                    } else {
+                        out.push_str(&format!(
+                            "        let mut props: Vec<(String, JsValue)> = vec![{}];\n",
+                            entries.join(", ")
+                        ));
+                        for (key, field, inner) in optional {
+                            out.push_str(&format!(
+                                "        if let Some(v) = &self.{field} {{\n            props.push(({key}.to_string(), {inner}));\n        }}\n"
+                            ));
+                        }
+                        out.push_str(&format!("        JsValue::Object({class}, props)\n"));
+                    }
+                }
+                out.push_str("    }\n}\n");
+            }
         }
         Ok(out)
     }

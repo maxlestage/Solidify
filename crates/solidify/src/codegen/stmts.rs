@@ -559,7 +559,13 @@ impl<'a> Gen<'a> {
         };
         let needs_type = matches!(
             value.as_str(),
-            "Vec::new()" | "HashMap::new()" | "HashSet::new()" | "None" | "String::new()"
+            "Vec::new()"
+                | "HashMap::new()"
+                | "HashSet::new()"
+                | "JsMap::new()"
+                | "JsSet::new()"
+                | "None"
+                | "String::new()"
         ) || matches!(self.resolve(&it), Ty::Null)
             || float_literal;
         let closure_mut = match &init.kind {
@@ -604,11 +610,15 @@ impl<'a> Gen<'a> {
             }
             ExprKind::Call { .. } | ExprKind::New { .. } | ExprKind::Await(_) => {
                 let x = self.expr(e)?;
-                let ty = self.ty_of(e);
-                // A value that must not be dropped silently? Only `Result`s matter, and they
-                // carry `?` or `unwrap` already.
-                let _ = ty;
-                self.line(&format!("{};", x.code));
+                // `map.delete(k);` as a statement: the result is not wanted.
+                let code = match self.p.calls.get(&e.id) {
+                    Some(Callee::Builtin("map.delete" | "set.delete")) => x
+                        .code
+                        .strip_suffix(".is_some()")
+                        .map_or(x.code.clone(), str::to_string),
+                    _ => x.code,
+                };
+                self.line(&format!("{code};"));
                 Ok(())
             }
             ExprKind::Seq(items) => {
@@ -683,7 +693,7 @@ impl<'a> Gen<'a> {
         let vt = self.ty_of(value);
         // `map[key] = value`
         if let ExprKind::Index { obj, index, .. } = &t.kind
-            && let Ty::Map(k, v) = self.ty_of(obj)
+            && let Ty::Map(k, v, _) = self.ty_of(obj)
             && op == AssignOp::Assign
         {
             let m = self.expr_as(obj, Want::RefMut)?;
@@ -760,15 +770,17 @@ impl<'a> Gen<'a> {
             AssignOp::Add if self.is_str(&tt) => {
                 if let ExprKind::Str(s) = &value.kind {
                     self.line(&format!("{place}.push_str({});", super::string_literal(s)));
+                } else if self.is_str(&vt) {
+                    let v = self.expr_as(value, Want::StrRef)?;
+                    self.line(&format!("{place}.push_str({v});"));
                 } else {
-                    let v = self.expr_as(value, Want::Display)?;
-                    let spec = self.fmt_spec(&vt);
-                    if self.is_str(&vt) {
-                        let v = self.expr_as(value, Want::StrRef)?;
-                        self.line(&format!("{place}.push_str({v});"));
-                    } else {
-                        self.line(&format!("{place}.push_str(&format!(\"{spec}\", {v}));"));
-                    }
+                    let (spec, arg) = self.format_arg(value)?;
+                    let call = super::exprs::format_call(
+                        "format!",
+                        &spec,
+                        &arg.into_iter().collect::<Vec<_>>(),
+                    );
+                    self.line(&format!("{place}.push_str(&{call});"));
                 }
             }
             AssignOp::Nullish => {
@@ -1278,7 +1290,7 @@ impl<'a> Gen<'a> {
         let item_ty = match self.resolve(&it) {
             Ty::Array(t) | Ty::Set(t) if !enumerate => *t,
             Ty::Array(t) => Ty::Tuple(vec![Ty::Any, *t]),
-            Ty::Map(k, v) => Ty::Tuple(vec![*k, *v]),
+            Ty::Map(k, v, _) => Ty::Tuple(vec![*k, *v]),
             Ty::Str => Ty::Str,
             _ => Ty::Any,
         };
