@@ -563,6 +563,17 @@ impl<'a> Gen<'a> {
         ))
     }
 
+    /// An error (its Rust value `e`) as JavaScript writes it: `Error: message`.
+    pub(super) fn error_text(&mut self, e: &str) -> String {
+        if self.p.error_classes.is_empty() {
+            let h = self.helper(super::Helper::ErrorText);
+            format!("{h}(&{e})")
+        } else {
+            self.helper(super::Helper::Error);
+            format!("js_error_text_named(&{e})")
+        }
+    }
+
     /// `x` (a Rust expression of type `ty`) as JavaScript's `String(x)`.
     pub(super) fn string_of(&mut self, code: &str, ty: &Ty) -> String {
         if self.is_inspect_ty(ty) {
@@ -669,6 +680,11 @@ impl<'a> Gen<'a> {
             let call = self.inspect_call(&code, &ty, false);
             self.elems_undefined = false;
             return Ok(("{}".into(), Some(call)));
+        }
+        // An error as text: `Error: message`, like JavaScript's `String(e)`.
+        if matches!(self.resolve(&ty), Ty::Named(ref n, ..) if n == "Error") {
+            let code = self.coerce(e, &ty, Want::Display);
+            return Ok(("{}".into(), Some(self.error_text(&code))));
         }
         // A struct with `toString()` prints through it.
         if let Ty::Named(n, ..) = self.resolve(&ty)

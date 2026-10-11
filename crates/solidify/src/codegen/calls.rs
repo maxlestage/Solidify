@@ -1511,7 +1511,11 @@ impl<'a> Gen<'a> {
                     _ => return self.err(format!("`{name}` is not supported"), e.span),
                 })
             }
-            "boolean" | "error" => {
+            "error" => {
+                let x = self.expr_as(obj, Want::Display)?;
+                Ok(E::owned(self.error_text(&x), PREC_POSTFIX))
+            }
+            "boolean" => {
                 let x = self.expr_as(obj, Want::Display)?;
                 Ok(E::owned(format!("{x}.to_string()"), PREC_POSTFIX))
             }

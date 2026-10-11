@@ -201,6 +201,13 @@ impl<'a> Gen<'a> {
             StmtKind::Throw(e) => {
                 let msg = self.error_value(e)?;
                 if self.fn_ctx().returns_result || !self.fn_ctx().try_ctx.is_empty() {
+                    // A thrown value that is not an error is marked: `String(e)` gives it
+                    // back as it is.
+                    let msg = if self.is_str(&self.ty_of(e)) {
+                        format!("format!(\"\\u{{3}}{{}}\", {msg})")
+                    } else {
+                        msg
+                    };
                     self.line(&format!("return Err({msg});"));
                 } else {
                     self.line(&format!("panic!(\"{{}}\", {msg});"));
