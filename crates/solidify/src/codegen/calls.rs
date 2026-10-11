@@ -507,8 +507,13 @@ impl<'a> Gen<'a> {
                 };
                 // A class held dynamically: every value of it is boxed.
                 if self.p.is_dyn(&class) {
+                    let args = match self.resolve(&built_ty) {
+                        Ty::Named(_, args) => args,
+                        _ => Vec::new(),
+                    };
+                    let g = self.dyn_generics(&class, &args, true, e.span)?;
                     return Ok(E::owned(
-                        format!("Box::new({}) as Box<dyn {name}Like>", built.code),
+                        format!("Box::new({}) as Box<dyn {name}Like{g}>", built.code),
                         PREC_CAST,
                     ));
                 }

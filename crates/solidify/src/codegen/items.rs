@@ -6,6 +6,7 @@ use super::{
 use crate::ast::*;
 use crate::infer::{Callee, EnumKind, EnumValue, Role, StructKind};
 use crate::types::Ty;
+use std::collections::HashMap;
 
 impl<'a> Gen<'a> {
     pub(super) fn module(&mut self) -> GResult<String> {
@@ -612,6 +613,56 @@ impl<'a> Gen<'a> {
         self.line("}");
         self.indent -= 1;
         self.line("}");
+        if self.p.enum_names.contains(&en.name) {
+            // `Level[x]`: from a value back to the member's name.
+            self.blank();
+            self.line(&format!("impl {name} {{"));
+            self.indent += 1;
+            self.line("/// `Level[Level.High]`: the member's name.");
+            self.line("#[allow(dead_code)]");
+            self.line("fn name(&self) -> &'static str {");
+            self.indent += 1;
+            self.line("match self {");
+            self.indent += 1;
+            for v in &en.variants {
+                self.line(&format!(
+                    "{name}::{} => {},",
+                    v.name,
+                    string_literal(&v.source)
+                ));
+            }
+            self.indent -= 1;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+            self.blank();
+            self.line(
+                "/// `Level[2]`: the name of the member with this value, `undefined` if none.",
+            );
+            self.line("#[allow(dead_code)]");
+            self.line("fn name_of(value: f64) -> &'static str {");
+            self.indent += 1;
+            let pairs: Vec<String> = en
+                .variants
+                .iter()
+                .map(|v| {
+                    let n = match &v.value {
+                        Some(EnumValue::Num(n)) => *n,
+                        _ => 0.0,
+                    };
+                    format!("({n:?}, {})", string_literal(&v.source))
+                })
+                .collect();
+            self.line(&format!("[{}]", pairs.join(", ")));
+            self.indent += 1;
+            self.line(".iter()");
+            self.line(".find(|(v, _)| *v == value)");
+            self.line(".map_or(\"undefined\", |(_, n)| *n)");
+            self.indent -= 2;
+            self.line("}");
+            self.indent -= 1;
+            self.line("}");
+        }
         Ok(())
     }
 
@@ -1632,6 +1683,15 @@ impl<'a> Gen<'a> {
                 .filter(|(b, _, _)| *b == base)
                 .map(|(_, sub, m)| (sub.clone(), *m))
                 .collect();
+            // A generic base: `trait ContainerLike<T>`, implemented with the arguments
+            // each class gives (`impl ContainerLike<i64> for Cell`).
+            let params = info.type_params.clone();
+            let generics = if params.is_empty() {
+                String::new()
+            } else {
+                format!("<{}>", params.join(", "))
+            };
+            let prev_params = std::mem::replace(&mut self.class_params, params.clone());
             // The trait.
             let mut lines: Vec<String> = Vec::new();
             for f in &fields {
@@ -1647,13 +1707,22 @@ impl<'a> Gen<'a> {
                     lines.push(format!("    fn {fname}_mut(&mut self) -> &mut {t};"));
                 }
             }
-            let mut sigs: Vec<(String, Vec<String>, String, bool)> = Vec::new();
-            for (owner, m) in &methods {
-                let mutable = self.p.method_mutates(m.func.id);
-                let (sig, names) = self.method_sig(m, mutable)?;
-                lines.push(format!("    {sig};"));
-                sigs.push((sig, names, owner.clone(), mutable));
-                let _ = owner;
+            // Each method with the types of the base (an interface's own, with its
+            // parameters), as the calls through the trait pass the arguments.
+            let mut sigs: Vec<(&'a Method, NodeId, bool)> = Vec::new();
+            for (_, m) in &methods {
+                let trait_fn = if iface {
+                    match info.method(&m.name, m.kind) {
+                        Some(im) => im.fn_id,
+                        None => continue,
+                    }
+                } else {
+                    m.func.id
+                };
+                let mutable = self.p.method_mutates(m.func.id) || self.p.method_mutates(trait_fn);
+                let sig = self.trait_sig(m, trait_fn, mutable)?;
+                lines.push(format!("    {};", sig.text(&[])));
+                sigs.push((m, trait_fn, mutable));
             }
             for (sub, mutable) in &tests {
                 let target = if self.p.is_dyn(sub) {
@@ -1674,10 +1743,11 @@ impl<'a> Gen<'a> {
             }
             let clone_name = format!("clone_{}", snake(&base));
             lines.push(format!(
-                "    fn {clone_name}(&self) -> Box<dyn {trait_name}>;"
+                "    fn {clone_name}(&self) -> Box<dyn {trait_name}{generics}>;"
             ));
+            self.class_params = prev_params;
             out.push_str(&format!(
-                "\n/// `{base}`{}.\ntrait {trait_name}: {} {{\n{}\n}}\n",
+                "\n/// `{base}`{}.\ntrait {trait_name}{generics}: {} {{\n{}\n}}\n",
                 if iface {
                     " and the classes implementing it"
                 } else {
@@ -1687,7 +1757,7 @@ impl<'a> Gen<'a> {
                 lines.join("\n")
             ));
             out.push_str(&format!(
-                "\nimpl Clone for Box<dyn {trait_name}> {{\n    fn clone(&self) -> Self {{\n        self.{clone_name}()\n    }}\n}}\n"
+                "\nimpl{generics} Clone for Box<dyn {trait_name}{generics}> {{\n    fn clone(&self) -> Self {{\n        self.{clone_name}()\n    }}\n}}\n"
             ));
             // The implementations: the base itself (unless it is an interface with
             // methods, which no value is of) and what descends from or implements it.
@@ -1700,69 +1770,32 @@ impl<'a> Gen<'a> {
             let order: Vec<String> = self.p.structs.iter().map(|s| s.name.clone()).collect();
             classes.sort_by_key(|c| order.iter().position(|o| o == c));
             for c in classes {
-                if self.p.struct_info(&c).is_none_or(|s| s.is_abstract) {
+                let Some(cinfo) = self.p.struct_info(&c).cloned() else {
+                    continue;
+                };
+                if cinfo.is_abstract {
                     continue;
                 }
-                let cname = pascal(&c);
-                let mut body: Vec<String> = Vec::new();
-                for f in &fields {
-                    let ty = if f.optional {
-                        Ty::Option(Box::new(f.ty.clone()))
-                    } else {
-                        f.ty.clone()
-                    };
-                    let t = self.rust_ty(&ty, f.span)?;
-                    let fname = snake(&f.name);
-                    body.push(format!(
-                        "    fn {fname}(&self) -> &{t} {{\n        &self.{fname}\n    }}"
-                    ));
-                    if self.dyn_setters.contains(&(base.clone(), f.name.clone())) {
-                        body.push(format!(
-                            "    fn {fname}_mut(&mut self) -> &mut {t} {{\n        &mut self.{fname}\n    }}"
-                        ));
-                    }
-                }
-                for (sig, names, _, _) in &sigs {
-                    let method = sig
-                        .trim_start_matches("fn ")
-                        .split('(')
-                        .next()
-                        .unwrap_or_default();
-                    let args = std::iter::once("self".to_string())
-                        .chain(names.iter().cloned())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    body.push(format!(
-                        "    {sig} {{\n        {cname}::{method}({args})\n    }}"
-                    ));
-                }
-                for (sub, mutable) in &tests {
-                    let target = if self.p.is_dyn(sub) {
-                        format!("dyn {}Like", pascal(sub))
-                    } else {
-                        pascal(sub)
-                    };
-                    let is = self.p.is_subclass(&c, sub);
-                    body.push(format!(
-                        "    fn as_{}(&self) -> Option<&{target}> {{\n        {}\n    }}",
-                        snake(sub),
-                        if is { "Some(self)" } else { "None" }
-                    ));
-                    if *mutable {
-                        body.push(format!(
-                            "    fn as_{}_mut(&mut self) -> Option<&mut {target}> {{\n        {}\n    }}",
-                            snake(sub),
-                            if is { "Some(self)" } else { "None" }
-                        ));
-                    }
-                }
-                body.push(format!(
-                    "    fn {clone_name}(&self) -> Box<dyn {trait_name}> {{\n        Box::new(self.clone())\n    }}"
-                ));
-                out.push_str(&format!(
-                    "\nimpl {trait_name} for {cname} {{\n{}\n}}\n",
-                    body.join("\n\n")
-                ));
+                // The base's parameters as this class gives them.
+                let given = self.base_args(&c, &base, iface);
+                let own = cinfo.type_params.clone();
+                let prev_subst = std::mem::replace(&mut self.class_subst, given.clone());
+                let prev_params = std::mem::replace(&mut self.class_params, own.clone());
+                let prev_class = self.current_class.replace(c.clone());
+                let r = self.dyn_impl(
+                    &c,
+                    &base,
+                    &trait_name,
+                    &params,
+                    &fields,
+                    &sigs,
+                    &tests,
+                    &clone_name,
+                );
+                self.class_subst = prev_subst;
+                self.class_params = prev_params;
+                self.current_class = prev_class;
+                out.push_str(&r?);
                 if inspect {
                     self.mark_inspected(&Ty::named(c.clone()));
                 }
@@ -1770,6 +1803,264 @@ impl<'a> Gen<'a> {
         }
         out.push_str(&self.bound_trait_items(file)?);
         Ok(out)
+    }
+
+    /// The signature of a method of a `dyn` trait: the types of `trait_fn` (the base
+    /// class's method, or the interface's, with its parameters), passed as the calls
+    /// through the trait pass them; `m` gives the names.
+    fn trait_sig(&mut self, m: &'a Method, trait_fn: NodeId, mutable: bool) -> GResult<TraitSig> {
+        let info = self.p.funcs[&trait_fn].clone();
+        let own = self.p.funcs[&m.func.id].clone();
+        let bindings = if info.params.len() == info.sig.params.len() {
+            info.params.clone()
+        } else {
+            own.params.clone()
+        };
+        let all = self.all_type_params(&info);
+        let mut params = Vec::new();
+        for (i, b) in bindings.iter().enumerate() {
+            let var = self.p.var(*b).clone();
+            let pt = info.sig.params[i].clone();
+            let mode = self.param_mode(
+                &pt,
+                var.stored || var.shared,
+                var.reassigned,
+                var.mutated,
+                &all,
+            );
+            let pty = self.resolve(&pt);
+            let t = self.mode_ty(&pty, mode, m.span)?;
+            params.push((snake(&var.name), t, mode, pty));
+        }
+        let ret_ty = self.resolve(&info.sig.ret);
+        let ret = self.fn_return_ty(&ret_ty, m.span)?;
+        let ret = if info.throws || own.throws {
+            format!(" -> Result<{ret}, String>")
+        } else if ret == "()" {
+            String::new()
+        } else {
+            format!(" -> {ret}")
+        };
+        let name = match m.kind {
+            MethodKind::Set => format!("set_{}", snake(&m.name)),
+            _ => snake(&m.name),
+        };
+        Ok(TraitSig {
+            name,
+            self_param: if mutable { "&mut self" } else { "&self" },
+            params,
+            ret,
+        })
+    }
+
+    /// How a method passes each parameter.
+    fn param_modes(&self, info: &crate::infer::FnInfo) -> Vec<Mode> {
+        let all = self.all_type_params(info);
+        info.params
+            .iter()
+            .zip(&info.sig.params)
+            .map(|(b, pt)| {
+                let var = self.p.var(*b);
+                self.param_mode(
+                    pt,
+                    var.stored || var.shared,
+                    var.reassigned,
+                    var.mutated,
+                    &all,
+                )
+            })
+            .collect()
+    }
+
+    /// The parameters of `base` (a generic class or interface held as `dyn`) as class
+    /// `c` gives them.
+    fn base_args(&self, c: &str, base: &str, iface: bool) -> HashMap<String, Ty> {
+        let Some(b) = self.p.struct_info(base) else {
+            return HashMap::new();
+        };
+        if b.type_params.is_empty() || c == base {
+            return HashMap::new();
+        }
+        if iface {
+            let args = self
+                .p
+                .ancestry(c)
+                .iter()
+                .filter_map(|a| self.p.struct_info(a))
+                .find_map(|s| {
+                    s.implements_args
+                        .iter()
+                        .find(|(i, _)| i == base)
+                        .map(|(_, a)| a.clone())
+                })
+                .unwrap_or_default();
+            return b.type_params.iter().cloned().zip(args).collect();
+        }
+        let all = self.ancestor_subst(c);
+        b.type_params
+            .iter()
+            .filter_map(|p| all.get(p).map(|t| (p.clone(), t.clone())))
+            .collect()
+    }
+
+    /// `impl BaseLike<…> for C`: the accessors, the methods (calling the class's own,
+    /// each argument passed as it wants), the type tests and the copy.
+    #[allow(clippy::too_many_arguments)]
+    fn dyn_impl(
+        &mut self,
+        c: &str,
+        base: &str,
+        trait_name: &str,
+        params: &[String],
+        fields: &[crate::infer::FieldInfo],
+        sigs: &[(&'a Method, NodeId, bool)],
+        tests: &[(String, bool)],
+        clone_name: &str,
+    ) -> GResult<String> {
+        let cname = pascal(c);
+        let own = self
+            .p
+            .struct_info(c)
+            .map(|s| s.type_params.clone())
+            .unwrap_or_default();
+        let span = self.p.struct_info(c).map(|s| s.span).unwrap_or_default();
+        let trait_args = if params.is_empty() {
+            String::new()
+        } else {
+            let mut parts = Vec::new();
+            for p in params {
+                parts.push(self.rust_ty(&Ty::named(p.clone()), span)?);
+            }
+            format!("<{}>", parts.join(", "))
+        };
+        let (impl_generics, c_generics) = if own.is_empty() {
+            (String::new(), String::new())
+        } else {
+            let inspect = self.helpers.contains(&Helper::Inspect);
+            let known = self
+                .known_bounds
+                .get(&format!("struct:{c}"))
+                .cloned()
+                .unwrap_or_default();
+            let list: Vec<String> = own
+                .iter()
+                .map(|p| {
+                    let mut b: std::collections::BTreeSet<&str> =
+                        ["Clone", "std::fmt::Debug", "'static"]
+                            .into_iter()
+                            .collect();
+                    if inspect {
+                        b.insert("JsInspect");
+                    }
+                    if let Some(more) = known.get(p) {
+                        b.extend(more.iter().copied());
+                    }
+                    format!("{p}: {}", b.into_iter().collect::<Vec<_>>().join(" + "))
+                })
+                .collect();
+            (
+                format!("<{}>", list.join(", ")),
+                format!("<{}>", own.join(", ")),
+            )
+        };
+        let mut body: Vec<String> = Vec::new();
+        for f in fields {
+            let ty = if f.optional {
+                Ty::Option(Box::new(f.ty.clone()))
+            } else {
+                f.ty.clone()
+            };
+            let t = self.rust_ty(&ty, f.span)?;
+            let fname = snake(&f.name);
+            body.push(format!(
+                "    fn {fname}(&self) -> &{t} {{\n        &self.{fname}\n    }}"
+            ));
+            if self
+                .dyn_setters
+                .contains(&(base.to_string(), f.name.clone()))
+            {
+                body.push(format!(
+                    "    fn {fname}_mut(&mut self) -> &mut {t} {{\n        &mut self.{fname}\n    }}"
+                ));
+            }
+        }
+        for (m, trait_fn, mutable) in sigs {
+            let sig = self.trait_sig(m, *trait_fn, *mutable)?;
+            let Some((_, cm)) = self
+                .class_methods(c)
+                .into_iter()
+                .find(|(_, x)| x.name == m.name && x.kind == m.kind)
+            else {
+                continue;
+            };
+            let target = self.p.funcs[&cm.func.id].clone();
+            let wanted = self.param_modes(&target);
+            let mut args = vec!["self".to_string()];
+            let mut muts = Vec::new();
+            for (i, (name, _, mode, ty)) in sig.params.iter().enumerate() {
+                let to = wanted.get(i).copied().unwrap_or(*mode);
+                let (code, needs_mut) = self.adapt_arg(name, *mode, to, ty);
+                args.push(code);
+                muts.push(needs_mut);
+            }
+            body.push(format!(
+                "    {} {{\n        {cname}::{}({})\n    }}",
+                sig.text(&muts),
+                sig.name,
+                args.join(", ")
+            ));
+        }
+        for (sub, mutable) in tests {
+            let target = if self.p.is_dyn(sub) {
+                format!("dyn {}Like", pascal(sub))
+            } else {
+                pascal(sub)
+            };
+            let is = self.p.is_subclass(c, sub);
+            body.push(format!(
+                "    fn as_{}(&self) -> Option<&{target}> {{\n        {}\n    }}",
+                snake(sub),
+                if is { "Some(self)" } else { "None" }
+            ));
+            if *mutable {
+                body.push(format!(
+                    "    fn as_{}_mut(&mut self) -> Option<&mut {target}> {{\n        {}\n    }}",
+                    snake(sub),
+                    if is { "Some(self)" } else { "None" }
+                ));
+            }
+        }
+        body.push(format!(
+            "    fn {clone_name}(&self) -> Box<dyn {trait_name}{trait_args}> {{\n        Box::new(self.clone())\n    }}"
+        ));
+        Ok(format!(
+            "\nimpl{impl_generics} {trait_name}{trait_args} for {cname}{c_generics} {{\n{}\n}}\n",
+            body.join("\n\n")
+        ))
+    }
+
+    /// An argument received as `from` and passed on as `to` (`&x`, `x.clone()`…); and
+    /// whether the parameter must be `mut`.
+    fn adapt_arg(&self, name: &str, from: Mode, to: Mode, ty: &Ty) -> (String, bool) {
+        let copy = self.is_copy(ty);
+        let str_inner = matches!(self.resolve(ty), Ty::Option(ref i) if self.is_str(i));
+        let code = match (from, to) {
+            (a, b) if a == b => name.to_string(),
+            (Mode::Value, Mode::Ref | Mode::Slice | Mode::StrRef) => format!("&{name}"),
+            (Mode::Value, Mode::RefMut) => return (format!("&mut {name}"), true),
+            (Mode::Value, Mode::OptRef) if str_inner => format!("{name}.as_deref()"),
+            (Mode::Value, Mode::OptRef) => format!("{name}.as_ref()"),
+            (Mode::Ref | Mode::RefMut, Mode::Value) if copy => format!("*{name}"),
+            (Mode::Ref | Mode::RefMut, Mode::Value) => format!("{name}.clone()"),
+            (Mode::StrRef, Mode::Value) => format!("{name}.to_string()"),
+            (Mode::Slice, Mode::Value) => format!("{name}.to_vec()"),
+            (Mode::OptRef, Mode::Value) if str_inner => format!("{name}.map(str::to_string)"),
+            (Mode::OptRef, Mode::Value) => format!("{name}.cloned()"),
+            (Mode::StrRef, Mode::Ref) => format!("&{name}.to_string()"),
+            (Mode::Slice, Mode::Ref) => format!("&{name}.to_vec()"),
+            _ => name.to_string(),
+        };
+        (code, false)
     }
 
     /// The traits of the constraints (`T extends HasId` → `trait HasIdLike`): an accessor
@@ -2099,3 +2390,28 @@ fn indent_text(text: &str, levels: usize) -> String {
 
 #[allow(dead_code)]
 fn unused(_: Role) {}
+
+/// A method of a `dyn` trait, as declared and as implemented.
+struct TraitSig {
+    name: String,
+    self_param: &'static str,
+    /// Name, Rust type, how it is passed, and its type.
+    params: Vec<(String, String, Mode, Ty)>,
+    ret: String,
+}
+
+impl TraitSig {
+    /// `fn name(&self, x: T) -> R`, with `mut` before the parameters marked.
+    fn text(&self, muts: &[bool]) -> String {
+        let mut all = vec![self.self_param.to_string()];
+        for (i, (name, t, _, _)) in self.params.iter().enumerate() {
+            let m = if muts.get(i).copied().unwrap_or(false) {
+                "mut "
+            } else {
+                ""
+            };
+            all.push(format!("{m}{name}: {t}"));
+        }
+        format!("fn {}({}){}", self.name, all.join(", "), self.ret)
+    }
+}

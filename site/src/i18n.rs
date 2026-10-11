@@ -110,7 +110,7 @@ static EN: Dict = Dict {
         cta2: "Install the CLI",
         facts: [
             ("0", "dependencies"),
-            ("30", "programs checked against Node.js"),
+            ("33", "programs checked against Node.js"),
             ("1", "Rust file out, however many files in"),
         ],
     },
@@ -258,6 +258,14 @@ static EN: Dict = Dict {
                 "f?.(), obj?.method(), fields of function type",
                 "if let Some(f) = …, .map(|o| o.method()), Rc<dyn Fn(…)> fields",
             ),
+            (
+                "class Stack<T>, interface Page<T>, <T extends HasId>, f<number>(x)",
+                "struct Stack<T> + impl<T: …>, bounds found across the program, constraint traits",
+            ),
+            (
+                "interface Listener<T> { notify(v: T): void }",
+                "trait ListenerLike<T>, Box<dyn ListenerLike<String>>",
+            ),
         ],
         limits_title: "What stays different",
         limits: "Rust values are not JavaScript references: an object stored in two places is copied, and changing one copy leaves the other alone (variables changed inside closures that outlive them are shared). Numbers are `i64` until a float is involved, so an integer that overflows panics where JavaScript would lose precision. Imports go between your own files only, not to packages. `JSON` replacers and revivers, `Symbol`, `Proxy`, `eval`, prototypes and `arguments` have no Rust counterpart and are refused with a clear message.",
@@ -299,7 +307,7 @@ static FR: Dict = Dict {
         cta2: "Installer la ligne de commande",
         facts: [
             ("0", "dépendance"),
-            ("30", "programmes vérifiés contre Node.js"),
+            ("33", "programmes vérifiés contre Node.js"),
             (
                 "1",
                 "fichier Rust en sortie, autant de fichiers en entrée que voulu",
@@ -449,6 +457,14 @@ static FR: Dict = Dict {
             (
                 "f?.(), obj?.method(), champs de type fonction",
                 "if let Some(f) = …, .map(|o| o.method()), champs Rc<dyn Fn(…)>",
+            ),
+            (
+                "class Stack<T>, interface Page<T>, <T extends HasId>, f<number>(x)",
+                "struct Stack<T> + impl<T: …>, bornes trouvées dans tout le programme, traits de contrainte",
+            ),
+            (
+                "interface Listener<T> { notify(v: T): void }",
+                "trait ListenerLike<T>, Box<dyn ListenerLike<String>>",
             ),
         ],
         limits_title: "Ce qui reste différent",

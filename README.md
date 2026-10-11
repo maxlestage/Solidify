@@ -106,7 +106,11 @@ Three passes, all deterministic:
 | `for … of`, `for (;;)`, `while`, labels | `for x in &v`, `for i in a..b`, `loop`, `'label` |
 | `switch` | `match`, with grouped cases |
 | `async`, `await` | `async fn`, `.await`, a small executor for `main` |
-| `function f<T>(x: T)` | `fn f<T: Clone + PartialEq>(x: T)`, bounds from use |
+| `function f<T>(x: T)`, `f<number>(x)` | `fn f<T: Clone + PartialEq>(x: T)`, bounds from use |
+| `class Stack<T>`, `interface Page<T>`, `type Entry<K, V>`, `extends Stack<number>`, `<T extends HasId>` | `struct Stack<T>` + `impl<T: …>`, bounds found across the program, a `HasIdLike` trait for constraints |
+| `interface Listener<T> { notify(v: T): void }`, `abstract class Shape<T>` | `trait ListenerLike<T>`, `Box<dyn ListenerLike<String>>` |
+| methods returning `this`, `a.add(1).add(2)` | `&mut Self`: the calls chain on one object |
+| `enum Level { … }`, `Level[Level.High]` | `enum` with `Display`, `Level::High.name()` |
 | `console.log`, `Math`, `parseInt`… | `println!`, `f64` methods, small helpers appended to the file |
 | recursive classes | `Option<Box<T>>` |
 | `class B extends A`, `abstract`, `super`, `protected`, `instanceof` | flattened structs, a trait per base class, `Box<dyn ALike>` where an `A` is expected |
@@ -129,7 +133,7 @@ What stays different, because Rust values are not JavaScript references: an obje
 Four rules worth knowing:
 
 - **Integers first.** `let n = 0` is an `i64`. Write `2.0`, divide, or read the number from JSON, and the whole family of that number becomes `f64`. `parseFloat` and `Number()` return `f64`, because they can return `NaN`; `parseInt` returns `Option<i64>`.
-- **Null is `Option`.** Test nullable values with `!== null`, `!== undefined` or `??`; the generated Rust uses `if let`, `let … else` and `unwrap_or`. Reading a field of a value that may be null is an error, as in TypeScript's strict mode.
+- **Null is `Option`.** Test nullable values with `!== null`, `!== undefined` or `??`; the generated Rust uses `if let`, `let … else` and `unwrap_or`. Reading a field of a value that may be null is an error, as in TypeScript's strict mode. `console.log` prints `undefined` or `null` as Node.js does, from where the missing value comes.
 - **Throw is `Result`.** `throw new Error("…")` becomes `return Err("…".to_string())`; `catch (e)` receives the message as a `String`. `JSON.parse` throws the same `SyntaxError` messages as V8.
 - **Files are modules.** Top-level statements become `main`, imported files first, as Node.js runs them; top-level `const`s holding literals become Rust `const`s; other top-level variables read inside functions become `static`s (`LazyLock`, with a `Mutex` when they change). Each imported file becomes a `mod`, its exports `pub`; the files share one namespace, so two files cannot declare the same top-level name.
 
@@ -140,7 +144,7 @@ Four rules worth knowing:
 | Folder | Contents |
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | The transpiler: lexer, parser, type inference, code generation, CLI |
-| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 30 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
+| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 33 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
 | [`site`](site) | The website: a playground running Solidify as WebAssembly, written with [active](https://github.com/maxlestage/Active) |
 
 ## Development

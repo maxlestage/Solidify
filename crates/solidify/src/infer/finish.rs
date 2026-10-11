@@ -34,9 +34,15 @@ impl<'m> Infer<'m> {
             }
         }
         self.propagate_throws();
-        self.propagate_mutation();
-        // A method is mutating when any implementation or override of it is.
+        // A method is mutating when any implementation or override of it is: known
+        // before what calls it is settled, and again after.
         let ids: Vec<NodeId> = self.funcs.keys().copied().collect();
+        for id in &ids {
+            if self.method_mutates(*id) {
+                self.funcs.get_mut(id).expect("fn").mutates_self = true;
+            }
+        }
+        self.propagate_mutation();
         for id in ids {
             if self.method_mutates(id) {
                 self.funcs.get_mut(&id).expect("fn").mutates_self = true;
@@ -151,6 +157,7 @@ impl<'m> Infer<'m> {
             undef_fns,
             undef_fields,
             undef_elem_vars: HashSet::new(),
+            enum_names: std::mem::take(&mut self.enum_names),
         };
         program.settle_undefined(&var_inits, &fn_returns);
         Ok(program)
@@ -404,6 +411,16 @@ impl<'m> Infer<'m> {
                     if let Some(p) = v.param_of {
                         self.param_mutated.insert(p);
                     }
+                    changed = true;
+                }
+            }
+            // A loop variable over a field of `this`, changed: the method changes `this`.
+            for (var, method) in self.loop_this_sources.clone() {
+                if self.vars.get(&var).is_some_and(|v| v.mutated)
+                    && let Some(f) = self.funcs.get_mut(&method)
+                    && !f.mutates_self
+                {
+                    f.mutates_self = true;
                     changed = true;
                 }
             }
