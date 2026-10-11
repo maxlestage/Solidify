@@ -54,6 +54,8 @@ pub const EXAMPLES: &[Example] = &[
     case!("plain", "Plain JavaScript", "JavaScript sans types"),
     case!("unions", "Unions & typeof", "Unions et typeof"),
     case!("inheritance", "Inheritance", "Héritage"),
+    case!("interfaces", "Interfaces as traits", "Interfaces en traits"),
+    case!("spreads", "Spreads & rest", "Spreads et rest"),
     case!("generators", "Generators", "Générateurs"),
     case!("regex", "Regular expressions", "Expressions régulières"),
     case!("json", "JSON", "JSON"),

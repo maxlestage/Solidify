@@ -110,6 +110,7 @@ Three passes, all deterministic:
 | `console.log`, `Math`, `parseInt`… | `println!`, `f64` methods, small helpers appended to the file |
 | recursive classes | `Option<Box<T>>` |
 | `class B extends A`, `abstract`, `super`, `protected`, `instanceof` | flattened structs, a trait per base class, `Box<dyn ALike>` where an `A` is expected |
+| `interface Shape { area(): number }`, `class C implements Shape`, `interface A extends B` | a trait per interface, `impl ShapeLike for C`, `Box<dyn ShapeLike>` / `&dyn ShapeLike` where a `Shape` is expected |
 | `A \| B`, `[1, "two"]`, discriminated unions, `typeof x === "string"`, `"kind" in x` | `enum` with one variant per member, `match` |
 | `function*`, `yield`, `yield*` | `JsGenerator<T>`, `for x in gen` |
 | `setTimeout`, `setInterval`, `clearTimeout`, `new Promise`, `Promise.all` | an event loop run by `main`, `JsPromise` |
@@ -137,7 +138,7 @@ Four rules worth knowing:
 | Folder | Contents |
 | --- | --- |
 | [`crates/solidify`](crates/solidify) | The transpiler: lexer, parser, type inference, code generation, CLI |
-| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 27 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
+| [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 28 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
 | [`site`](site) | The website: a playground running Solidify as WebAssembly, written with [active](https://github.com/maxlestage/Active) |
 
 ## Development
