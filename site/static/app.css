@@ -4068,6 +4068,9 @@ kbd {
   position: relative;
   isolation: isolate;
   display: grid;
+  /* The column is the screen's width: the search's example text is cut with an ellipsis
+     instead of widening the hero on a 320 px phone. */
+  grid-template-columns: minmax(0, 1fr);
   justify-items: center;
   padding: clamp(48px, 8vw, 104px) 0 clamp(40px, 6vw, 72px);
   text-align: center;
