@@ -69,6 +69,13 @@ fn document(route: Route, origin: &str, head: Head, main: Element) -> String {
         .description(head.description)
         .locale(d.locale)
         .base_url(origin)
+        .image("/static/og-image.png")
+        .meta_property("og:image:width", "1200")
+        .meta_property("og:image:height", "630")
+        .meta_property(
+            "og:image:alt",
+            "Solidify: write TypeScript, ship Rust. A TypeScript function and the Rust it becomes.",
+        )
         .canonical(route.path())
         .json_ld(head.json_ld);
     for other in Lang::ALL {
@@ -909,6 +916,14 @@ mod tests {
             assert!(html.contains("class=\"loader\""));
             // The stylesheet's address changes with it.
             assert!(html.contains("/static/app.css?v="));
+            assert!(html.contains(
+                r#"<meta property="og:image" content="https://example.com/static/og-image.png"/>"#
+            ));
+            // The card of a shared link: the image, its size and its description.
+            assert!(html.contains(r#"<meta property="og:image:width" content="1200"/>"#));
+            assert!(html.contains(r#"<meta property="og:image:height" content="630"/>"#));
+            assert!(html.contains(r#"<meta property="og:image:alt" content="#));
+            assert!(html.contains(r#"<meta name="twitter:card" content="summary_large_image"/>"#));
         }
         let fr = home(Lang::Fr, "https://example.com");
         assert!(fr.contains("<html lang=\"fr\""));
