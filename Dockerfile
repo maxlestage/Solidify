@@ -7,6 +7,8 @@ RUN rustup target add wasm32-unknown-unknown \
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
+# The documentation's pages are built into the server.
+COPY docs docs
 COPY site site
 RUN cargo build -p solidify-site --lib --target wasm32-unknown-unknown --profile wasm-release \
  && wasm-bindgen --target web --no-typescript --out-dir site/pkg target/wasm32-unknown-unknown/wasm-release/solidify_site.wasm \

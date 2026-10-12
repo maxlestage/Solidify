@@ -3,7 +3,8 @@
 //! - A language picked in the header or the footer (`a[data-lang]`) is kept in
 //!   `localStorage` under [`STORE`], and opened from then on.
 //! - Without one, the browser's languages (`navigator.languages`) decide, on the English
-//!   home page only: a link straight to `/fr/` or `/es/` stays where it leads.
+//!   pages only: a link straight to `/fr/…` or `/es/…` stays where it leads.
+//! - Either way, the same page opens in that language (the language picker's link to it).
 //! - "Automatic" (`data-lang="auto"`) forgets the choice.
 
 use wasm_bindgen::JsCast;
@@ -42,11 +43,13 @@ pub fn redirect() -> bool {
     };
     match wanted {
         Some(lang) if lang != here => {
+            // The same page in that language: the picker links to it.
+            let target = super::first(&format!(".lang-list a[data-lang=\"{}\"]", lang.code()))
+                .and_then(|a| a.get_attribute("href"))
+                .unwrap_or_else(|| link(lang.path()));
             let location = window().location();
             let hash = location.hash().unwrap_or_default();
-            location
-                .replace(&format!("{}{hash}", link(lang.path())))
-                .is_ok()
+            location.replace(&format!("{target}{hash}")).is_ok()
         }
         _ => false,
     }

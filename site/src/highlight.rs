@@ -198,6 +198,40 @@ fn span(out: &mut String, class: &str, text: &str) {
     out.push_str("</span>");
 }
 
+/// Shell commands and TOML: comments (a whole line, or after ` #`) dimmed, strings in
+/// double quotes marked.
+pub fn shell(text: &str) -> String {
+    let mut out = String::new();
+    for (i, line) in text.lines().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let (code, comment) = if line.trim_start().starts_with('#') {
+            ("", line)
+        } else {
+            match line.find(" #") {
+                Some(at) => line.split_at(at + 1),
+                None => (line, ""),
+            }
+        };
+        // Odd parts are inside quotes; the last one may lack its closing quote.
+        let parts: Vec<&str> = code.split('"').collect();
+        for (n, part) in parts.iter().enumerate() {
+            if n % 2 == 0 {
+                escape_into(&mut out, part);
+            } else if n + 1 < parts.len() {
+                span(&mut out, "s", &format!("\"{part}\""));
+            } else {
+                span(&mut out, "s", &format!("\"{part}"));
+            }
+        }
+        if !comment.is_empty() {
+            span(&mut out, "c", comment);
+        }
+    }
+    out
+}
+
 /// Escapes text for HTML.
 pub fn escape_into(out: &mut String, text: &str) {
     for c in text.chars() {
@@ -229,5 +263,9 @@ mod tests {
         assert!(rust.contains("<span class=\"f\">main</span>"));
         assert!(rust.contains("<span class=\"m\">println</span>"));
         assert!(rust.contains("<span class=\"t\">Vec</span>"));
+        assert_eq!(
+            shell("# all\nnpx a \"b c\" # d\nx = \"y"),
+            "<span class=\"c\"># all</span>\nnpx a <span class=\"s\">&quot;b c&quot;</span> <span class=\"c\"># d</span>\nx = <span class=\"s\">&quot;y</span>"
+        );
     }
 }
