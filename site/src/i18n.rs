@@ -14,6 +14,7 @@ pub struct Dict {
     pub supported: Supported,
     pub install: Install,
     pub footer: Footer,
+    pub docs: Docs,
 }
 
 pub struct Nav {
@@ -106,6 +107,46 @@ pub struct Footer {
     pub top: &'static str,
     pub copy: &'static str,
     pub copied: &'static str,
+}
+
+/// The documentation, its search, and the menu that leads to it.
+pub struct Docs {
+    /// Its name, as a title.
+    pub title: &'static str,
+    /// Its name in the header's menu.
+    pub nav: &'static str,
+    /// Under the title of the documentation's home.
+    pub lead: &'static str,
+    /// The button that opens the search, and the search field's label and placeholder.
+    pub search: &'static str,
+    pub search_label: &'static str,
+    pub search_placeholder: &'static str,
+    /// When nothing matches, and how to use the keyboard there.
+    pub search_empty: &'static str,
+    pub search_keys: &'static str,
+    pub close: &'static str,
+    /// The quick links of the documentation's home, and the number of pages of a
+    /// category (`{}` is the number).
+    pub start_here: &'static str,
+    pub pages: &'static str,
+    /// A page: its table of contents, the pages before and after it, the link to its
+    /// source, and the button that opens the list of pages on small screens.
+    pub toc: &'static str,
+    pub prev: &'static str,
+    pub next: &'static str,
+    pub edit: &'static str,
+    pub all_pages: &'static str,
+    /// Callouts, and the word between a TypeScript block and its Rust.
+    pub note: &'static str,
+    pub tip: &'static str,
+    pub warning: &'static str,
+    pub becomes: &'static str,
+    /// The header's menu: its groups, and the card that leads to the playground.
+    pub menu_sections: &'static str,
+    pub menu_resources: &'static str,
+    pub menu_try: &'static str,
+    pub menu_try_text: &'static str,
+    pub home: &'static str,
 }
 
 pub fn t(lang: Lang) -> &'static Dict {
@@ -369,6 +410,33 @@ static EN: Dict = Dict {
         copy: "Copy",
         copied: "Copied",
     },
+    docs: Docs {
+        title: "Documentation",
+        nav: "Docs",
+        lead: "Everything Solidify does with your TypeScript: how to run it, what each construct becomes in Rust, and where the limits are. Every example on these pages is checked against the transpiler.",
+        search: "Search",
+        search_label: "Search the documentation",
+        search_placeholder: "Option, async, classes, --check…",
+        search_empty: "No page matches. Try another word.",
+        search_keys: "↑ ↓ to choose · Enter to open · Esc to close",
+        close: "Close",
+        start_here: "Start here",
+        pages: "{} pages",
+        toc: "On this page",
+        prev: "Previous",
+        next: "Next",
+        edit: "Edit this page on GitHub",
+        all_pages: "All pages",
+        note: "Note",
+        tip: "Tip",
+        warning: "Warning",
+        becomes: "becomes",
+        menu_sections: "On the home page",
+        menu_resources: "Resources",
+        menu_try: "Try it now",
+        menu_try_text: "The playground runs Solidify in your browser.",
+        home: "Home",
+    },
 };
 
 static FR: Dict = Dict {
@@ -626,6 +694,33 @@ static FR: Dict = Dict {
         top: "Haut de page",
         copy: "Copier",
         copied: "Copié",
+    },
+    docs: Docs {
+        title: "Documentation",
+        nav: "Docs",
+        lead: "Tout ce que Solidify fait de votre TypeScript : comment le lancer, ce que devient chaque construction en Rust, et où sont les limites. Chaque exemple de ces pages est vérifié avec le transpileur.",
+        search: "Rechercher",
+        search_label: "Rechercher dans la documentation",
+        search_placeholder: "Option, async, classes, --check…",
+        search_empty: "Aucune page ne correspond. Essayez un autre mot.",
+        search_keys: "↑ ↓ pour choisir · Entrée pour ouvrir · Échap pour fermer",
+        close: "Fermer",
+        start_here: "Pour commencer",
+        pages: "{} pages",
+        toc: "Sur cette page",
+        prev: "Précédent",
+        next: "Suivant",
+        edit: "Modifier cette page sur GitHub",
+        all_pages: "Toutes les pages",
+        note: "Note",
+        tip: "Astuce",
+        warning: "Attention",
+        becomes: "devient",
+        menu_sections: "Sur la page d'accueil",
+        menu_resources: "Ressources",
+        menu_try: "Essayer maintenant",
+        menu_try_text: "Le bac à sable fait tourner Solidify dans votre navigateur.",
+        home: "Accueil",
     },
 };
 
@@ -887,5 +982,32 @@ static ES: Dict = Dict {
         top: "Volver arriba",
         copy: "Copiar",
         copied: "Copiado",
+    },
+    docs: Docs {
+        title: "Documentación",
+        nav: "Docs",
+        lead: "Todo lo que Solidify hace con tu TypeScript: cómo ejecutarlo, en qué se convierte cada construcción en Rust y dónde están los límites. Cada ejemplo de estas páginas se comprueba con el transpilador.",
+        search: "Buscar",
+        search_label: "Buscar en la documentación",
+        search_placeholder: "Option, async, clases, --check…",
+        search_empty: "Ninguna página coincide. Prueba otra palabra.",
+        search_keys: "↑ ↓ para elegir · Intro para abrir · Esc para cerrar",
+        close: "Cerrar",
+        start_here: "Para empezar",
+        pages: "{} páginas",
+        toc: "En esta página",
+        prev: "Anterior",
+        next: "Siguiente",
+        edit: "Editar esta página en GitHub",
+        all_pages: "Todas las páginas",
+        note: "Nota",
+        tip: "Consejo",
+        warning: "Atención",
+        becomes: "se convierte en",
+        menu_sections: "En la página de inicio",
+        menu_resources: "Recursos",
+        menu_try: "Pruébalo ahora",
+        menu_try_text: "La zona de pruebas ejecuta Solidify en tu navegador.",
+        home: "Inicio",
     },
 };

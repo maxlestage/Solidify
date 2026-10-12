@@ -47,6 +47,8 @@ fn main() {
 
 📚 **Site web, avec un bac à sable qui exécute Solidify dans le navigateur** : le site dans [`site/`](site), lui-même écrit avec [active](https://github.com/maxlestage/Active) et publié sur https://maxlestage.github.io/Solidify/fr/. Lancez-le avec `cargo run -p solidify-site`.
 
+📖 **Documentation** : 16 pages, de l'[introduction](docs/fr/introduction.md) et du [démarrage rapide](docs/fr/quick-start.md) à la [ligne de commande](docs/fr/cli.md), la [bibliothèque Rust](docs/fr/library.md) et la table complète de [ce qui se traduit en quoi](docs/fr/mapping.md). Dans [`docs/`](docs) en français, anglais et espagnol, et sur le site à https://maxlestage.github.io/Solidify/fr/docs/ avec une recherche. Chacun de ses exemples est vérifié avec le transpileur.
+
 ## Installer
 
 Rien à installer d'autre que Node.js 20 ou plus récent : `npx` lance Solidify, compilé en WebAssembly, sur vos fichiers.
@@ -153,7 +155,8 @@ Quatre règles à connaître :
 | [`crates/solidify`](crates/solidify) | Le transpileur : lexeur, parseur, inférence de types, génération de code, ligne de commande |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programmes traduits, compilés avec `rustc` et comparés à ce que Node.js imprime (un dossier contient un programme de plusieurs fichiers) |
 | [`npm`](npm) | Le paquet `solidify-rs` pour `npx` : un lanceur Node.js du transpileur compilé en WebAssembly (WASI), vérifié contre les programmes de test par `cargo test -p solidify --test npm` |
-| [`site`](site) | Le site web, écrit avec [active](https://github.com/maxlestage/Active) : un bac à sable qui exécute Solidify en WebAssembly, trois langues choisies automatiquement ou à la main, une app installable qui marche hors ligne, de nombreuses animations. [`site/README.md`](site/README.md) documente le tout |
+| [`docs`](docs) | La documentation, en anglais, français et espagnol (`docs/{en,fr,es}/*.md`) : le site l'affiche, et un test vérifie chaque exemple avec le transpileur |
+| [`site`](site) | Le site web, écrit avec [active](https://github.com/maxlestage/Active) : un bac à sable qui exécute Solidify en WebAssembly, la documentation avec un menu et une recherche, trois langues choisies automatiquement ou à la main, une app installable qui marche hors ligne, de nombreuses animations. [`site/README.md`](site/README.md) documente le tout |
 
 ## Développement
 

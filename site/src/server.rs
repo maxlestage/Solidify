@@ -10,7 +10,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 
 use crate::pages;
-use crate::routes::{Lang, base, set_base};
+use crate::routes::{Lang, Route, base, set_base};
 
 /// The `site/` folder: `SITE_DIR`, or the crate's folder.
 pub fn site_dir() -> PathBuf {
@@ -28,6 +28,7 @@ fn content_type(path: &str) -> &'static str {
         Some("woff2") => "font/woff2",
         Some("txt") => "text/plain; charset=utf-8",
         Some("webmanifest") => "application/manifest+json",
+        Some("xml") => "application/xml; charset=utf-8",
         Some("html") => "text/html; charset=utf-8",
         _ => "application/octet-stream",
     }
@@ -54,11 +55,11 @@ pub fn respond(path: &str, host: &str) -> (&'static str, &'static str, Vec<u8>) 
     if path.contains("..") {
         return ("404 Not Found", "text/plain", b"not found".to_vec());
     }
-    if let Some(lang) = Lang::from_path(path) {
+    if let Some(route) = Route::parse(path) {
         return (
             "200 OK",
             "text/html; charset=utf-8",
-            pages::home(lang, &origin(host)).into_bytes(),
+            pages::render(route, &origin(host)).into_bytes(),
         );
     }
     let relative = path.strip_prefix(base()).unwrap_or(path);
@@ -68,6 +69,13 @@ pub fn respond(path: &str, host: &str) -> (&'static str, &'static str, Vec<u8>) 
                 "200 OK",
                 content_type(relative),
                 crate::pwa::manifest().to_json().into_bytes(),
+            );
+        }
+        "/sitemap.xml" => {
+            return (
+                "200 OK",
+                content_type(relative),
+                sitemap(&origin(host)).into_bytes(),
             );
         }
         "/sw.js" => {
@@ -97,17 +105,41 @@ pub fn respond(path: &str, host: &str) -> (&'static str, &'static str, Vec<u8>) 
     }
 }
 
+/// `sitemap.xml`: every page, each with its address in the other languages, for search
+/// engines.
+pub fn sitemap(origin: &str) -> String {
+    let mut xml = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\" xmlns:xhtml=\"http://www.w3.org/1999/xhtml\">\n",
+    );
+    for route in Route::all() {
+        xml.push_str(&format!(
+            "  <url>\n    <loc>{origin}{}</loc>\n",
+            route.path()
+        ));
+        for lang in Lang::ALL {
+            xml.push_str(&format!(
+                "    <xhtml:link rel=\"alternate\" hreflang=\"{}\" href=\"{origin}{}\"/>\n",
+                lang.code(),
+                route.with_lang(lang).path()
+            ));
+        }
+        xml.push_str("  </url>\n");
+    }
+    xml.push_str("</urlset>\n");
+    xml
+}
+
 /// The service worker for the pages as rendered at `origin` (`None` while
 /// `site/pkg/worker` is not built: see site/README.md).
 fn service_worker(origin: &str) -> Option<String> {
-    let pages: Vec<(String, String)> = Lang::ALL
-        .iter()
-        .map(|lang| {
-            let path = match lang.path().trim_start_matches('/') {
+    let pages: Vec<(String, String)> = Route::all()
+        .into_iter()
+        .map(|route| {
+            let path = match route.path().trim_start_matches('/') {
                 "" => "./".to_string(),
                 p => p.to_string(),
             };
-            (path, pages::home(*lang, origin))
+            (path, pages::render(route, origin))
         })
         .collect();
     let (files, version) = crate::pwa::offline_files(&site_dir(), &pages);
@@ -172,9 +204,9 @@ pub fn export(out: &Path) -> io::Result<usize> {
         written += 1;
         Ok(())
     };
-    for lang in Lang::ALL {
-        let html = pages::home(lang, &origin);
-        write(&format!("{}index.html", lang.path()), html.as_bytes())?;
+    for route in Route::all() {
+        let html = pages::render(route, &origin);
+        write(&format!("{}index.html", route.path()), html.as_bytes())?;
     }
     write("404.html", pages::home(Lang::En, &origin).as_bytes())?;
     // The installable app: its manifest, and the service worker that keeps it offline.
@@ -182,6 +214,7 @@ pub fn export(out: &Path) -> io::Result<usize> {
         "manifest.webmanifest",
         crate::pwa::manifest().to_json().as_bytes(),
     )?;
+    write("sitemap.xml", sitemap(&origin).as_bytes())?;
     match service_worker(&origin) {
         Some(worker) => write("sw.js", worker.as_bytes())?,
         None => eprintln!("warning: site/pkg/worker is missing, the site will not work offline"),
@@ -243,6 +276,9 @@ mod tests {
         let (status, kind, _) = respond("/static/app.css", "localhost");
         assert_eq!(status, "200 OK");
         assert_eq!(kind, "text/css; charset=utf-8");
+        let (status, _, body) = respond("/es/docs/cli/", "localhost");
+        assert_eq!(status, "200 OK");
+        assert!(String::from_utf8_lossy(&body).contains("<html lang=\"es\""));
         let (status, _, _) = respond("/static/../Cargo.toml", "localhost");
         assert_eq!(status, "404 Not Found");
     }
@@ -278,12 +314,18 @@ mod tests {
         assert!(n >= 4);
         assert!(dir.join("index.html").exists());
         assert!(dir.join("fr/index.html").exists());
+        assert!(dir.join("docs/index.html").exists());
+        assert!(dir.join("es/docs/cli/index.html").exists());
         assert!(dir.join("static/app.css").exists());
         assert!(dir.join(".nojekyll").exists());
         assert!(dir.join("manifest.webmanifest").exists());
+        let sitemap = std::fs::read_to_string(dir.join("sitemap.xml")).unwrap();
+        assert_eq!(sitemap.matches("<url>").count(), Route::all().len());
+        assert!(sitemap.contains("/fr/docs/quick-start/</loc>"));
         // The worker exists once site/pkg/worker is built (CI builds it before exporting).
         if let Ok(sw) = std::fs::read_to_string(dir.join("sw.js")) {
             assert!(sw.contains("\"static/app.css\"") && sw.contains("\"fr/\""));
+            assert!(sw.contains("\"fr/docs/quick-start/\""));
             assert!(sw.contains("wasm_bindgen.serve(\"solidify-"));
             assert!(!sw.contains("\"pkg/worker"));
         }
