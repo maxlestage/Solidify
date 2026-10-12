@@ -1,3 +1,5 @@
+[![Solidify: write TypeScript, ship Rust. A TypeScript function and the Rust it becomes](https://raw.githubusercontent.com/maxlestage/Solidify/master/site/static/og-image.png)](https://maxlestage.github.io/Solidify/)
+
 # Solidify
 
 **English** · [Français](README.fr.md) · [Español](README.es.md)

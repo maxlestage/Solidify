@@ -1,3 +1,5 @@
+[![Solidify: write TypeScript, ship Rust. A TypeScript function and the Rust it becomes](https://raw.githubusercontent.com/maxlestage/Solidify/master/site/static/og-image.png)](https://maxlestage.github.io/Solidify/)
+
 # solidify
 
 **Write TypeScript or JavaScript, get Rust.** A transpiler with no dependency: one file in, one Rust file out, with structs, enums, `Option`, `Result`, iterators and ownership inferred from the source.
