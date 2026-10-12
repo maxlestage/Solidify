@@ -5,7 +5,7 @@ The presentation site of Solidify, written with [active](https://github.com/maxl
 - **One page in three languages:** English at `/`, French at `/fr/`, Spanish at `/es/`. Every page is rendered on the server with all its SEO tags.
 - **Playground:** an island that runs Solidify, compiled to WebAssembly, in the browser. Its examples are the transpiler's own test programs (`crates/solidify/tests/cases`).
 - **Installable app (PWA):** the site works offline, playground included.
-- **Animations:** many, and none of them is needed for the page to work.
+- **Animations:** many, on an electric theme (Solidify's yellow is a spark), and none of them is needed for the page to work.
 - **No JavaScript of its own.** Everything is Rust: the pages are rendered by `active`, and the browser runs two WebAssembly modules.
   - The page's client (`src/client/`): language, playground, motion, app.
   - The service worker (`worker/`).
@@ -36,10 +36,10 @@ Environment variables:
 
 | File | Contents |
 | --- | --- |
-| `src/pages.rs` | The page: header (sections, language picker, mobile menu), hero, marquee, playground, how it works, what translates, install, footer |
+| `src/pages.rs` | The page: preloader, cursor, header (sections, language picker, mobile menu), hero (with its scene, circuit and floating bolts), marquee, playground, how it works, what translates, install, footer |
 | `src/client/mod.rs` | The page's WebAssembly client: starts everything below, and small helpers over `web-sys` |
 | `src/client/language.rs` | Opens the visitor's language, keeps the one picked |
-| `src/client/motion.rs` | What the motion needs from the scroll position, the pointer or the elements in view; the menu; copy buttons |
+| `src/client/motion.rs` | What the motion needs from the scroll position, the pointer, the elements in view or the visit (preloader, cursor, tilt, sparks); the menu; copy buttons |
 | `src/client/app.rs` | Registers the service worker; the "Install the app" button |
 | `worker/` | The service worker, a crate of its own (`solidify-site-worker`) compiled to WebAssembly |
 | `src/islands.rs` | The playground island: rendered on the server, then translating live in the browser |
@@ -68,38 +68,46 @@ Environment variables:
 
 ## Animations
 
-The visuals are CSS (`static/app.css`). What needs the scroll position, the pointer or the elements in view is the WebAssembly client (`src/client/motion.rs`).
+The visuals are CSS (`static/app.css`). What needs the scroll position, the pointer, the elements in view or the visit is the WebAssembly client (`src/client/motion.rs`). The theme is electricity: the preloader powers the page up, the cursor is a spark, a current runs along circuits, cards and the steps, lightning turns the hero's TypeScript cube into Rust, clicks throw sparks, the wordmark is a neon sign.
 
 The page never waits for the client:
-- The hero's entrance and the counting figures are CSS animations: they play as the page opens, with or without WebAssembly.
+- The preloader, the hero's entrance and scene, and the counting figures are CSS animations: they play as the page opens, with or without WebAssembly.
+- The preloader plays once per visit: on the next pages the client hides it (`intro-seen`, kept in `sessionStorage` under `solidify-intro`), and a click lifts it (`intro-skip`). The hero waits for it through `--hero-delay`.
 - What appears on scroll is hidden only once the client runs: it adds `.motion` to `<html>`, then `.in` to each element that comes into view.
 - If the client never loads, nothing stays hidden.
-- When the system asks for less motion (`prefers-reduced-motion: reduce`), nothing moves and everything is shown at once.
+- When the system asks for less motion (`prefers-reduced-motion: reduce`), nothing moves and everything is shown at once: no preloader, no cursor, no sparks, the scene's solid Rust cube still, the steps lit.
 
 | Where | What | How |
 | --- | --- | --- |
+| Preloader | A bolt draws itself and lights up; the letters of SOLIDIFY flicker on like neon; a battery charges cell by cell while large hollow figures count to 100 %; a flash, then a yellow curtain lifts | `loader()` in `pages.rs`; CSS only (`--pct`, an integer declared with `@property`, shown through a counter) |
 | Header | Slides in when the page opens; turns opaque and gets a line once the page scrolls (`.scrolled`); the link of the section being read is underlined (`.on`) | CSS transitions; `IntersectionObserver` for the current section |
-| Top edge | A bar shows how far the page has been read | `.progress`, `transform: scaleX()` from the scroll position |
+| Top edge | A glowing bar shows how far the page has been read, a spark crackling at its end | `.progress`, `transform: scaleX()` from the scroll position; `.progress-head` follows it |
+| Cursor (fine pointer) | A spark, and a dashed ring of charge that catches up with it; the ring grows over links and buttons and shows a label (`Go`) on the main button; hidden over text fields | `.cursor-dot`, `.cursor-ring`, `data-cursor` |
+| Clicks and taps | Sparks fly: a flash, a ring of charge, eight rays of random length | `.sparkburst`, made by the client and removed after 0.7 s |
 | Hero title | Each word rises out of a mask, one after another | `emphasized()` wraps every word (`.w > .w-in`, `--i` orders them) |
 | Hero accent | `TypeScript` and `Rust` shimmer | an animated gradient clipped to the text |
 | Hero | The eyebrow, text, buttons and figures arrive in turn, from a blur | `.intro`, `--d` orders them (CSS) |
-| Hero background | Three blurred lights drift slowly over a fading grid, and move slower than the page (parallax) | `.aurora`, `--py` set on scroll |
+| Hero background | Three blurred lights drift slowly over a fading grid, and move slower than the page (parallax); a pulse of current runs along each trace of a circuit and lights the pad it reaches; bolts float at their own depths and flicker now and then | `.aurora`, `--py` set on scroll; `circuit()` (SVG, `stroke-dashoffset`); `floaters()`, `data-speed` |
+| Hero scene | A dashed TypeScript cube turns in 3D; the charge crackles around it, lightning strikes, a flash, and it becomes a solid Rust cube with sparks orbiting it; then it fades back. It leans towards the pointer | `scene()`: CSS 3D, one 7 s cycle (`--cycle`); `--hx`, `--hy` set by the client |
 | Hero figures | Count up from 0 | CSS only: `--n`, an integer declared with `@property`, animated from 0 to `--to` and shown through a counter; the figure stays in the text for screen readers (`.value`) |
-| Buttons | Drawn a little towards the pointer; a light sweeps across them, the arrow moves on | `.magnetic`, `::after`, `.arrow` |
+| Buttons | Drawn a little towards the pointer; a light sweeps across them, the arrow moves on; the main one crackles | `.magnetic`, `::after`, `.arrow` |
 | Marquee | Two bands of "what becomes what" slide in opposite directions; pointing at one stops it | `.marquee-row`, an infinite translation over two copies |
-| Sections | The number and a line that draws itself; the title's words rise in turn; the text arrives from a blur | `.kicker`, `data-reveal="words"`, `data-reveal` |
-| Cards | A light follows the pointer; they lift a little; the step numbers turn | `.spot` (`--mx`, `--my` set by the client) |
+| Sections | The number flickers on and a line draws itself; the title's words rise in turn; the text arrives from a blur | `.kicker`, `data-reveal="words"`, `data-reveal` |
+| Cards | A light follows the pointer; they lean in 3D towards it and lift a little; a current runs around the edge of the one pointed at; the step numbers turn | `.spot` (`--mx`, `--my`), `data-tilt` (`--rx`, `--ry`), `.charged` (a conic gradient turning, `--a`) |
+| How it works | A wire runs above the steps (down their side on small screens): the current fills it as they come up the screen and lights each step it reaches | `--p` and `.lit` set on scroll; lit at once without the client |
 | Table | Rows arrive one after another; the row pointed at gets a bar | `data-reveal="rows"`, `--i` on each row |
-| Playground | Grows into place | `data-reveal="scale"` |
+| Playground | Grows into place; every translation (a keystroke, an example) sends a discharge along the line between the panes and the Rust tag flickers | `data-reveal="scale"`; `.surge`, restarted by the client |
 | Page | A soft light follows the pointer (desktop) | `.glow` |
 | Language | The page fades out when it changes, and the browser can cross-fade the next one | `.leaving`, `@view-transition` |
 | Menu (small screens) | The sections, in large letters, slide in one after another; the three bars become a cross | `.menu-open` |
-| Footer | The columns arrive in turn; links underline from the left; the status light pulses; the large wordmark rises as the end of the page comes | `data-reveal`, `--seen` set on scroll |
+| Footer | The columns arrive in turn; links underline from the left; the status light pulses; the large wordmark rises as the end of the page comes, and lights up like a neon sign, letter by letter, one of them buzzing now and then | `data-reveal`, `--seen` set on scroll; `data-reveal="neon"` |
+| Page | A fine grain moves over everything | `.noise` |
 
 **To animate a new element:**
 - Give it `data-reveal`, and optionally `style="--i:n"` to order it among its neighbours.
 - Use `data-reveal="words"` (or `split()` in `pages.rs`) for a heading.
 - Use `data-reveal="scale"` for a block that should grow.
+- Add the class `charged` to a card (with `.spot`) for the current along its edge, and `data-tilt="8"` for it to lean (the most it turns, in degrees).
 
 ## No horizontal scrolling
 

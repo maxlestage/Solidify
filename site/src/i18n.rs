@@ -40,6 +40,10 @@ pub struct Hero {
     pub cta: &'static str,
     pub cta2: &'static str,
     pub facts: [(&'static str, &'static str); 3],
+    /// What the scene beside the title shows, for screen readers.
+    pub scene: &'static str,
+    /// Under the preloader, while the page powers up.
+    pub charging: &'static str,
 }
 
 pub struct Play {
@@ -141,6 +145,8 @@ static EN: Dict = Dict {
             ("54", "programs checked against Node.js"),
             ("1", "Rust file out, however many files in"),
         ],
+        scene: "A dashed TypeScript cube, struck by lightning, turns into a solid Rust cube.",
+        charging: "Powering up",
     },
     play: Play {
         title: "Playground",
@@ -397,6 +403,8 @@ static FR: Dict = Dict {
                 "fichier Rust en sortie, autant de fichiers en entrée que voulu",
             ),
         ],
+        scene: "Un cube TypeScript en pointillés, frappé par la foudre, devient un cube Rust plein.",
+        charging: "Mise sous tension",
     },
     play: Play {
         title: "Bac à sable",
@@ -653,6 +661,8 @@ static ES: Dict = Dict {
                 "archivo Rust de salida, tantos archivos de entrada como quieras",
             ),
         ],
+        scene: "Un cubo TypeScript punteado, alcanzado por un rayo, se vuelve un cubo Rust macizo.",
+        charging: "Encendiendo",
     },
     play: Play {
         title: "Zona de pruebas",
