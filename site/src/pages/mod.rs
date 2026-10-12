@@ -18,13 +18,15 @@ pub const NPM: &str = "https://www.npmjs.com/package/solidify-rs";
 const ISSUES: &str = "https://github.com/maxlestage/Solidify/issues";
 pub const AUTHOR: &str = "Maxime Nathan Lestage";
 pub const AUTHOR_URL: &str = "https://github.com/maxlestage";
-pub const FAMILY: [(&str, &str); 6] = [
+/// The seven projects of the family, in the order of every site's footer.
+pub const ECOSYSTEM: [(&str, &str); 7] = [
     ("Active", "https://maxlestage.github.io/Active/"),
     ("Vitesse", "https://maxlestage.github.io/Vitesse/"),
     ("Securite", "https://maxlestage.github.io/Securite/"),
     ("Memoire", "https://maxlestage.github.io/Memoire/"),
     ("Paquets", "https://maxlestage.github.io/Paquets/"),
     ("FerroSwift", "https://maxlestage.github.io/FerroSwift/"),
+    ("Solidify", "https://maxlestage.github.io/Solidify/"),
 ];
 
 /// The page at `route`, as HTML. `origin` is the public address (with the base path) for
@@ -772,8 +774,9 @@ fn to_top(lang: Lang) -> Element {
         .child(icon("up"))
 }
 
-/// The footer: the brand and the command to run it; the product, documentation,
-/// resources, languages and family columns; a large wordmark; the legal line.
+/// The signature footer, shared in spirit by every site of the family: the brand and the
+/// command to run it; the product, documentation, resources and languages columns; the
+/// sister projects; the author's signature; a large wordmark; the legal line.
 fn footer(route: Route) -> Element {
     let lang = route.lang;
     let d = t(lang);
@@ -824,7 +827,49 @@ fn footer(route: Route) -> Element {
         out(LICENSE, f.license_link),
     ];
     let languages = language_links(route, false);
-    let family: Vec<Element> = FAMILY.iter().map(|(name, url)| out(url, name)).collect();
+    let ecosystem = nav()
+        .class("foot-eco")
+        .attr("aria-label", f.ecosystem)
+        .attr("data-reveal", "")
+        .child(
+            div()
+                .class("foot-eco-head")
+                .child(h2().class("foot-title").text(f.ecosystem))
+                .child(p().text(f.ecosystem_text)),
+        )
+        .child(ul().class("eco-grid").attr("role", "list").children(
+            ECOSYSTEM.iter().zip(f.projects).map(|((name, url), text)| {
+                let here = *name == "Solidify";
+                let mut title = span().class("eco-name").text(*name);
+                if here {
+                    title = title.child(span().class("eco-here").text(f.here));
+                }
+                let card = a()
+                    .class(if here { "eco current" } else { "eco" })
+                    .child(title)
+                    .child(span().class("eco-text").text(text))
+                    .child(arrow());
+                li().child(if here {
+                    card.href(Route::new(lang, Page::Home).href())
+                        .attr("aria-current", "page")
+                } else {
+                    external(card.href(*url))
+                })
+            }),
+        ));
+    let credits = div()
+        .class("foot-credits")
+        .attr("data-reveal", "")
+        .child(p().class("credits-by").text(f.made))
+        .child(
+            p().class("credits-name").children(
+                AUTHOR
+                    .split(' ')
+                    .enumerate()
+                    .map(|(i, word)| span().style(format!("--i:{i}")).text(word.to_string())),
+            ),
+        )
+        .child(p().class("credits-note").text(f.crafted));
     el("footer")
         .class("bottom")
         .child(
@@ -863,9 +908,10 @@ fn footer(route: Route) -> Element {
                 .child(column(f.product, product, 1))
                 .child(column(d.docs.title, docs, 2))
                 .child(column(f.resources, resources, 3))
-                .child(column(d.nav.language, languages, 4))
-                .child(column(f.projects, family, 5)),
+                .child(column(d.nav.language, languages, 4)),
         )
+        .child(ecosystem)
+        .child(credits)
         .child(
             div()
                 .class("wordmark-wrap")
@@ -889,9 +935,7 @@ fn footer(route: Route) -> Element {
                 )
                 .child(
                     p().class("foot-meta")
-                        .child(span().text(f.made))
-                        .text(" ")
-                        .child(a().href(AUTHOR_URL).attr("rel", "external").text(AUTHOR))
+                        .child(span().text(f.built))
                         .text(" · ")
                         .child(span().text(format!("v{}", env!("CARGO_PKG_VERSION"))))
                         .text(" · ")
@@ -903,6 +947,27 @@ fn footer(route: Route) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Like every site of the family, the footer lists the seven projects (this one marked,
+    /// the others opening their site) and carries the author's signature.
+    #[test]
+    fn footer_lists_the_family_and_signs() {
+        for lang in Lang::ALL {
+            let html = home(lang, "https://example.com");
+            let f = &t(lang).footer;
+            for (name, url) in ECOSYSTEM {
+                let card = if name == "Solidify" {
+                    r#"<a class="eco current""#.to_string()
+                } else {
+                    format!(r#"<a class="eco" href="{url}""#)
+                };
+                assert!(html.contains(&card), "{lang:?} {name}");
+            }
+            assert!(html.contains(&format!(r#"<p class="credits-by">{}</p>"#, f.made)));
+            assert!(html.contains(r#"<span style="--i:1">Nathan</span>"#));
+            assert!(html.contains(&format!(r#"<p class="credits-note">{}</p>"#, f.crafted)));
+        }
+    }
 
     #[test]
     fn pages_render_with_their_seo() {
