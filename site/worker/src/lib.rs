@@ -9,10 +9,11 @@
 //!
 //! Strategy:
 //!
-//! - **install**: every file of the list is downloaded into the cache of this version;
+//! - **install**: every file of the list is downloaded into the cache of this version,
+//!   from the server itself (not the browser's cache, which may hold an older copy);
 //! - **activate**: the caches of older versions are deleted, open pages are taken over;
-//! - **pages**: the network first (the latest version), the saved copy offline, else the
-//!   home page;
+//! - **pages**: the network first (the latest version, checked with the server), the saved
+//!   copy offline, else the home page;
 //! - **other files** of the site: the saved copy, else the network (and saved);
 //! - other sites, and anything but `GET`: left to the browser.
 
@@ -20,8 +21,8 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
 use web_sys::{
-    Cache, ExtendableEvent, FetchEvent, Request, RequestMode, Response, ResponseType,
-    ServiceWorkerGlobalScope,
+    Cache, ExtendableEvent, FetchEvent, Request, RequestCache, RequestInit, RequestMode, Response,
+    ResponseType, ServiceWorkerGlobalScope,
 };
 
 /// The worker's global scope.
@@ -43,8 +44,12 @@ pub fn serve(cache: String, files: Vec<String>) {
         let (name, files) = (name.clone(), files.clone());
         let _ = event.wait_until(&future_to_promise(async move {
             let cache = open(&name).await?;
-            let list: js_sys::Array = files.iter().map(|f| JsValue::from_str(f)).collect();
-            JsFuture::from(cache.add_all_with_str_sequence(&list)).await?;
+            let list = js_sys::Array::new();
+            for file in &files {
+                let request = fresh(file, RequestCache::Reload)?;
+                list.push(&request);
+            }
+            JsFuture::from(cache.add_all_with_request_sequence(&list)).await?;
             JsFuture::from(scope().skip_waiting()?).await?;
             Ok(JsValue::UNDEFINED)
         }));
@@ -116,11 +121,23 @@ async fn saved(request: &Request) -> Result<Option<Response>, JsValue> {
     Ok(hit.dyn_into::<Response>().ok())
 }
 
-/// Fetches `request` from the network and keeps a copy of a good answer.
+/// A request for `url` that goes to the server: `Reload` ignores the browser's cache,
+/// `NoCache` asks the server whether the browser's copy is still the latest.
+fn fresh(url: &str, mode: RequestCache) -> Result<Request, JsValue> {
+    let init = RequestInit::new();
+    init.set_cache(mode);
+    Request::new_with_str_and_init(url, &init)
+}
+
+/// Fetches `request` from the network and keeps a copy of a good answer. A page is
+/// checked with the server: a copy the browser kept could be an older version.
 async fn network(request: &Request, cache: &str) -> Result<Response, JsValue> {
-    let response: Response = JsFuture::from(scope().fetch_with_request(request))
-        .await?
-        .unchecked_into();
+    let fetched = if request.mode() == RequestMode::Navigate {
+        scope().fetch_with_request(&fresh(&request.url(), RequestCache::NoCache)?)
+    } else {
+        scope().fetch_with_request(request)
+    };
+    let response: Response = JsFuture::from(fetched).await?.unchecked_into();
     if response.ok() && response.type_() == ResponseType::Basic {
         let copy = response.clone()?;
         let cache = open(cache).await?;

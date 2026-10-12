@@ -324,7 +324,8 @@ mod tests {
         assert!(sitemap.contains("/fr/docs/quick-start/</loc>"));
         // The worker exists once site/pkg/worker is built (CI builds it before exporting).
         if let Ok(sw) = std::fs::read_to_string(dir.join("sw.js")) {
-            assert!(sw.contains("\"static/app.css\"") && sw.contains("\"fr/\""));
+            // The stylesheet is kept at the versioned address the pages use.
+            assert!(sw.contains("\"static/app.css?v=") && sw.contains("\"fr/\""));
             assert!(sw.contains("\"fr/docs/quick-start/\""));
             assert!(sw.contains("wasm_bindgen.serve(\"solidify-"));
             assert!(!sw.contains("\"pkg/worker"));

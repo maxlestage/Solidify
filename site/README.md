@@ -162,6 +162,7 @@ The test `nothing_scrolls_sideways` (`src/server.rs`) fails if a rule of `app.cs
 - `sw.js`: the service worker, written in Rust (`worker/`).
   - Browsers only start a service worker from a script, and only listen to the events it registers while that script first runs. So `sw.js` holds three things: the loader `wasm-bindgen` generates (`--target no-modules`), the worker's WebAssembly inlined (42 KB), and the call to `serve`.
   - `serve` receives this version's cache name and the files to keep: every page (the home page and the documentation, in the three languages), `static/` and `pkg/`. The cache is named after a hash of all of them, so a new version of the site replaces the old one.
-  - Its strategy: pages from the network first, the saved copy offline; other files from the cache first.
+  - Its strategy: pages from the network first (checked with the server: `cache: "no-cache"`), the saved copy offline; other files from the cache first. It downloads its files with `cache: "reload"`, never from the browser's cache, which may hold an older copy.
+- **Versioned files.** The pages link to `static/app.css`, `pkg/solidify_site.js` and `pkg/solidify_site_bg.wasm` with `?v=` and a hash of the file (`pwa::VERSIONED`, `pwa::versioned`), and the worker keeps them at those addresses. A new version of one is a new address: neither the browser's cache nor the worker of an older version can give a new page the previous stylesheet. (Without it, a visitor's older worker served the old stylesheet to the new pages after a release.)
 
 The client (`client/app.rs`) registers the worker once the page has loaded. It shows "Install the app" when the browser offers it (`beforeinstallprompt`). On iPhone, it is *Share → Add to Home Screen*.

@@ -56,17 +56,42 @@ pub fn service_worker(site: &Path, files: &[String], version: &str) -> Option<St
     ))
 }
 
+/// The files the pages link to with a version (`?v=` and a hash of the file): a new
+/// version of one is a new address, so neither the browser's cache nor an older service
+/// worker can serve the previous copy to a newer page.
+pub const VERSIONED: [&str; 3] = [
+    "static/app.css",
+    "pkg/solidify_site.js",
+    "pkg/solidify_site_bg.wasm",
+];
+
+/// FNV-1a, 64 bits: `hash` mixed with `bytes`.
+fn fnv(mut hash: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+const FNV_START: u64 = 0xcbf2_9ce4_8422_2325;
+
+/// `file` (relative to `site`) with `?v=` and a hash of its contents, or as it is when it
+/// cannot be read.
+pub fn versioned(site: &Path, file: &str) -> String {
+    match std::fs::read(site.join(file)) {
+        Ok(bytes) => format!("{file}?v={:08x}", fnv(FNV_START, &bytes) as u32),
+        Err(_) => file.to_string(),
+    }
+}
+
 /// What the service worker keeps: the pages and every file of `static/` and `pkg/` under
-/// `site` (the worker's own files aside), with a version that changes with any of them.
+/// `site` (the worker's own files aside, and the [`VERSIONED`] ones at their versioned
+/// address), with a version that changes with any of them.
 pub fn offline_files(site: &Path, pages: &[(String, String)]) -> (Vec<String>, String) {
     let mut files: Vec<String> = pages.iter().map(|(path, _)| path.clone()).collect();
-    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    let mut mix = |bytes: &[u8]| {
-        for b in bytes {
-            hash ^= u64::from(*b);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-    };
+    let mut hash: u64 = FNV_START;
+    let mut mix = |bytes: &[u8]| hash = fnv(hash, bytes);
     for (_, html) in pages {
         mix(html.as_bytes());
     }
@@ -96,7 +121,9 @@ pub fn offline_files(site: &Path, pages: &[(String, String)]) -> (Vec<String>, S
             if let Ok(bytes) = std::fs::read(&path) {
                 // The worker's files change its script, hence the version, too.
                 mix(&bytes);
-                if !relative.starts_with(WORKER) {
+                if VERSIONED.contains(&relative.as_str()) {
+                    files.push(versioned(site, &relative));
+                } else if !relative.starts_with(WORKER) {
                     files.push(relative);
                 }
             }
@@ -152,6 +179,24 @@ mod tests {
         assert_eq!(base64(b"foo"), "Zm9v");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64(&[0, 255, 254]), "AP/+");
+    }
+
+    #[test]
+    fn versioned_files_change_address_with_their_contents() {
+        let dir = std::env::temp_dir().join(format!("solidify-pwa-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        std::fs::write(dir.join("static/app.css"), "a{}").unwrap();
+        let first = versioned(&dir, "static/app.css");
+        std::fs::write(dir.join("static/app.css"), "b{}").unwrap();
+        let second = versioned(&dir, "static/app.css");
+        assert!(first.starts_with("static/app.css?v="));
+        assert_ne!(first, second);
+        assert_eq!(versioned(&dir, "pkg/missing.js"), "pkg/missing.js");
+        // The worker keeps them at the address the pages use.
+        let (files, _) = offline_files(&dir, &[]);
+        assert!(files.contains(&second));
+        assert!(!files.contains(&"static/app.css".to_string()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

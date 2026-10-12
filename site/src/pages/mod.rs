@@ -100,7 +100,7 @@ fn document(route: Route, origin: &str, head: Head, main: Element) -> String {
     let mut document = Document::new(fragment(body))
         .lang(lang.code())
         .seo(seo)
-        .stylesheet(link("/static/app.css"))
+        .stylesheet(asset("static/app.css"))
         .head(head_extra())
         .html_attr("data-base", base());
     if home {
@@ -109,10 +109,19 @@ fn document(route: Route, origin: &str, head: Head, main: Element) -> String {
     }
     document
         .client(
-            link("/pkg/solidify_site.js"),
-            link("/pkg/solidify_site_bg.wasm"),
+            asset("pkg/solidify_site.js"),
+            asset("pkg/solidify_site_bg.wasm"),
         )
         .render()
+}
+
+/// A link to one of the files that change with each version of the site (see
+/// `pwa::VERSIONED`): `?v=` and a hash of the file.
+fn asset(file: &str) -> String {
+    link(&format!(
+        "/{}",
+        crate::pwa::versioned(&crate::server::site_dir(), file)
+    ))
 }
 
 fn head_extra() -> String {
@@ -898,6 +907,8 @@ mod tests {
             assert!(html.contains("data-island=\"playground\""));
             assert!(html.contains("fib</span>(n: <span class=\"t\">i64</span>)"));
             assert!(html.contains("class=\"loader\""));
+            // The stylesheet's address changes with it.
+            assert!(html.contains("/static/app.css?v="));
         }
         let fr = home(Lang::Fr, "https://example.com");
         assert!(fr.contains("<html lang=\"fr\""));
