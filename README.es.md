@@ -47,6 +47,8 @@ fn main() {
 
 📚 **Sitio web, con un playground que ejecuta Solidify en el navegador**: el sitio está en [`site/`](site), escrito a su vez con [active](https://github.com/maxlestage/Active) y publicado en https://maxlestage.github.io/Solidify/. Arráncalo con `cargo run -p solidify-site`.
 
+📖 **Documentación**: 16 páginas, de la [introducción](docs/es/introduction.md) y el [inicio rápido](docs/es/quick-start.md) a la [línea de comandos](docs/es/cli.md), la [biblioteca Rust](docs/es/library.md) y la tabla completa de [qué se traduce en qué](docs/es/mapping.md). En [`docs/`](docs) en español, inglés y francés, y en el sitio en https://maxlestage.github.io/Solidify/es/docs/ con un buscador. Cada ejemplo se comprueba con el transpilador.
+
 ## Instalar
 
 Nada que instalar salvo Node.js 20 o posterior: `npx` ejecuta Solidify, compilado a WebAssembly, sobre tus archivos.
@@ -153,7 +155,8 @@ Cuatro reglas que conviene conocer:
 | [`crates/solidify`](crates/solidify) | El transpilador: lexer, parser, inferencia de tipos, generación de código, línea de comandos |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programas traducidos, compilados con `rustc` y comparados con lo que imprime Node.js (una carpeta contiene un programa de varios archivos) |
 | [`npm`](npm) | El paquete `solidify-rs` para `npx`: un lanzador Node.js del transpilador compilado a WebAssembly (WASI), comprobado contra los programas de prueba con `cargo test -p solidify --test npm` |
-| [`site`](site) | El sitio web, escrito con [active](https://github.com/maxlestage/Active): un playground que ejecuta Solidify en WebAssembly, tres idiomas elegidos automáticamente o a mano, una app instalable que funciona sin conexión, muchas animaciones. [`site/README.md`](site/README.md) lo documenta todo |
+| [`docs`](docs) | La documentación, en inglés, francés y español (`docs/{en,fr,es}/*.md`): el sitio la muestra, y un test comprueba cada ejemplo con el transpilador |
+| [`site`](site) | El sitio web, escrito con [active](https://github.com/maxlestage/Active): un playground que ejecuta Solidify en WebAssembly, la documentación con un menú y un buscador, tres idiomas elegidos automáticamente o a mano, una app instalable que funciona sin conexión, muchas animaciones. [`site/README.md`](site/README.md) lo documenta todo |
 
 ## Desarrollo
 

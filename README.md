@@ -47,6 +47,8 @@ fn main() {
 
 📚 **Website, with a playground running Solidify in the browser**: the site in [`site/`](site), itself written with [active](https://github.com/maxlestage/Active) and published at https://maxlestage.github.io/Solidify/. Run it with `cargo run -p solidify-site`.
 
+📖 **Documentation**: 16 pages, from the [introduction](docs/en/introduction.md) and the [quick start](docs/en/quick-start.md) to the [command line](docs/en/cli.md), the [Rust library](docs/en/library.md) and the full table of [what translates to what](docs/en/mapping.md). In [`docs/`](docs) in English, French and Spanish, and on the website at https://maxlestage.github.io/Solidify/docs/ with a search. Every example in it is checked against the transpiler.
+
 ## Install
 
 Nothing to install but Node.js 20 or later: `npx` runs Solidify, compiled to WebAssembly, on your files.
@@ -153,7 +155,8 @@ Four rules worth knowing:
 | [`crates/solidify`](crates/solidify) | The transpiler: lexer, parser, type inference, code generation, CLI |
 | [`crates/solidify/tests/cases`](crates/solidify/tests/cases) | 54 programs translated, compiled with `rustc` and compared with what Node.js prints (a directory holds a program of several files) |
 | [`npm`](npm) | The `solidify-rs` package for `npx`: a Node.js launcher for the transpiler compiled to WebAssembly (WASI), checked against the test programs by `cargo test -p solidify --test npm` |
-| [`site`](site) | The website, written with [active](https://github.com/maxlestage/Active): a playground running Solidify as WebAssembly, three languages chosen automatically or by hand, an installable app that works offline, many animations. [`site/README.md`](site/README.md) documents all of it |
+| [`docs`](docs) | The documentation, in English, French and Spanish (`docs/{en,fr,es}/*.md`): the website shows it, and a test checks every example against the transpiler |
+| [`site`](site) | The website, written with [active](https://github.com/maxlestage/Active): a playground running Solidify as WebAssembly, the documentation with a menu and a search, three languages chosen automatically or by hand, an installable app that works offline, many animations. [`site/README.md`](site/README.md) documents all of it |
 
 ## Development
 

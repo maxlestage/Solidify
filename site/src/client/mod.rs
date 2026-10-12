@@ -4,20 +4,25 @@
 //!
 //! - [`language`]: the page in the visitor's language, the picker's choice kept;
 //! - [`motion`]: reveals, scroll state, pointer effects, copy buttons, the menu;
+//! - [`search`]: the documentation's search;
+//! - [`docs`]: the list of pages and "On this page" of the documentation;
 //! - [`app`]: the service worker (offline use) and the "Install the app" button.
 //!
 //! Everything here adds to a page that already works: links, the language picker (a
 //! `<details>`) and the text are plain HTML, and the hero's entrance is CSS.
 
 mod app;
+mod docs;
 mod language;
 mod motion;
+mod search;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use web_sys::{IntersectionObserver, IntersectionObserverEntry, IntersectionObserverInit};
 
 #[wasm_bindgen(start)]
 pub fn start() {
@@ -38,6 +43,8 @@ pub fn start() {
     active::hydrate(&crate::islands::ISLANDS);
     language::init();
     motion::init();
+    search::init();
+    docs::init();
     app::init();
 }
 
@@ -153,6 +160,31 @@ pub(crate) fn first(selector: &str) -> Option<web_sys::HtmlElement> {
         .ok()
         .flatten()
         .and_then(|e| e.dyn_into().ok())
+}
+
+/// Watches the elements matching `selector`, calling `f` for each change of visibility.
+pub(crate) fn observe(
+    selector: &str,
+    options: &IntersectionObserverInit,
+    f: impl Fn(&IntersectionObserverEntry, &IntersectionObserver) + 'static,
+) {
+    let callback = Closure::<dyn Fn(js_sys::Array, IntersectionObserver)>::new(
+        move |entries: js_sys::Array, io: IntersectionObserver| {
+            for entry in entries.iter() {
+                if let Ok(entry) = entry.dyn_into::<IntersectionObserverEntry>() {
+                    f(&entry, &io);
+                }
+            }
+        },
+    );
+    if let Ok(io) =
+        IntersectionObserver::new_with_options(callback.as_ref().unchecked_ref(), options)
+    {
+        for el in all(selector) {
+            io.observe(&el);
+        }
+    }
+    callback.forget();
 }
 
 /// The element an event happened on, or its nearest ancestor matching `selector`.

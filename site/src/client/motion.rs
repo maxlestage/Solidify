@@ -5,7 +5,7 @@
 //!
 //! 1. the preloader, played once per visit (`.intro-seen` skips it, a click too);
 //! 2. the header that tightens once the page scrolls, the reading progress bar and its
-//!    spark, the hero's parallax (`--py`, `data-speed`), the current along the steps
+//!    spark, the ring of the button back to the top (`--p`, `.show`), the hero's parallax (`--py`, `data-speed`), the current along the steps
 //!    (`--p`, `.lit`) and the footer's wordmark rising (`--seen`);
 //! 3. the menu link of the section being read (`.on`);
 //! 4. reveals: elements marked `data-reveal` get `.in` when they scroll into view
@@ -26,15 +26,12 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
-use web_sys::{
-    HtmlElement, IntersectionObserver, IntersectionObserverEntry, IntersectionObserverInit,
-};
+use web_sys::{HtmlElement, IntersectionObserverInit};
 
 use super::{
-    all, closest, document, first, frames, later, media, on, on_passive, reduced_motion, root,
-    window,
+    all, closest, document, first, frames, later, media, observe, on, on_passive, reduced_motion,
+    root, window,
 };
 
 pub fn init() {
@@ -101,6 +98,7 @@ fn scroll_state() {
     let header = first(".top");
     let progress = first(".progress");
     let spark = first(".progress-head");
+    let to_top = first(".to-top-ring");
     let hero = first(".hero");
     let steps = first(".steps");
     let step_items = all(".steps > li");
@@ -126,13 +124,20 @@ fn scroll_state() {
         if let Some(h) = &header {
             let _ = h.class_list().toggle_with_force("scrolled", y > 8.0);
         }
+        let max = f64::from(root().scroll_height()) - height;
+        let ratio = if max > 0.0 {
+            (y / max).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // Back to the top: shown once the page has scrolled, its ring filled as far.
+        if let Some(button) = &to_top {
+            let _ = button
+                .class_list()
+                .toggle_with_force("show", y > height * 0.8);
+            let _ = button.style().set_property("--p", &format!("{ratio:.4}"));
+        }
         if let Some(p) = &progress {
-            let max = f64::from(root().scroll_height()) - height;
-            let ratio = if max > 0.0 {
-                (y / max).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
             let _ = p
                 .style()
                 .set_property("transform", &format!("scaleX({ratio:.4})"));
@@ -198,31 +203,6 @@ fn scroll_state() {
             false
         });
     });
-}
-
-/// Watches the elements matching `selector`, calling `f` for each change of visibility.
-fn observe(
-    selector: &str,
-    options: &IntersectionObserverInit,
-    f: impl Fn(&IntersectionObserverEntry, &IntersectionObserver) + 'static,
-) {
-    let callback = Closure::<dyn Fn(js_sys::Array, IntersectionObserver)>::new(
-        move |entries: js_sys::Array, io: IntersectionObserver| {
-            for entry in entries.iter() {
-                if let Ok(entry) = entry.dyn_into::<IntersectionObserverEntry>() {
-                    f(&entry, &io);
-                }
-            }
-        },
-    );
-    if let Ok(io) =
-        IntersectionObserver::new_with_options(callback.as_ref().unchecked_ref(), options)
-    {
-        for el in all(selector) {
-            io.observe(&el);
-        }
-    }
-    callback.forget();
 }
 
 /// The menu link of the section in the middle of the screen gets `.on`.
